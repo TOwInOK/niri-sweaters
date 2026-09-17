@@ -234,6 +234,25 @@ impl BorderRenderElement {
             HueInterpolation::Decreasing => 3.,
         };
 
+        // Convert the gradient endpoints into the interpolation space once per
+        // element instead of per pixel in the shader.
+        let convert = |color: Color| -> [f32; 4] {
+            let [r, g, b, a] = color.to_array_unpremul();
+            let rgb = match gradient_format.color_space {
+                GradientColorSpace::Srgb => [r, g, b],
+                GradientColorSpace::SrgbLinear => srgb_to_linear([r, g, b]),
+                GradientColorSpace::Oklab => linear_to_oklab(srgb_to_linear([r, g, b])),
+                GradientColorSpace::Oklch => {
+                    oklab_to_oklch(linear_to_oklab(srgb_to_linear([r, g, b])))
+                }
+            };
+            [rgb[0], rgb[1], rgb[2], a]
+        };
+        let color_from = convert(color_from);
+        let color_to = convert(color_to);
+
+        let grad_inv_dot = 1. / grad_vec.length_squared().max(1e-6);
+
         let (
             knit_enabled,
             knit_pattern,
@@ -269,11 +288,12 @@ impl BorderRenderElement {
             Rc::new([
                 Uniform::new("colorspace", colorspace),
                 Uniform::new("hue_interpolation", hue_interpolation),
-                Uniform::new("color_from", color_from.to_array_unpremul()),
-                Uniform::new("color_to", color_to.to_array_unpremul()),
+                Uniform::new("color_from", color_from),
+                Uniform::new("color_to", color_to),
                 Uniform::new("grad_offset", grad_offset.to_array()),
                 Uniform::new("grad_width", w),
                 Uniform::new("grad_vec", grad_vec.to_array()),
+                Uniform::new("grad_inv_dot", grad_inv_dot),
                 mat3_uniform("input_to_geo", input_to_geo),
                 Uniform::new("geo_size", geo_size.to_array()),
                 Uniform::new("outer_radius", <[f32; 4]>::from(corner_radius)),
@@ -403,4 +423,35 @@ impl<'render> RenderElement<TtyRenderer<'render>> for BorderRenderElement {
     ) -> Option<UnderlyingStorage<'_>> {
         self.inner.underlying_storage(renderer)
     }
+}
+
+// Color space conversions matching border.frag. They run once per element on
+// the CPU so the shader only needs the inverse transforms per pixel.
+
+fn srgb_to_linear([r, g, b]: [f32; 3]) -> [f32; 3] {
+    [r.powf(2.2), g.powf(2.2), b.powf(2.2)]
+}
+
+fn linear_to_oklab([r, g, b]: [f32; 3]) -> [f32; 3] {
+    // Row-vector times column-major matrix, same as `color * mat` in GLSL.
+    let l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b;
+    let m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b;
+    let s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b;
+    let l = l.powf(1. / 3.);
+    let m = m.powf(1. / 3.);
+    let s = s.powf(1. / 3.);
+    [
+        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    ]
+}
+
+fn oklab_to_oklch([l, a, b]: [f32; 3]) -> [f32; 3] {
+    let c = (a * a + b * b).sqrt();
+    let mut h = b.atan2(a).to_degrees();
+    if h <= 0. {
+        h += 360.;
+    }
+    [l, c, h]
 }

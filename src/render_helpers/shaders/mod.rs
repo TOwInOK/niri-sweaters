@@ -50,6 +50,7 @@ impl Shaders {
                 UniformName::new("grad_offset", UniformType::_2f),
                 UniformName::new("grad_width", UniformType::_1f),
                 UniformName::new("grad_vec", UniformType::_2f),
+                UniformName::new("grad_inv_dot", UniformType::_1f),
                 UniformName::new("input_to_geo", UniformType::Matrix3x3),
                 UniformName::new("geo_size", UniformType::_2f),
                 UniformName::new("outer_radius", UniformType::_4f),

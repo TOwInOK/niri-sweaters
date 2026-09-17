@@ -17,6 +17,7 @@ uniform vec4 color_to;
 uniform vec2 grad_offset;
 uniform float grad_width;
 uniform vec2 grad_vec;
+uniform float grad_inv_dot;
 
 uniform mat3 input_to_geo;
 uniform vec2 geo_size;
@@ -65,25 +66,8 @@ vec4 premul_mix_unpremul_lch(vec4 color1, vec4 color2, float ratio) {
     return unpremul_lch(mixed);
 }
 
-vec3 srgb_to_linear(vec3 color) {
-    return pow(color, vec3(2.2));
-}
-
 vec3 linear_to_srgb(vec3 color) {
     return pow(color, vec3(1.0 / 2.2));
-}
-
-vec3 lab_to_lch(vec3 color) {
-    float c = sqrt(pow(color.y, 2.0) + pow(color.z, 2.0));
-    float h = degrees(atan(color.z, color.y)) ;
-    h += h <= 0.0 ?
-        360.0 :
-        0.0 ;
-    return vec3(
-        color.x,
-        c,
-        h
-    );
 }
 
 vec3 lch_to_lab(vec3 color) {
@@ -94,22 +78,6 @@ vec3 lch_to_lab(vec3 color) {
         a,
         b
     );
-}
-
-vec3 linear_to_oklab(vec3 color){
-    mat3 rgb_to_lms = mat3(
-        vec3(0.4122214708, 0.5363325363, 0.0514459929),
-        vec3(0.2119034982, 0.6806995451, 0.1073969566),
-        vec3(0.0883024619, 0.2817188376, 0.6299787005)
-    );
-    mat3 lms_to_oklab = mat3(
-        vec3(0.2104542553, 0.7936177850, -0.0040720468),
-        vec3(1.9779984951, -2.4285922050, 0.4505937099),
-        vec3(0.0259040371, 0.7827717662, -0.8086757660)
-    );
-    vec3 lms = color * rgb_to_lms;
-    lms = pow(lms, vec3(1.0 / 3.0));
-    return lms * lms_to_oklab;
 }
 
 vec3 oklab_to_linear(vec3 color){
@@ -124,10 +92,15 @@ vec3 oklab_to_linear(vec3 color){
         vec3(-0.0041960863, -0.7034186147, 1.7076147010)
     );
     vec3 lms = color * oklab_to_lms;
-    lms = pow(lms, vec3(3.0));
+    // Multiplication instead of pow(): lms can go negative out of gamut,
+    // where pow() is undefined.
+    lms = lms * lms * lms;
     return lms * lms_to_rgb;
 }
 
+// color_from/color_to arrive already converted into the interpolation space
+// (srgb, linear, oklab or oklch); the conversion runs once per element on the
+// CPU instead of per pixel.
 vec4 color_mix(vec4 color1, vec4 color2, float color_ratio) {
     vec4 color_out;
 
@@ -136,22 +109,15 @@ vec4 color_mix(vec4 color1, vec4 color2, float color_ratio) {
         return mix(premul_rect(color1), premul_rect(color2), color_ratio);
     }
 
-    color1.rgb = srgb_to_linear(color1.rgb);
-    color2.rgb = srgb_to_linear(color2.rgb);
-
     // srgb-linear
     if (colorspace == 1.0) {
         color_out = premul_mix_unpremul_rect(color1, color2, color_ratio);
     // oklab
     } else if (colorspace == 2.0) {
-        color1.xyz = linear_to_oklab(color1.rgb);
-        color2.xyz = linear_to_oklab(color2.rgb);
         color_out = premul_mix_unpremul_rect(color1, color2, color_ratio);
         color_out.rgb = oklab_to_linear(color_out.xyz);
     // oklch
     } else if (colorspace == 3.0) {
-        color1.xyz = lab_to_lch(linear_to_oklab(color1.rgb));
-        color2.xyz = lab_to_lch(linear_to_oklab(color2.rgb));
         color_out = premul_mix_unpremul_lch(color1, color2, color_ratio);
 
         float min_hue = min(color1.z, color2.z);
@@ -205,7 +171,7 @@ vec4 gradient_color(vec2 coords) {
     if ((grad_vec.x < 0.0 && 0.0 <= grad_vec.y) || (0.0 <= grad_vec.x && grad_vec.y < 0.0))
         coords.x -= grad_width;
 
-    float frac = dot(coords, grad_vec) / dot(grad_vec, grad_vec);
+    float frac = dot(coords, grad_vec) * grad_inv_dot;
 
     if (grad_vec.y < 0.0)
         frac += 1.0;
@@ -487,6 +453,11 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
             float seed = knit_hash(vec2(stitch_id, row));
             point += vec2(seed - 0.5, fract(seed * 13.73) - 0.5) * vec2(0.018, 0.024);
             float radius = mix(0.225, 0.268, relief) * mix(0.96, 1.04, seed);
+            // Legs reach at most ~0.75/0.85 stitch units. Once some yarn
+            // covers this pixel (best_surface >= 0), far cells evaluate to a
+            // negative surface and cannot win, so skip the capsule math.
+            if (best_surface >= 0.0 && (abs(point.x) > 0.8 || abs(point.y) > 0.9))
+                continue;
             for (int leg = 0; leg < 2; leg++) {
                 vec3 normal;
                 vec2 leg_tangent;
@@ -518,12 +489,19 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
     float fibre_filter = 1.0 - smoothstep(0.8, 2.0, pixel * 32.0);
     float nap_filter = 1.0 - smoothstep(0.8, 2.0, pixel * 52.0);
     vec3 bundles = knit_noise(vec2(u * 1.8 + t * 2.5, t * 0.65) + yarn_seed * vec2(19.0, 31.0));
-    vec3 fibres = knit_noise(vec2(u * 8.0 + t * 2.8 + bundles.x * 0.8, t * 3.5)
-        + yarn_seed * vec2(43.0, 17.0));
-    vec3 nap = knit_noise(vec2(u * 13.0 - t * 4.0, t * 9.0) + yarn_seed * vec2(11.0, 53.0));
+    vec3 fibres = fibre_filter > 0.0
+        ? knit_noise(vec2(u * 8.0 + t * 2.8 + bundles.x * 0.8, t * 3.5)
+            + yarn_seed * vec2(43.0, 17.0))
+        : vec3(0.0);
+    vec3 nap = nap_filter > 0.0
+        ? knit_noise(vec2(u * 13.0 - t * 4.0, t * 9.0) + yarn_seed * vec2(11.0, 53.0))
+        : vec3(0.0);
     float pile = 0.18 + fuzz * 0.82;
-    vec2 filaments = knit_filaments(vec2(u * 3.4 + t * 1.6 + bundles.x * 0.3, t * 5.0)
-        + yarn_seed * vec2(29.0, 47.0), vec2(13.6, 4.5) * pixel);
+    // knit_filaments fades out by aa.x = 2.0; skip the call entirely past it.
+    vec2 filaments = 13.6 * pixel < 2.0
+        ? knit_filaments(vec2(u * 3.4 + t * 1.6 + bundles.x * 0.3, t * 5.0)
+            + yarn_seed * vec2(29.0, 47.0), vec2(13.6, 4.5) * pixel)
+        : vec2(0.0);
     float thickness = (bundles.x - 0.5) * 0.035 * bundle_filter;
     float loose_fibres = (nap.x - 0.5) * 0.045 * pile * nap_filter;
     float distance = strand.x - thickness - loose_fibres;
@@ -605,10 +583,7 @@ vec4 knit_color(vec2 geometry_coords, vec4 base_color) {
 }
 void main() {
     vec3 coords_geo = input_to_geo * vec3(niri_v_coords, 1.0);
-    vec4 base_color = gradient_color(coords_geo.xy);
-    vec4 color = knit_enabled == 1.0
-        ? knit_color(coords_geo.xy, base_color)
-        : base_color;
+
     float ring_alpha = niri_rounding_alpha(coords_geo.xy, geo_size, outer_radius);
 
     if (border_width > 0.0) {
@@ -622,7 +597,24 @@ void main() {
         }
     }
 
-    color *= ring_alpha * niri_alpha;
+    // Skip the gradient and knit pipelines for pixels outside the ring:
+    // corner AA fringes and, for full-quad callers, the window interior.
+    float alpha = ring_alpha * niri_alpha;
+#if defined(DEBUG_FLAGS)
+    // Tint mode visualizes the whole element quad; keep transparent pixels.
+    if (alpha == 0.0 && niri_tint != 1.0)
+        discard;
+#else
+    if (alpha == 0.0)
+        discard;
+#endif
+
+    vec4 base_color = gradient_color(coords_geo.xy);
+    vec4 color = knit_enabled == 1.0
+        ? knit_color(coords_geo.xy, base_color)
+        : base_color;
+
+    color *= alpha;
 #if defined(DEBUG_FLAGS)
     if (niri_tint == 1.0)
         color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
