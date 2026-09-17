@@ -3814,8 +3814,8 @@ prop_compose! {
     fn arbitrary_focus_ring()(
         off in any::<bool>(),
         width in prop::option::of(arbitrary_spacing().prop_map(FloatOrInt)),
-    ) -> niri_config::BorderRule {
-        niri_config::BorderRule {
+    ) -> niri_config::FocusRingRule {
+        niri_config::FocusRingRule {
             off,
             on: !off,
             width,

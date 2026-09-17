@@ -210,6 +210,15 @@ layout {
         // active-gradient from="#e5989b" to="#ffb4a2" angle=45 relative-to="workspace-view" in="oklch longer hue"
 
         // inactive-gradient from="#505050" to="#808080" angle=45 relative-to="workspace-view"
+        // Render a procedural knitted border instead of a flat color or gradient.
+        // knit {
+        //     on
+        //     pattern "zigzag" // stockinette, rib, checker, zigzag, diamond, dots
+        //     accent-color "#f5e2b8"
+        //     stitch-size 5
+        //     relief 0.8
+        //     fuzz 0.0
+        // }
     }
 
     // You can enable drop shadows for windows.

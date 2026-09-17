@@ -379,6 +379,44 @@ layout {
 }
 ```
 
+#### Procedural knit border
+
+The `border` section can render a procedural knitted material instead of a flat color or gradient.
+This option applies only to `border`, not to `focus-ring`.
+The stitch geometry, lighting and pattern are generated in the border shader, so no image assets are required.
+
+```kdl
+layout {
+    focus-ring { off; }
+
+    border {
+        on
+        width 18
+        active-color "#174f32"
+        inactive-color "#46515c"
+        urgent-color "#c2410c"
+
+        knit {
+            on
+            pattern "zigzag"
+            accent-color "#f5e2b8"
+            stitch-size 5
+            relief 0.85
+            fuzz 0.0
+        }
+    }
+}
+```
+
+`pattern` can be `stockinette`, `rib`, `checker`, `zigzag`, `diamond` or `dots`.
+`stitch-size` is measured in logical pixels and accepts values from 1 to 64.
+`relief` controls yarn thickness, surface lighting and contact shadow from 0 to 1 without changing the pattern repeat.
+`fuzz` adds stable irregular edges, a soft fibre halo and matte wool roughness from 0 to 1; the default is 0 for clean chunky yarn.
+The normal active, inactive and urgent colors or gradients provide the base yarn color; `accent-color` supplies the pattern yarn.
+Corners use a 45° mitered decrease spine in the base yarn; the accent motif fades before the seam so stitches keep a constant scale through rounded corners.
+
+The nested `knit` options can also be overridden in a `window-rule` to give individual applications their own pattern and palette.
+Use `off` inside `knit` to return a matching window to the standard border renderer.
 ### `shadow`
 
 <sup>Since: 25.02</sup>

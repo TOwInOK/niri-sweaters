@@ -3,7 +3,8 @@ use std::rc::Rc;
 
 use glam::{Mat3, Vec2};
 use niri_config::{
-    Color, CornerRadius, GradientColorSpace, GradientInterpolation, HueInterpolation,
+    Color, CornerRadius, GradientColorSpace, GradientInterpolation, HueInterpolation, KnitBorder,
+    KnitPattern,
 };
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, Uniform};
@@ -44,6 +45,7 @@ struct Parameters {
     // Should only be used for visual improvements, i.e. corner radius anti-aliasing.
     scale: f32,
     alpha: f32,
+    knit: Option<KnitBorder>,
 }
 
 impl BorderRenderElement {
@@ -76,6 +78,7 @@ impl BorderRenderElement {
                 corner_radius,
                 scale,
                 alpha,
+                knit: None,
             },
         };
         rv.update_inner();
@@ -98,6 +101,7 @@ impl BorderRenderElement {
                 corner_radius: Default::default(),
                 scale: 1.,
                 alpha: 1.,
+                knit: None,
             },
         }
     }
@@ -121,6 +125,38 @@ impl BorderRenderElement {
         scale: f32,
         alpha: f32,
     ) {
+        self.update_with_knit(
+            size,
+            gradient_area,
+            gradient_format,
+            color_from,
+            color_to,
+            angle,
+            geometry,
+            border_width,
+            corner_radius,
+            scale,
+            alpha,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_with_knit(
+        &mut self,
+        size: Size<f64, Logical>,
+        gradient_area: Rectangle<f64, Logical>,
+        gradient_format: GradientInterpolation,
+        color_from: Color,
+        color_to: Color,
+        angle: f32,
+        geometry: Rectangle<f64, Logical>,
+        border_width: f32,
+        corner_radius: CornerRadius,
+        scale: f32,
+        alpha: f32,
+        knit: Option<KnitBorder>,
+    ) {
         let params = Parameters {
             size,
             gradient_area,
@@ -133,6 +169,7 @@ impl BorderRenderElement {
             corner_radius,
             scale,
             alpha,
+            knit,
         };
         if self.params == params {
             return;
@@ -155,6 +192,7 @@ impl BorderRenderElement {
             corner_radius,
             scale,
             alpha,
+            knit,
         } = self.params;
 
         let grad_offset = geometry.loc - gradient_area.loc;
@@ -196,6 +234,33 @@ impl BorderRenderElement {
             HueInterpolation::Decreasing => 3.,
         };
 
+        let (
+            knit_enabled,
+            knit_pattern,
+            knit_accent_color,
+            knit_stitch_size,
+            knit_relief,
+            knit_fuzz,
+        ) = if let Some(knit) = knit {
+            let pattern = match knit.pattern {
+                KnitPattern::Stockinette => 0.,
+                KnitPattern::Rib => 1.,
+                KnitPattern::Checker => 2.,
+                KnitPattern::Zigzag => 3.,
+                KnitPattern::Diamond => 4.,
+                KnitPattern::Dots => 5.,
+            };
+            (
+                1.,
+                pattern,
+                knit.accent_color.to_array_unpremul(),
+                knit.stitch_size as f32,
+                knit.relief as f32,
+                knit.fuzz as f32,
+            )
+        } else {
+            (0., 0., Color::default().to_array_unpremul(), 1., 0., 0.)
+        };
         self.inner.update(
             size,
             None,
@@ -213,6 +278,12 @@ impl BorderRenderElement {
                 Uniform::new("geo_size", geo_size.to_array()),
                 Uniform::new("outer_radius", <[f32; 4]>::from(corner_radius)),
                 Uniform::new("border_width", border_width),
+                Uniform::new("knit_enabled", knit_enabled),
+                Uniform::new("knit_pattern", knit_pattern),
+                Uniform::new("knit_accent_color", knit_accent_color),
+                Uniform::new("knit_stitch_size", knit_stitch_size),
+                Uniform::new("knit_relief", knit_relief),
+                Uniform::new("knit_fuzz", knit_fuzz),
             ]),
             HashMap::new(),
         );
@@ -227,6 +298,10 @@ impl BorderRenderElement {
         Shaders::get(renderer)
             .program(ProgramType::Border)
             .is_some()
+    }
+    #[cfg(test)]
+    pub(crate) fn knit_for_tests(&self) -> Option<KnitBorder> {
+        self.params.knit
     }
 }
 

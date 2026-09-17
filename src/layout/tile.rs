@@ -191,10 +191,12 @@ impl<W: LayoutElement> Tile<W> {
         let focus_ring_config = options.layout.focus_ring.merged_with(&rules.focus_ring);
         let shadow_config = options.layout.shadow.merged_with(&rules.shadow);
         let sizing_mode = window.sizing_mode();
+        let mut border = FocusRing::new(border_config.into());
+        border.update_knit((!border_config.knit.off).then_some(border_config.knit));
 
         Self {
             window,
-            border: FocusRing::new(border_config.into()),
+            border,
             focus_ring: FocusRing::new(focus_ring_config),
             shadow: Shadow::new(shadow_config),
             sizing_mode,
@@ -244,6 +246,8 @@ impl<W: LayoutElement> Tile<W> {
         let mut border_config = self.options.layout.border.merged_with(&rules.border);
         border_config.width = round_max1(border_config.width);
         self.border.update_config(border_config.into());
+        self.border
+            .update_knit((!border_config.knit.off).then_some(border_config.knit));
 
         let mut focus_ring_config = self
             .options
@@ -394,6 +398,8 @@ impl<W: LayoutElement> Tile<W> {
         let mut border_config = self.options.layout.border.merged_with(&rules.border);
         border_config.width = round_max1(border_config.width);
         self.border.update_config(border_config.into());
+        self.border
+            .update_knit((!border_config.knit.off).then_some(border_config.knit));
 
         let mut focus_ring_config = self
             .options

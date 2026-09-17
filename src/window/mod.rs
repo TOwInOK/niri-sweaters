@@ -3,8 +3,8 @@ use std::cmp::{max, min};
 use niri_config::utils::MergeWith as _;
 use niri_config::window_rule::{Match, OnXdgActivate, WindowRule};
 use niri_config::{
-    BackgroundEffect, BlockOutFrom, BorderRule, CornerRadius, FloatingPosition, PresetSize,
-    ResolvedPopupsRules, ShadowRule, TabIndicatorRule,
+    BackgroundEffect, BlockOutFrom, BorderRule, CornerRadius, FloatingPosition, FocusRingRule,
+    PresetSize, ResolvedPopupsRules, ShadowRule, TabIndicatorRule,
 };
 use niri_ipc::ColumnDisplay;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -86,7 +86,7 @@ pub struct ResolvedWindowRules {
     pub max_height: Option<u16>,
 
     /// Focus ring overrides.
-    pub focus_ring: BorderRule,
+    pub focus_ring: FocusRingRule,
     /// Window border overrides.
     pub border: BorderRule,
     /// Shadow overrides.

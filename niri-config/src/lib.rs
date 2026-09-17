@@ -1374,6 +1374,19 @@ mod tests {
                     active_gradient: None,
                     inactive_gradient: None,
                     urgent_gradient: None,
+                    knit: KnitBorder {
+                        off: true,
+                        pattern: Stockinette,
+                        accent_color: Color {
+                            r: 0.9607843,
+                            g: 0.8862745,
+                            b: 0.72156864,
+                            a: 1.0,
+                        },
+                        stitch_size: 5.0,
+                        relief: 0.8,
+                        fuzz: 0.0,
+                    },
                 },
                 shadow: Shadow {
                     on: false,
@@ -1832,7 +1845,7 @@ mod tests {
                     min_height: None,
                     max_width: None,
                     max_height: None,
-                    focus_ring: BorderRule {
+                    focus_ring: FocusRingRule {
                         off: true,
                         on: false,
                         width: Some(
@@ -1861,6 +1874,15 @@ mod tests {
                         active_gradient: None,
                         inactive_gradient: None,
                         urgent_gradient: None,
+                        knit: KnitBorderRule {
+                            off: false,
+                            on: false,
+                            pattern: None,
+                            accent_color: None,
+                            stitch_size: None,
+                            relief: None,
+                            fuzz: None,
+                        },
                     },
                     shadow: ShadowRule {
                         off: false,

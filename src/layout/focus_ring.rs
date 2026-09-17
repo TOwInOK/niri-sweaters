@@ -1,6 +1,6 @@
 use std::iter::zip;
 
-use niri_config::{CornerRadius, Gradient, GradientRelativeTo};
+use niri_config::{CornerRadius, Gradient, GradientRelativeTo, KnitBorder};
 use smithay::backend::renderer::element::{Element as _, Kind};
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
@@ -19,6 +19,7 @@ pub struct FocusRing {
     is_border: bool,
     use_border_shader: bool,
     config: niri_config::FocusRing,
+    knit: Option<KnitBorder>,
     thicken_corners: bool,
 }
 
@@ -40,12 +41,16 @@ impl FocusRing {
             is_border: false,
             use_border_shader: false,
             config,
+            knit: None,
             thicken_corners: true,
         }
     }
 
     pub fn update_config(&mut self, config: niri_config::FocusRing) {
         self.config = config;
+    }
+    pub fn update_knit(&mut self, knit: Option<KnitBorder>) {
+        self.knit = knit;
     }
 
     pub fn update_shaders(&mut self) {
@@ -66,6 +71,7 @@ impl FocusRing {
         scale: f64,
         alpha: f32,
     ) {
+        let is_border = is_border || self.knit.is_some();
         let width = self.config.width;
         self.full_size = win_size + Size::from((width, width)).upscale(2.);
         self.is_border = is_border;
@@ -92,7 +98,8 @@ impl FocusRing {
             self.config.inactive_gradient
         };
 
-        self.use_border_shader = radius != CornerRadius::default() || gradient.is_some();
+        self.use_border_shader =
+            radius != CornerRadius::default() || gradient.is_some() || self.knit.is_some();
 
         // Set the defaults for solid color + rounded corners.
         let gradient = gradient.unwrap_or_else(|| Gradient::from(color));
@@ -180,7 +187,7 @@ impl FocusRing {
             }
 
             for (border, (loc, size)) in zip(&mut self.borders, zip(self.locations, self.sizes)) {
-                border.update(
+                border.update_with_knit(
                     size,
                     Rectangle::new(gradient_area.loc - loc, gradient_area.size),
                     gradient.in_,
@@ -192,6 +199,7 @@ impl FocusRing {
                     radius,
                     scale as f32,
                     alpha,
+                    self.knit,
                 );
             }
         } else {
@@ -272,5 +280,65 @@ impl FocusRing {
 
     pub fn config(&self) -> &niri_config::FocusRing {
         &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn knit_uses_segmented_border_and_survives_urgent_state() {
+        let config = niri_config::FocusRing {
+            width: 8.,
+            ..Default::default()
+        };
+
+        let knit = KnitBorder {
+            off: false,
+            pattern: niri_config::KnitPattern::Checker,
+            accent_color: niri_config::Color::from_rgba8_unpremul(255, 210, 230, 255),
+            stitch_size: 11.,
+            relief: 0.8,
+            fuzz: 0.,
+        };
+
+        let mut ring = FocusRing::new(config);
+        ring.update_knit(Some(knit));
+        ring.update_render_elements(
+            Size::from((200., 120.)),
+            false,
+            false,
+            false,
+            Rectangle::from_size(Size::from((1920., 1080.))),
+            CornerRadius::from(16.),
+            1.,
+            1.,
+        );
+
+        assert!(ring.is_border);
+        assert!(ring.sizes.iter().all(|size| size.w > 0. && size.h > 0.));
+        assert!(ring
+            .borders
+            .iter()
+            .all(|border| border.knit_for_tests() == Some(knit)));
+
+        let sizes_before_urgent = ring.sizes;
+        ring.update_render_elements(
+            Size::from((200., 120.)),
+            false,
+            false,
+            true,
+            Rectangle::from_size(Size::from((1920., 1080.))),
+            CornerRadius::from(16.),
+            1.,
+            1.,
+        );
+
+        assert_eq!(ring.sizes, sizes_before_urgent);
+        assert!(ring
+            .borders
+            .iter()
+            .all(|border| border.knit_for_tests() == Some(knit)));
     }
 }

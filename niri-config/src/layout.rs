@@ -5,7 +5,9 @@ use crate::appearance::{
     Border, FocusRing, InsertHint, Shadow, TabIndicator, DEFAULT_BACKGROUND_COLOR,
 };
 use crate::utils::{expect_only_children, Flag, MergeWith};
-use crate::{BorderRule, Color, FloatOrInt, InsertHintPart, ShadowRule, TabIndicatorPart};
+use crate::{
+    BorderRule, Color, FloatOrInt, FocusRingRule, InsertHintPart, ShadowRule, TabIndicatorPart,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
@@ -97,7 +99,7 @@ impl MergeWith<LayoutPart> for Layout {
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
 pub struct LayoutPart {
     #[knuffel(child)]
-    pub focus_ring: Option<BorderRule>,
+    pub focus_ring: Option<FocusRingRule>,
     #[knuffel(child)]
     pub border: Option<BorderRule>,
     #[knuffel(child)]

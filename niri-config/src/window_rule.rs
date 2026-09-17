@@ -1,8 +1,8 @@
 use niri_ipc::ColumnDisplay;
 
 use crate::appearance::{
-    BackgroundEffect, BackgroundEffectRule, BlockOutFrom, BorderRule, CornerRadius, ShadowRule,
-    TabIndicatorRule,
+    BackgroundEffect, BackgroundEffectRule, BlockOutFrom, BorderRule, CornerRadius, FocusRingRule,
+    ShadowRule, TabIndicatorRule,
 };
 use crate::layout::DefaultPresetSize;
 use crate::utils::{MergeWith, RegexEq};
@@ -48,7 +48,7 @@ pub struct WindowRule {
     pub max_height: Option<u16>,
 
     #[knuffel(child, default)]
-    pub focus_ring: BorderRule,
+    pub focus_ring: FocusRingRule,
     #[knuffel(child, default)]
     pub border: BorderRule,
     #[knuffel(child, default)]

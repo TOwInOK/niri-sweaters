@@ -54,6 +54,12 @@ impl Shaders {
                 UniformName::new("geo_size", UniformType::_2f),
                 UniformName::new("outer_radius", UniformType::_4f),
                 UniformName::new("border_width", UniformType::_1f),
+                UniformName::new("knit_enabled", UniformType::_1f),
+                UniformName::new("knit_pattern", UniformType::_1f),
+                UniformName::new("knit_accent_color", UniformType::_4f),
+                UniformName::new("knit_stitch_size", UniformType::_1f),
+                UniformName::new("knit_relief", UniformType::_1f),
+                UniformName::new("knit_fuzz", UniformType::_1f),
             ],
             &[],
         )

@@ -783,7 +783,8 @@ window-rule {
 
 Override the focus ring and border options for the window.
 
-These rules have the same options as the normal [`focus-ring` and `border` config in the layout section](./Configuration:-Layout.md#focus-ring-and-border), so check the documentation there.
+`focus-ring` and `border` rules support their corresponding options from the [`layout` section](./Configuration:-Layout.md#focus-ring-and-border).
+The `border` rule additionally supports the nested [`knit` options](./Configuration:-Layout.md#procedural-knit-border), which can override the global pattern, accent color, stitch size and relief per application.
 
 However, in addition to `off` to disable the border/focus ring, this window rule has an `on` flag that enables the border/focus ring for the window even if it was otherwise disabled.
 The `on` flag has precedence over the `off` flag, in case both are set.

@@ -265,6 +265,7 @@ pub struct Border {
     pub active_gradient: Option<Gradient>,
     pub inactive_gradient: Option<Gradient>,
     pub urgent_gradient: Option<Gradient>,
+    pub knit: KnitBorder,
 }
 
 impl Default for Border {
@@ -278,27 +279,48 @@ impl Default for Border {
             active_gradient: None,
             inactive_gradient: None,
             urgent_gradient: None,
+            knit: KnitBorder::default(),
+        }
+    }
+}
+
+#[derive(knuffel::DecodeScalar, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum KnitPattern {
+    #[default]
+    Stockinette,
+    Rib,
+    Checker,
+    Zigzag,
+    Diamond,
+    Dots,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KnitBorder {
+    pub off: bool,
+    pub pattern: KnitPattern,
+    pub accent_color: Color,
+    pub stitch_size: f64,
+    // TODO: mb lithness
+    pub relief: f64,
+    pub fuzz: f64,
+}
+
+impl Default for KnitBorder {
+    fn default() -> Self {
+        Self {
+            off: true,
+            pattern: KnitPattern::default(),
+            accent_color: Color::from_rgba8_unpremul(245, 226, 184, 255),
+            stitch_size: 5.,
+            relief: 0.8,
+            fuzz: 0.,
         }
     }
 }
 
 impl From<Border> for FocusRing {
     fn from(value: Border) -> Self {
-        Self {
-            off: value.off,
-            width: value.width,
-            active_color: value.active_color,
-            inactive_color: value.inactive_color,
-            urgent_color: value.urgent_color,
-            active_gradient: value.active_gradient,
-            inactive_gradient: value.inactive_gradient,
-            urgent_gradient: value.urgent_gradient,
-        }
-    }
-}
-
-impl From<FocusRing> for Border {
-    fn from(value: FocusRing) -> Self {
         Self {
             off: value.off,
             width: value.width,
@@ -327,14 +349,26 @@ impl MergeWith<BorderRule> for Border {
             (inactive_color, inactive_gradient),
             (urgent_color, urgent_gradient),
         );
+
+        self.knit.merge_with(&part.knit);
     }
 }
 
-impl MergeWith<BorderRule> for FocusRing {
-    fn merge_with(&mut self, part: &BorderRule) {
-        let mut x = Border::from(*self);
-        x.merge_with(part);
-        *self = FocusRing::from(x);
+impl MergeWith<FocusRingRule> for FocusRing {
+    fn merge_with(&mut self, part: &FocusRingRule) {
+        self.off |= part.off;
+        if part.on {
+            self.off = false;
+        }
+
+        merge!((self, part), width);
+
+        merge_color_gradient!(
+            (self, part),
+            (active_color, active_gradient),
+            (inactive_color, inactive_gradient),
+            (urgent_color, urgent_gradient),
+        );
     }
 }
 
@@ -623,6 +657,45 @@ pub enum BlockOutFrom {
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct FocusRingRule {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub width: Option<FloatOrInt<0, 65535>>,
+    #[knuffel(child)]
+    pub active_color: Option<Color>,
+    #[knuffel(child)]
+    pub inactive_color: Option<Color>,
+    #[knuffel(child)]
+    pub urgent_color: Option<Color>,
+    #[knuffel(child)]
+    pub active_gradient: Option<Gradient>,
+    #[knuffel(child)]
+    pub inactive_gradient: Option<Gradient>,
+    #[knuffel(child)]
+    pub urgent_gradient: Option<Gradient>,
+}
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct KnitBorderRule {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub pattern: Option<KnitPattern>,
+    #[knuffel(child)]
+    pub accent_color: Option<Color>,
+    #[knuffel(child, unwrap(argument))]
+    pub stitch_size: Option<FloatOrInt<1, 64>>,
+    #[knuffel(child, unwrap(argument))]
+    pub relief: Option<FloatOrInt<0, 1>>,
+    #[knuffel(child, unwrap(argument))]
+    pub fuzz: Option<FloatOrInt<0, 1>>,
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
 pub struct BorderRule {
     #[knuffel(child)]
     pub off: bool,
@@ -642,6 +715,8 @@ pub struct BorderRule {
     pub inactive_gradient: Option<Gradient>,
     #[knuffel(child)]
     pub urgent_gradient: Option<Gradient>,
+    #[knuffel(child, default)]
+    pub knit: KnitBorderRule,
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
@@ -680,7 +755,50 @@ pub struct TabIndicatorRule {
     pub urgent_gradient: Option<Gradient>,
 }
 
+impl MergeWith<KnitBorderRule> for KnitBorder {
+    fn merge_with(&mut self, part: &KnitBorderRule) {
+        self.off |= part.off;
+        if part.on {
+            self.off = false;
+        }
+        if let Some(pattern) = part.pattern {
+            self.pattern = pattern;
+        }
+        if let Some(color) = part.accent_color {
+            self.accent_color = color;
+        }
+        merge!((self, part), stitch_size, relief, fuzz);
+    }
+}
+
+impl MergeWith<Self> for KnitBorderRule {
+    fn merge_with(&mut self, part: &Self) {
+        merge_on_off!((self, part));
+        merge_clone_opt!(
+            (self, part),
+            pattern,
+            accent_color,
+            stitch_size,
+            relief,
+            fuzz
+        );
+    }
+}
+
 impl MergeWith<Self> for BorderRule {
+    fn merge_with(&mut self, part: &Self) {
+        merge_on_off!((self, part));
+        merge_clone_opt!((self, part), width);
+        merge_color_gradient_opt!(
+            (self, part),
+            (active_color, active_gradient),
+            (inactive_color, inactive_gradient),
+            (urgent_color, urgent_gradient),
+        );
+        self.knit.merge_with(&part.knit);
+    }
+}
+impl MergeWith<Self> for FocusRingRule {
     fn merge_with(&mut self, part: &Self) {
         merge_on_off!((self, part));
 
@@ -1227,6 +1345,57 @@ mod tests {
         assert_snapshot!(is_on("on", &["on", "on"]), @"on");
     }
 
+    #[test]
+    fn knit_border_rules_merge() {
+        let config = Config::parse_mem(
+            r##"
+            layout {
+                border {
+                    on
+                    width 18
+                    active-color "#174f32"
+                    knit {
+                        on
+                        pattern "zigzag"
+                        accent-color "#f5e2b8"
+                        stitch-size 5
+                        relief 0.85
+                        fuzz 0.25
+                    }
+                }
+            }
+
+            window-rule {
+                border {
+                    knit {
+                        pattern "checker"
+                        accent-color "#8ed8ff"
+                        stitch-size 7
+                        relief 0.6
+                        fuzz 0.7
+                    }
+                }
+            }
+            "##,
+        )
+        .unwrap();
+
+        let mut border = config.layout.border;
+        for rule in &config.window_rules {
+            border.merge_with(&rule.border);
+        }
+
+        assert!(!border.off);
+        assert!(!border.knit.off);
+        assert_eq!(border.knit.pattern, KnitPattern::Checker);
+        assert_eq!(
+            border.knit.accent_color,
+            Color::from_rgba8_unpremul(142, 216, 255, 255)
+        );
+        assert_eq!(border.knit.stitch_size, 7.);
+        assert_eq!(border.knit.relief, 0.6);
+        assert_eq!(border.knit.fuzz, 0.7);
+    }
     #[test]
     fn rule_color_can_override_base_gradient() {
         let config = Config::parse_mem(
