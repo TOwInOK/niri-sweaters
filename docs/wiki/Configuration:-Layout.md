@@ -384,6 +384,9 @@ layout {
 The `border` section can render a procedural knitted material instead of a flat color or gradient.
 This option applies only to `border`, not to `focus-ring`.
 The stitch geometry, lighting and pattern are generated in the border shader, so no image assets are required.
+The material uses dense V-shaped loops with curved yarn bodies, tucked ends and overlapping courses.
+Irregular fibre bundles affect both colour and surface normals; short fibres soften contacts without blurring whole stitches.
+The band has a rounded, matte surface rather than a flat texture.
 
 ```kdl
 layout {
@@ -409,11 +412,18 @@ layout {
 ```
 
 `pattern` can be `stockinette`, `rib`, `checker`, `zigzag`, `diamond` or `dots`.
+Accent motifs are made from whole stitches; `zigzag` forms a stepped, alternating diagonal rather than parallel stripes.
 `stitch-size` is measured in logical pixels and accepts values from 1 to 64.
 `relief` controls yarn thickness, surface lighting and contact shadow from 0 to 1 without changing the pattern repeat.
-`fuzz` adds stable irregular edges, a soft fibre halo and matte wool roughness from 0 to 1; the default is 0 for clean chunky yarn.
+Compact fibres and short nap are intrinsic to the wool material, even with `fuzz 0`.
+`fuzz` extends the short pile and edge irregularity from 0 to 1; the default is 0 for compact wool.
+Fibres have varied lengths and slants, follow the yarn, and are filtered at small pixel sizes, including fractional output scales.
+The pile stays within the existing border geometry; it does not create a separate surface outside the frame.
 The normal active, inactive and urgent colors or gradients provide the base yarn color; `accent-color` supplies the pattern yarn.
-Corners use a 45° mitered decrease spine in the base yarn; the accent motif fades before the seam so stitches keep a constant scale through rounded corners.
+Rounded corners use concentric courses with individually rotated stitches. Each course fits its own
+stitch count to the arc length, so inner turns contain fewer loops instead of radially pinched yarn.
+The accent motif continues around the bend without a diagonal seam or a color fade.
+Very tight turns limit changes in stitch width to preserve the body of the yarn.
 
 The nested `knit` options can also be overridden in a `window-rule` to give individual applications their own pattern and palette.
 Use `off` inside `knit` to return a matching window to the standard border renderer.
