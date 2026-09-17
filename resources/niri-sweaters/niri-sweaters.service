@@ -11,4 +11,4 @@ Before=xdg-desktop-autostart.target
 [Service]
 Slice=session.slice
 Type=notify
-ExecStart=/usr/local/bin/niri-sweaters --session
+ExecStart=/usr/local/bin/niri-sweaters-session

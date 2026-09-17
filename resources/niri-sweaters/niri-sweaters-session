@@ -2,8 +2,19 @@
 set -eu
 
 variant_bin=/usr/local/bin/niri-sweaters
+default_config=/usr/local/share/niri-sweaters/default-config.kdl
 service=niri-sweaters.service
 shutdown=niri-sweaters-shutdown.target
+config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
+config="$config_home/niri-sweaters/config.kdl"
+
+if [ ! -e "$config" ]; then
+    mkdir -p "$(dirname -- "$config")"
+    cp -- "$default_config" "$config"
+fi
+
+NIRI_CONFIG=$config
+export NIRI_CONFIG
 
 # When systemd starts the service, run the compositor directly instead of
 # recursively asking the service manager to start the same unit.
@@ -41,7 +52,7 @@ if command -v systemctl >/dev/null 2>&1; then
 
     systemctl --user --wait start "$service"
     systemctl --user start --job-mode=replace-irreversibly "$shutdown"
-    systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP NIRI_SOCKET
+    systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP NIRI_SOCKET NIRI_CONFIG
 else
     exec "$variant_bin" --session
 fi

@@ -1,6 +1,6 @@
 # This flake file is community maintained
 {
-  description = "Niri: A scrollable-tiling Wayland compositor.";
+  description = "Niri Sweaters: niri with procedural knitted borders.";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
@@ -11,7 +11,7 @@
     }:
     let
       revision = self.shortRev or self.dirtyShortRev or "unknown";
-      niri-package =
+      niri-sweaters-package =
         {
           lib,
           cairo,
@@ -28,7 +28,6 @@
           rustPlatform,
           systemd,
           wayland,
-          installShellFiles,
           withDbus ? true,
           withSystemd ? true,
           withScreencastSupport ? true,
@@ -36,7 +35,7 @@
         }:
 
         rustPlatform.buildRustPackage {
-          pname = "niri";
+          pname = "niri-sweaters";
           version = revision;
 
           src = lib.fileset.toSource {
@@ -53,9 +52,14 @@
           };
 
           postPatch = ''
-            patchShebangs resources/niri-session
-            substituteInPlace resources/niri.service \
-              --replace-fail 'ExecStart=niri' "ExecStart=$out/bin/niri"
+            patchShebangs resources/niri-sweaters/niri-sweaters-session
+            substituteInPlace resources/niri-sweaters/niri-sweaters-session \
+              --replace-fail '/usr/local/bin/niri-sweaters' "$out/bin/niri-sweaters" \
+              --replace-fail '/usr/local/share/niri-sweaters/default-config.kdl' "$out/share/niri-sweaters/default-config.kdl"
+            substituteInPlace resources/niri-sweaters/niri-sweaters.service \
+              --replace-fail '/usr/local/bin/niri-sweaters-session' "$out/bin/niri-sweaters-session"
+            substituteInPlace resources/niri-sweaters/niri-sweaters.desktop \
+              --replace-fail '/usr/local/bin/niri-sweaters-session' "$out/bin/niri-sweaters-session"
           '';
 
           cargoLock = {
@@ -69,26 +73,24 @@
           nativeBuildInputs = [
             rustPlatform.bindgenHook
             pkg-config
-            installShellFiles
           ];
 
-          buildInputs =
-            [
-              cairo
-              dbus
-              libGL
-              libdisplay-info_0_3
-              libinput
-              seatd
-              libxkbcommon
-              libgbm
-              pango
-              wayland
-            ]
-            ++ lib.optional (withDbus || withScreencastSupport || withSystemd) dbus
-            ++ lib.optional withScreencastSupport pipewire
-            # Also includes libudev
-            ++ lib.optional withSystemd systemd;
+          buildInputs = [
+            cairo
+            dbus
+            libGL
+            libdisplay-info_0_3
+            libinput
+            seatd
+            libxkbcommon
+            libgbm
+            pango
+            wayland
+          ]
+          ++ lib.optional (withDbus || withScreencastSupport || withSystemd) dbus
+          ++ lib.optional withScreencastSupport pipewire
+          # Also includes libudev
+          ++ lib.optional withSystemd systemd;
 
           buildFeatures =
             lib.optional withDbus "dbus"
@@ -111,22 +113,20 @@
             # inside the Nix sandbox
             "--skip=::egl"
           ];
+          postInstall = ''
+            mv $out/bin/niri $out/bin/niri-sweaters
 
-          postInstall =
-            ''
-              installShellCompletion --cmd niri \
-                --bash <($out/bin/niri completions bash) \
-                --fish <($out/bin/niri completions fish) \
-                --nushell <($out/bin/niri completions nushell) \
-                --zsh <($out/bin/niri completions zsh)
-
-              install -Dm644 resources/niri.desktop -t $out/share/wayland-sessions
-              install -Dm644 resources/niri-portals.conf -t $out/share/xdg-desktop-portal
-            ''
-            + lib.optionalString withSystemd ''
-              install -Dm755 resources/niri-session $out/bin/niri-session
-              install -Dm644 resources/niri{.service,-shutdown.target} -t $out/lib/systemd/user
-            '';
+            install -Dm644 resources/niri-sweaters/niri-sweaters.desktop -t $out/share/wayland-sessions
+            install -Dm644 resources/niri-portals.conf $out/share/xdg-desktop-portal/niri-sweaters-portals.conf
+            install -Dm644 resources/default-config.kdl $out/share/niri-sweaters/default-config.kdl
+          ''
+          + lib.optionalString withSystemd ''
+            install -Dm755 resources/niri-sweaters/niri-sweaters-session $out/bin/niri-sweaters-session
+            install -Dm644 \
+              resources/niri-sweaters/niri-sweaters.service \
+              resources/niri-sweaters/niri-sweaters-shutdown.target \
+              -t $out/lib/systemd/user
+          '';
 
           env = {
             # Force linking with libEGL and libwayland-client so they end up in RPATH and
@@ -143,14 +143,13 @@
           };
 
           passthru = {
-            providedSessions = [ "niri" ];
+            providedSessions = [ "niri-sweaters" ];
           };
 
           meta = {
-            description = "Scrollable-tiling Wayland compositor";
-            homepage = "https://github.com/niri-wm/niri";
+            description = "Scrollable-tiling Wayland compositor with procedural knitted borders";
             license = lib.licenses.gpl3Only;
-            mainProgram = "niri";
+            mainProgram = "niri-sweaters";
             platforms = lib.platforms.linux;
           };
         };
@@ -164,8 +163,8 @@
     in
     {
       checks = forAllSystems (system: {
-        # We use the debug build here to save a bit of time
-        inherit (self.packages.${system}) niri-debug;
+        # We use the debug build here to save a bit of time.
+        niri-sweaters-debug = self.packages.${system}.niri-sweaters-debug;
       });
 
       devShells = forAllSystems (
@@ -173,7 +172,7 @@
         let
           pkgs = nixpkgsFor.${system};
           rustfmt' = pkgs.rustfmt.override { asNightly = true; };
-          inherit (self.packages.${system}) niri;
+          niriSweaters = self.packages.${system}.niri-sweaters;
         in
         {
           default = pkgs.mkShell {
@@ -193,17 +192,17 @@
               pkgs.wrapGAppsHook4 # For `niri-visual-tests`
             ];
 
-            buildInputs = niri.buildInputs ++ [
+            buildInputs = niriSweaters.buildInputs ++ [
               pkgs.libadwaita # For `niri-visual-tests`
             ];
 
             env = {
               # WARN: Do not overwrite this variable in your shell!
               # It is required for `dlopen()` to work on some libraries; see the comment
-              # in the package expression
+              # in the package expression.
               #
-              # This should only be set with `RUSTFLAGS="$RUSTFLAGS -C your-flags"`
-              RUSTFLAGS = niri.RUSTFLAGS;
+              # This should only be set with `RUSTFLAGS="$RUSTFLAGS -C your-flags"`.
+              RUSTFLAGS = niriSweaters.RUSTFLAGS;
             };
           };
         }
@@ -214,17 +213,13 @@
       packages = forAllSystems (
         system:
         let
-          niri = nixpkgsFor.${system}.callPackage niri-package { };
+          niriSweaters = nixpkgsFor.${system}.callPackage niri-sweaters-package { };
         in
         {
-          inherit niri;
+          niri-sweaters = niriSweaters;
 
-          # NOTE: This is for development purposes only
-          #
-          # It is primarily to help with quickly iterating on
-          # changes made to the above expression - though it is
-          # also not stripped in order to better debug niri itself
-          niri-debug = niri.overrideAttrs (
+          # NOTE: This is for development purposes only.
+          niri-sweaters-debug = niriSweaters.overrideAttrs (
             newAttrs: oldAttrs: {
               pname = oldAttrs.pname + "-debug";
 
@@ -235,12 +230,22 @@
             }
           );
 
-          default = niri;
+          default = niriSweaters;
         }
       );
 
       overlays.default = final: _: {
-        niri = final.callPackage niri-package { };
+        niri-sweaters = final.callPackage niri-sweaters-package { };
       };
+
+      nixosModules.default =
+        { pkgs, ... }:
+        let
+          package = pkgs.callPackage niri-sweaters-package { };
+        in
+        {
+          environment.systemPackages = [ package ];
+          services.displayManager.sessionPackages = [ package ];
+        };
     };
 }

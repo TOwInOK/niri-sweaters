@@ -6,6 +6,7 @@ install_session=/usr/local/bin/niri-sweaters-session
 install_service=/usr/lib/systemd/user/niri-sweaters.service
 install_shutdown=/usr/lib/systemd/user/niri-sweaters-shutdown.target
 install_desktop=/usr/share/wayland-sessions/niri-sweaters.desktop
+install_default_config=/usr/local/share/niri-sweaters/default-config.kdl
 
 dry_run=0
 
@@ -74,17 +75,7 @@ run_privileged() {
 
     case "$privilege_tool" in
     pkexec)
-        if "$pkexec" "$@"; then
-            return 0
-        fi
-        status=$?
-        if [ "$status" -eq 126 ] && [ -n "$run0" ]; then
-            echo 'pkexec authorization was dismissed; retrying with run0...' >&2
-            privilege_tool=run0
-            "$run0" --pty "$@"
-            return
-        fi
-        return "$status"
+        "$pkexec" "$@"
         ;;
     run0)
         "$run0" --pty "$@"
@@ -101,7 +92,8 @@ run_privileged "$rm" -f \
     "$install_session" \
     "$install_service" \
     "$install_shutdown" \
-    "$install_desktop"
+    "$install_desktop" \
+    "$install_default_config"
 
 if [ "$dry_run" -eq 1 ]; then
     exit 0
@@ -116,7 +108,8 @@ for path in \
     "$install_session" \
     "$install_service" \
     "$install_shutdown" \
-    "$install_desktop"; do
+    "$install_desktop" \
+    "$install_default_config"; do
     if [ -e "$path" ]; then
         echo "error: failed to remove $path" >&2
         exit 1

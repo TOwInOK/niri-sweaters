@@ -1,0 +1,126 @@
+// Run from an existing Wayland session:
+// ./target/debug/niri --config resources/knit-preview.kdl
+// This standalone preview does not load your personal niri configuration.
+// Requires Ghostty. In nested niri, Mod is Alt: Alt+Shift+E exits the preview.
+
+input {}
+
+layout {
+    background-color "#e9e1cd"
+    gaps 20
+    default-column-width { fixed 540; }
+    center-focused-column "never"
+    focus-ring { off; }
+    border {
+        on
+        width 24
+        active-color "#a94728"
+        inactive-color "#91503c"
+        urgent-color "#c85b35"
+        knit {
+            on
+            pattern "stockinette"
+            stitch-size 8
+            relief 0.8
+            fuzz 0.35
+        }
+    }
+}
+
+window-rule {
+    geometry-corner-radius 18
+    clip-to-geometry true
+}
+
+window-rule {
+    match app-id=r#"^com\.mitchellh\.ghostty$"# title="Sweaters / checker"
+    border {
+        active-color "#174f32"
+        inactive-color "#365440"
+        knit {
+            pattern "checker"
+            accent-color "#eadc9d"
+        }
+    }
+}
+
+window-rule {
+    match app-id=r#"^com\.mitchellh\.ghostty$"# title="Sweaters / diamond"
+    border {
+        active-gradient from="#7048a8" to="#b85a88" angle=45
+        inactive-gradient from="#635674" to="#916c80" angle=45
+        knit {
+            pattern "diamond"
+            accent-color "#ffd2e6"
+        }
+    }
+}
+
+// Application palettes used in the README showcase.
+window-rule {
+    match app-id=r#"^dev\.zed\.Zed$"#
+    border {
+        active-color "#445873"
+        inactive-color "#445873"
+        knit {
+            pattern "rib"
+            accent-color "#aabbd2"
+        }
+    }
+}
+
+window-rule {
+    match app-id=r#"^com\.mitchellh\.ghostty$"# title="^Helix$"
+    border {
+        active-color "#465440"
+        inactive-color "#465440"
+        knit {
+            pattern "checker"
+            accent-color "#bac6a6"
+        }
+    }
+}
+
+window-rule {
+    match app-id=r#"^md\.obsidian\.Obsidian$"#
+    border {
+        active-gradient from="#58476e" to="#796184" angle=45
+        inactive-gradient from="#58476e" to="#796184" angle=45
+        knit {
+            pattern "diamond"
+            accent-color "#c8badf"
+        }
+    }
+}
+
+window-rule {
+    match app-id=r#"^com\.mitchellh\.ghostty$"# title="^Oh My Pi$"
+    border {
+        active-gradient from="#945ba1" to="#477f97" angle=110
+        inactive-gradient from="#945ba1" to="#477f97" angle=110
+        knit { pattern "stockinette"; }
+    }
+}
+
+spawn-at-startup "ghostty" "--config-default-files=false" "--title=Sweaters / stockinette" "--window-decoration=false" "--font-size=16" "--background=#faf6ed" "--foreground=#38352e" "--window-padding-x=22" "--window-padding-y=24" "-e" "sh" "-c" r#"
+printf '\033[1mYOUR WINDOWS.\nIN SWEATERS.\033[0m\n\nProcedural knitted borders\nfor the niri compositor.\n\n\n01 / STOCKINETTE\n\nDense loops. Warm terracotta.\nRendered, not wallpapered.\n\n\nAlt + Left / Right  switch columns\nAlt + R             resize\nAlt + Shift + E     quit preview\n'
+exec sleep infinity
+"#
+
+spawn-at-startup "ghostty" "--config-default-files=false" "--title=Sweaters / checker" "--window-decoration=false" "--font-size=16" "--background=#faf6ed" "--foreground=#38352e" "--window-padding-x=22" "--window-padding-y=24" "-e" "sh" "-c" r##"
+printf '\033[1mPICK YOUR PATTERN.\033[0m\n\nSix ways to dress a window.\n\n\n02 / CHECKER\n\nForest green + cream.\nA different sweater for every app.\n\n\nknit {\n    on\n    pattern "checker"\n    accent-color "#eadc9d"\n    stitch-size 8\n    relief 0.8\n    fuzz 0.35\n}\n'
+exec sleep infinity
+"##
+
+spawn-at-startup "ghostty" "--config-default-files=false" "--title=Sweaters / diamond" "--window-decoration=false" "--font-size=16" "--background=#faf6ed" "--foreground=#38352e" "--window-padding-x=22" "--window-padding-y=24" "-e" "sh" "-c" r#"
+printf '\033[1mPART OF THE WINDOW.\033[0m\n\nNot a separate overlay.\n\n\n03 / DIAMOND\n\nPurple-to-rose gradient yarn.\nSame scrolling workflow.\n\n\nMove. Resize. Change focus.\nThe border stays with its window.\n\n\nstockinette / rib / checker\nzigzag / diamond / dots\n'
+exec sleep infinity
+"#
+
+binds {
+    Mod+Return { spawn "ghostty"; }
+    Mod+Left { focus-column-left; }
+    Mod+Right { focus-column-right; }
+    Mod+R { switch-preset-column-width; }
+    Mod+Shift+E { quit; }
+}

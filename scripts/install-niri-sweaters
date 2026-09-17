@@ -4,6 +4,8 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 resources_dir="$root_dir/resources/niri-sweaters"
+knit_config="$root_dir/resources/knit-preview.kdl"
+default_config="$root_dir/resources/default-config.kdl"
 binary="$root_dir/target/release/niri"
 
 install_binary=/usr/local/bin/niri-sweaters
@@ -11,6 +13,7 @@ install_session=/usr/local/bin/niri-sweaters-session
 install_service=/usr/lib/systemd/user/niri-sweaters.service
 install_shutdown=/usr/lib/systemd/user/niri-sweaters-shutdown.target
 install_desktop=/usr/share/wayland-sessions/niri-sweaters.desktop
+install_default_config=/usr/local/share/niri-sweaters/default-config.kdl
 
 skip_build=0
 dry_run=0
@@ -69,7 +72,7 @@ if [ "$skip_build" -eq 0 ]; then
     echo 'Building release binary...'
     (
         cd "$root_dir"
-        cargo build --release --locked
+        cargo build --release --locked --target-dir "$root_dir/target"
     )
 fi
 
@@ -82,12 +85,24 @@ for resource in \
     "$resources_dir/niri-sweaters-session" \
     "$resources_dir/niri-sweaters.service" \
     "$resources_dir/niri-sweaters-shutdown.target" \
-    "$resources_dir/niri-sweaters.desktop"; do
+    "$resources_dir/niri-sweaters.desktop" \
+    "$knit_config" \
+    "$default_config"; do
     if [ ! -f "$resource" ]; then
         echo "error: resource not found: $resource" >&2
         exit 1
     fi
 done
+if [ "$dry_run" -eq 0 ] && ! command -v systemctl >/dev/null 2>&1; then
+    echo 'error: systemctl is required to reload the user service units' >&2
+    exit 1
+fi
+
+echo 'Validating Niri Sweaters binary...'
+if ! "$binary" validate --config "$knit_config"; then
+    echo "error: release binary does not support the bundled knit configuration: $binary" >&2
+    exit 1
+fi
 
 install=$(command -v install)
 
@@ -106,17 +121,7 @@ run_privileged() {
 
     case "$privilege_tool" in
     pkexec)
-        if "$pkexec" "$@"; then
-            return 0
-        fi
-        status=$?
-        if [ "$status" -eq 126 ] && [ -n "$run0" ]; then
-            echo 'pkexec authorization was dismissed; retrying with run0...' >&2
-            privilege_tool=run0
-            "$run0" --pty "$@"
-            return
-        fi
-        return "$status"
+        "$pkexec" "$@"
         ;;
     run0)
         "$run0" --pty "$@"
@@ -133,20 +138,22 @@ run_privileged "$install" -Dm755 "$resources_dir/niri-sweaters-session" "$instal
 run_privileged "$install" -Dm644 "$resources_dir/niri-sweaters.service" "$install_service"
 run_privileged "$install" -Dm644 "$resources_dir/niri-sweaters-shutdown.target" "$install_shutdown"
 run_privileged "$install" -Dm644 "$resources_dir/niri-sweaters.desktop" "$install_desktop"
+run_privileged "$install" -Dm644 "$default_config" "$install_default_config"
 
 if [ "$dry_run" -eq 1 ]; then
     exit 0
 fi
 
-if ! command -v systemctl >/dev/null 2>&1; then
-    echo 'error: systemctl is required to reload the user service units' >&2
+systemctl --user daemon-reload
+if ! "$install_binary" validate --config "$knit_config"; then
+    echo 'error: installed binary does not support the bundled knit configuration' >&2
     exit 1
 fi
 
-systemctl --user daemon-reload
-
 printf 'Installed: '
 "$install_binary" --version
+echo 'Use niri-sweaters validate for configs with knit directives; stock niri remains unchanged.'
+echo 'Session config: ~/.config/niri-sweaters/config.kdl'
 
 if command -v systemd-analyze >/dev/null 2>&1; then
     systemd-analyze --user verify niri-sweaters.service niri-sweaters-shutdown.target
