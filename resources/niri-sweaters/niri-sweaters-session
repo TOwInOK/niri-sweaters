@@ -1,0 +1,47 @@
+#!/bin/sh
+set -eu
+
+variant_bin=/usr/local/bin/niri-sweaters
+service=niri-sweaters.service
+shutdown=niri-sweaters-shutdown.target
+
+# When systemd starts the service, run the compositor directly instead of
+# recursively asking the service manager to start the same unit.
+if [ -n "${MANAGERPID:-}" ] && [ "${SYSTEMD_EXEC_PID:-}" = "$$" ]; then
+    case "$(ps -p "$MANAGERPID" -o cmd=)" in
+    *systemd*--user*)
+        exec "$variant_bin" --session
+        ;;
+    esac
+fi
+
+if [ -n "${SHELL:-}" ] &&
+   grep -q "$SHELL" /etc/shells &&
+   ! (echo "$SHELL" | grep -q "false") &&
+   ! (echo "$SHELL" | grep -q "nologin"); then
+  if [ "${1:-}" != '-l' ]; then
+    exec "$SHELL" -l -c "exec $0 -l $*"
+  else
+    shift
+  fi
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+    if systemctl --user -q is-active "$service"; then
+      echo 'A Niri Sweaters session is already running.'
+      exit 1
+    fi
+
+    systemctl --user reset-failed
+    systemctl --user import-environment
+
+    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        dbus-update-activation-environment --all
+    fi
+
+    systemctl --user --wait start "$service"
+    systemctl --user start --job-mode=replace-irreversibly "$shutdown"
+    systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP NIRI_SOCKET
+else
+    exec "$variant_bin" --session
+fi

@@ -1,0 +1,161 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+resources_dir="$root_dir/resources/niri-sweaters"
+binary="$root_dir/target/release/niri"
+
+install_binary=/usr/local/bin/niri-sweaters
+install_session=/usr/local/bin/niri-sweaters-session
+install_service=/usr/lib/systemd/user/niri-sweaters.service
+install_shutdown=/usr/lib/systemd/user/niri-sweaters-shutdown.target
+install_desktop=/usr/share/wayland-sessions/niri-sweaters.desktop
+
+skip_build=0
+dry_run=0
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/install-niri-sweaters [OPTIONS]
+
+Build and install the Niri Sweaters session alongside the stock Niri session.
+
+Options:
+  --skip-build  Reuse target/release/niri.
+  --dry-run     Print privileged install commands without changing the system.
+  -h, --help    Show this help.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    --skip-build|--no-build)
+        skip_build=1
+        ;;
+    --dry-run)
+        dry_run=1
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    *)
+        echo "error: unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+    shift
+done
+
+pkexec=$(command -v pkexec || true)
+run0=$(command -v run0 || true)
+privilege_tool=
+if [ -n "$run0" ]; then
+    privilege_tool=run0
+elif [ -n "$pkexec" ]; then
+    privilege_tool=pkexec
+elif [ "$dry_run" -eq 0 ]; then
+    echo 'error: pkexec or run0 is required for system installation' >&2
+    exit 1
+fi
+
+if [ "$skip_build" -eq 0 ]; then
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo 'error: cargo is required; use --skip-build with an existing release binary' >&2
+        exit 1
+    fi
+    echo 'Building release binary...'
+    (
+        cd "$root_dir"
+        cargo build --release --locked
+    )
+fi
+
+if [ ! -x "$binary" ]; then
+    echo "error: release binary not found or not executable: $binary" >&2
+    exit 1
+fi
+
+for resource in \
+    "$resources_dir/niri-sweaters-session" \
+    "$resources_dir/niri-sweaters.service" \
+    "$resources_dir/niri-sweaters-shutdown.target" \
+    "$resources_dir/niri-sweaters.desktop"; do
+    if [ ! -f "$resource" ]; then
+        echo "error: resource not found: $resource" >&2
+        exit 1
+    fi
+done
+
+install=$(command -v install)
+
+run_privileged() {
+    if [ "$dry_run" -eq 1 ]; then
+        printf '+ %s' "$privilege_tool"
+        if [ "$privilege_tool" = run0 ]; then
+            printf ' --pty'
+        fi
+        for argument in "$@"; do
+            printf ' %s' "$argument"
+        done
+        printf '\n'
+        return 0
+    fi
+
+    case "$privilege_tool" in
+    pkexec)
+        if "$pkexec" "$@"; then
+            return 0
+        fi
+        status=$?
+        if [ "$status" -eq 126 ] && [ -n "$run0" ]; then
+            echo 'pkexec authorization was dismissed; retrying with run0...' >&2
+            privilege_tool=run0
+            "$run0" --pty "$@"
+            return
+        fi
+        return "$status"
+        ;;
+    run0)
+        "$run0" --pty "$@"
+        ;;
+    *)
+        echo 'error: no privilege tool selected' >&2
+        return 1
+        ;;
+    esac
+}
+
+run_privileged "$install" -Dm755 "$binary" "$install_binary"
+run_privileged "$install" -Dm755 "$resources_dir/niri-sweaters-session" "$install_session"
+run_privileged "$install" -Dm644 "$resources_dir/niri-sweaters.service" "$install_service"
+run_privileged "$install" -Dm644 "$resources_dir/niri-sweaters-shutdown.target" "$install_shutdown"
+run_privileged "$install" -Dm644 "$resources_dir/niri-sweaters.desktop" "$install_desktop"
+
+if [ "$dry_run" -eq 1 ]; then
+    exit 0
+fi
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo 'error: systemctl is required to reload the user service units' >&2
+    exit 1
+fi
+
+systemctl --user daemon-reload
+
+printf 'Installed: '
+"$install_binary" --version
+
+if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze --user verify niri-sweaters.service niri-sweaters-shutdown.target
+fi
+
+if command -v noctalia-greeter >/dev/null 2>&1; then
+    if ! noctalia-greeter sessions | grep -Fqx 'Niri Sweaters'; then
+        echo 'error: Noctalia Greeter did not discover Niri Sweaters' >&2
+        exit 1
+    fi
+    echo 'Session manager: Niri Sweaters detected'
+fi

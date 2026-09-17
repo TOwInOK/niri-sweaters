@@ -1,0 +1,126 @@
+#!/bin/sh
+set -eu
+
+install_binary=/usr/local/bin/niri-sweaters
+install_session=/usr/local/bin/niri-sweaters-session
+install_service=/usr/lib/systemd/user/niri-sweaters.service
+install_shutdown=/usr/lib/systemd/user/niri-sweaters-shutdown.target
+install_desktop=/usr/share/wayland-sessions/niri-sweaters.desktop
+
+dry_run=0
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/uninstall-niri-sweaters [OPTIONS]
+
+Remove only the Niri Sweaters session installed by this repository.
+
+Options:
+  --dry-run     Print privileged removal commands without changing the system.
+  -h, --help    Show this help.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    --dry-run)
+        dry_run=1
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    *)
+        echo "error: unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+    shift
+done
+
+pkexec=$(command -v pkexec || true)
+run0=$(command -v run0 || true)
+privilege_tool=
+if [ -n "$run0" ]; then
+    privilege_tool=run0
+elif [ -n "$pkexec" ]; then
+    privilege_tool=pkexec
+elif [ "$dry_run" -eq 0 ]; then
+    echo 'error: pkexec or run0 is required for system removal' >&2
+    exit 1
+fi
+
+if [ "$dry_run" -eq 0 ] && command -v systemctl >/dev/null 2>&1 &&
+   systemctl --user is-active --quiet niri-sweaters.service 2>/dev/null; then
+    echo 'error: Niri Sweaters is running; log out of that session before removing it' >&2
+    exit 1
+fi
+
+rm=$(command -v rm)
+
+run_privileged() {
+    if [ "$dry_run" -eq 1 ]; then
+        printf '+ %s' "$privilege_tool"
+        if [ "$privilege_tool" = run0 ]; then
+            printf ' --pty'
+        fi
+        for argument in "$@"; do
+            printf ' %s' "$argument"
+        done
+        printf '\n'
+        return 0
+    fi
+
+    case "$privilege_tool" in
+    pkexec)
+        if "$pkexec" "$@"; then
+            return 0
+        fi
+        status=$?
+        if [ "$status" -eq 126 ] && [ -n "$run0" ]; then
+            echo 'pkexec authorization was dismissed; retrying with run0...' >&2
+            privilege_tool=run0
+            "$run0" --pty "$@"
+            return
+        fi
+        return "$status"
+        ;;
+    run0)
+        "$run0" --pty "$@"
+        ;;
+    *)
+        echo 'error: no privilege tool selected' >&2
+        return 1
+        ;;
+    esac
+}
+
+run_privileged "$rm" -f \
+    "$install_binary" \
+    "$install_session" \
+    "$install_service" \
+    "$install_shutdown" \
+    "$install_desktop"
+
+if [ "$dry_run" -eq 1 ]; then
+    exit 0
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user daemon-reload
+fi
+
+for path in \
+    "$install_binary" \
+    "$install_session" \
+    "$install_service" \
+    "$install_shutdown" \
+    "$install_desktop"; do
+    if [ -e "$path" ]; then
+        echo "error: failed to remove $path" >&2
+        exit 1
+    fi
+done
+
+echo 'Removed Niri Sweaters session files'
