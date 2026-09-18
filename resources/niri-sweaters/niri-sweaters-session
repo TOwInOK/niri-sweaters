@@ -8,9 +8,20 @@ shutdown=niri-sweaters-shutdown.target
 config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
 config="$config_home/niri-sweaters/config.kdl"
 
-if [ ! -e "$config" ]; then
+if [ ! -e "$config" ] && [ ! -L "$config" ]; then
     mkdir -p "$(dirname -- "$config")"
-    cp -- "$default_config" "$config"
+    if [ -f "$config_home/niri/config.kdl" ]; then
+        (
+            config_copy=$(mktemp -d "$config_home/.niri-sweaters.XXXXXX")
+            trap 'chmod -R u+w -- "$config_copy"; rm -rf -- "$config_copy"' 0
+            # Dereference Home Manager links without losing private or executable modes.
+            cp -RL --preserve=mode -- "$config_home/niri/." "$config_copy/"
+            chmod -R u+w -- "$config_copy"
+            cp -R --no-clobber --preserve=mode -- "$config_copy/." "$(dirname -- "$config")/"
+        )
+    else
+        cp --no-clobber --no-preserve=mode -- "$default_config" "$config"
+    fi
 fi
 
 NIRI_CONFIG=$config
