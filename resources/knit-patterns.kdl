@@ -1,0 +1,169 @@
+// Run from an existing Wayland session:
+// ./target/release/niri --config resources/knit-patterns.kdl
+// Requires Ghostty. Six labelled terminals are arranged as a 3-by-2 grid.
+
+prefer-no-csd
+input {}
+
+layout {
+    background-color "#eee7d8"
+    gaps 28
+    default-column-width { proportion 0.33333; }
+    center-focused-column "never"
+    focus-ring { off; }
+    border {
+        on
+        width 64
+        active-color "#796952"
+        inactive-color "#796952"
+        urgent-color "#a76745"
+        knit {
+            on
+            pattern "stockinette"
+            stitch-size 8
+            relief 0.65
+            fuzz 0.15
+        }
+    }
+}
+
+window-rule {
+    geometry-corner-radius 24
+    clip-to-geometry true
+}
+
+
+window-rule {
+    match app-id=r#"^com\.mitchellh\.ghostty$"# title="^knit-pattern-stockinette$"
+    border {
+        active-color "#796952"
+        inactive-color "#796952"
+        knit { pattern "stockinette"; }
+    }
+}
+
+window-rule {
+    match app-id=r#"^com\.mitchellh\.ghostty$"# title="^knit-pattern-rib$"
+    border {
+        active-color "#526c89"
+        inactive-color "#526c89"
+        knit {
+            pattern "rib"
+            accent-color "#8fa6bf"
+        }
+    }
+}
+
+
+window-rule {
+    match app-id=r#"^com\.mitchellh\.ghostty$"# title="^knit-pattern-checker$"
+    border {
+        active-color "#5a6b53"
+        inactive-color "#5a6b53"
+        knit {
+            pattern "checker"
+            accent-color "#9ba98e"
+        }
+    }
+}
+
+
+window-rule {
+    match app-id=r#"^com\.mitchellh\.ghostty$"# title="^knit-pattern-zigzag$"
+    border {
+        active-color "#796952"
+        inactive-color "#796952"
+        knit {
+            pattern "zigzag"
+            accent-color "#b7a78b"
+        }
+    }
+}
+
+
+window-rule {
+    match app-id=r#"^com\.mitchellh\.ghostty$"# title="^knit-pattern-diamond$"
+    border {
+        active-gradient from="#6c5878" to="#aa97b7" angle=45
+        inactive-gradient from="#6c5878" to="#aa97b7" angle=45
+        knit {
+            pattern "diamond"
+            accent-color "#aa97b7"
+        }
+    }
+}
+
+
+window-rule {
+    match app-id=r#"^com\.mitchellh\.ghostty$"# title="^knit-pattern-dots$"
+    border {
+        active-color "#526c89"
+        inactive-color "#526c89"
+        knit {
+            pattern "dots"
+            accent-color "#8fa6bf"
+        }
+    }
+}
+
+
+spawn-at-startup "sh" "-c" r##"
+set -eu
+
+wait_for_title() {
+    title="$1"
+    attempt=0
+    until niri msg windows 2>/dev/null | grep -F "Title: \"$title\"" >/dev/null; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 300 ]; then
+            printf 'timed out waiting for %s\n' "$title" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+}
+
+open_terminal() {
+    title="$1"
+    pattern_name="$2"
+    ghostty \
+        --config-default-files=false \
+        "--title=$title" \
+        --window-decoration=false \
+        --font-size=16 \
+        --background=#faf6ed \
+        --foreground=#38352e \
+        --window-padding-x=22 \
+        --window-padding-y=24 \
+        -e sh -c 'printf "%s\n" "$1"; exec sleep infinity' sh "$pattern_name" &
+    wait_for_title "$title"
+}
+
+stack_focused_left() {
+    niri msg action consume-or-expel-window-left >/dev/null
+    niri msg action set-window-height "50%" >/dev/null
+    sleep 0.2
+}
+
+open_terminal knit-pattern-stockinette Stockinette
+open_terminal knit-pattern-zigzag Zigzag
+stack_focused_left
+
+open_terminal knit-pattern-rib Rib
+open_terminal knit-pattern-diamond Diamond
+stack_focused_left
+
+open_terminal knit-pattern-checker Checker
+open_terminal knit-pattern-dots Dots
+stack_focused_left
+
+niri msg action focus-column-first >/dev/null
+"##
+
+binds {
+    Alt+Left { focus-column-left; }
+    Alt+Right { focus-column-right; }
+    Alt+Up { focus-window-up; }
+    Alt+Down { focus-window-down; }
+    Alt+Shift+E { quit skip-confirmation=true; }
+}

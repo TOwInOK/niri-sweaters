@@ -1,0 +1,161 @@
+// Run from an existing Wayland session:
+// ./target/release/niri --config resources/knit-desktop.kdl
+// Launches Zed, Obsidian and two blank Ghostty windows as a 2-by-2 grid.
+
+prefer-no-csd
+input {}
+
+layout {
+    background-color "#e9e1cd"
+    gaps 20
+    default-column-width { proportion 0.5; }
+    center-focused-column "never"
+    focus-ring { off; }
+    border {
+        on
+        width 24
+        active-color "#526c89"
+        // inactive-color "#3d4652"
+        inactive-color "#526c89"
+        urgent-color "#a76745"
+        knit {
+            on
+            pattern "rib"
+            accent-color "#8fa6bf"
+            stitch-size 8
+            relief 0.65
+            fuzz 0.15
+        }
+    }
+}
+
+window-rule {
+    geometry-corner-radius 24
+    clip-to-geometry true
+}
+
+
+window-rule {
+    match app-id=r#"^dev\.zed\.Zed$"#
+    border {
+        active-color "#526c89"
+        // inactive-color "#3d4652"
+        inactive-color "#526c89"
+        knit {
+            pattern "rib"
+            accent-color "#8fa6bf"
+        }
+    }
+}
+
+
+window-rule {
+    match app-id=r#"^com\.mitchellh\.ghostty$"# title="^knit-desktop-helix$"
+    border {
+        active-color "#5a6b53"
+        inactive-color "#5a6b53"
+        knit {
+            pattern "checker"
+            accent-color "#9ba98e"
+        }
+    }
+}
+
+
+window-rule {
+    match app-id=r#"^md\.obsidian\.Obsidian$"#
+    open-floating false
+    border {
+        active-gradient from="#6c5878" to="#aa97b7" angle=45
+        // inactive-gradient from="#463d4b" to="#64576c" angle=45
+        inactive-gradient from="#6c5878" to="#aa97b7" angle=45
+        knit {
+            pattern "diamond"
+            accent-color "#aa97b7"
+        }
+    }
+}
+
+
+window-rule {
+    match app-id=r#"^com\.mitchellh\.ghostty$"# title="^knit-desktop-omp$"
+    border {
+        active-gradient from="#945ba1" to="#477f97" angle=110
+        inactive-gradient from="#945ba1" to="#477f97" angle=110
+        knit { pattern "stockinette"; }
+    }
+}
+
+spawn-at-startup "sh" "-c" r##"
+set -eu
+
+wait_for_app() {
+    app_id="$1"
+    attempt=0
+    until niri msg windows 2>/dev/null | grep -F "App ID: \"$app_id\"" >/dev/null; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 300 ]; then
+            printf 'timed out waiting for %s\n' "$app_id" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+}
+
+wait_for_title() {
+    title="$1"
+    attempt=0
+    until niri msg windows 2>/dev/null | grep -F "Title: \"$title\"" >/dev/null; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 300 ]; then
+            printf 'timed out waiting for %s\n' "$title" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+}
+
+open_terminal() {
+    title="$1"
+    background="$2"
+    foreground="$3"
+    ghostty \
+        --config-default-files=false \
+        "--title=$title" \
+        --window-decoration=false \
+        --font-size=16 \
+        "--background=$background" \
+        "--foreground=$foreground" \
+        --window-padding-x=18 \
+        --window-padding-y=18 \
+        -e sh -c 'exec sleep infinity' &
+    wait_for_title "$title"
+}
+
+stack_focused_left() {
+    niri msg action consume-or-expel-window-left >/dev/null
+    niri msg action set-window-height "50%" >/dev/null
+    sleep 0.2
+}
+
+zeditor --foreground --user-data-dir="$XDG_RUNTIME_DIR/niri-sweaters-zed-preview" --new >/dev/null 2>&1 &
+wait_for_app dev.zed.Zed
+open_terminal knit-desktop-helix "#171a16" "#c6cabd"
+stack_focused_left
+
+obsidian --user-data-dir="$XDG_RUNTIME_DIR/niri-sweaters-obsidian-preview" --disable-gpu >/dev/null 2>&1 &
+wait_for_app md.obsidian.Obsidian
+open_terminal knit-desktop-omp "#262735" "#c9cad6"
+stack_focused_left
+
+niri msg action focus-column-first >/dev/null
+"##
+
+binds {
+    Alt+Left { focus-column-left; }
+    Alt+Right { focus-column-right; }
+    Alt+Up { focus-window-up; }
+    Alt+Down { focus-window-down; }
+    Alt+Shift+E { quit skip-confirmation=true; }
+    Alt+Space { toggle-window-floating; }
+}

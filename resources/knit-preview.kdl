@@ -3,6 +3,7 @@
 // This standalone preview does not load your personal niri configuration.
 // Requires Ghostty. In nested niri, Mod is Alt: Alt+Shift+E exits the preview.
 
+prefer-no-csd
 input {}
 
 layout {
@@ -14,84 +15,90 @@ layout {
     border {
         on
         width 24
-        active-color "#a94728"
-        inactive-color "#91503c"
-        urgent-color "#c85b35"
+        active-color "#796952"
+        inactive-color "#494239"
+        urgent-color "#a76745"
         knit {
             on
             pattern "stockinette"
             stitch-size 8
-            relief 0.8
-            fuzz 0.35
+            relief 0.65
+            fuzz 0.15
         }
     }
 }
 
 window-rule {
-    geometry-corner-radius 18
+    geometry-corner-radius 24
     clip-to-geometry true
 }
+
 
 window-rule {
     match app-id=r#"^com\.mitchellh\.ghostty$"# title="Sweaters / checker"
     border {
-        active-color "#174f32"
-        inactive-color "#365440"
+        active-color "#5a6b53"
+        inactive-color "#3e473a"
         knit {
             pattern "checker"
-            accent-color "#eadc9d"
+            accent-color "#9ba98e"
         }
     }
 }
 
+
 window-rule {
     match app-id=r#"^com\.mitchellh\.ghostty$"# title="Sweaters / diamond"
     border {
-        active-gradient from="#7048a8" to="#b85a88" angle=45
-        inactive-gradient from="#635674" to="#916c80" angle=45
+        active-gradient from="#6c5878" to="#aa97b7" angle=45
+        inactive-gradient from="#463d4b" to="#64576c" angle=45
         knit {
             pattern "diamond"
-            accent-color "#ffd2e6"
+            accent-color "#aa97b7"
         }
     }
 }
+
 
 // Application palettes used in the README showcase.
 window-rule {
     match app-id=r#"^dev\.zed\.Zed$"#
     border {
-        active-color "#445873"
-        inactive-color "#445873"
+        active-color "#526c89"
+        inactive-color "#3d4652"
         knit {
             pattern "rib"
-            accent-color "#aabbd2"
+            accent-color "#8fa6bf"
         }
     }
 }
+
 
 window-rule {
     match app-id=r#"^com\.mitchellh\.ghostty$"# title="^Helix$"
     border {
-        active-color "#465440"
-        inactive-color "#465440"
+        active-color "#5a6b53"
+        inactive-color "#3e473a"
         knit {
             pattern "checker"
-            accent-color "#bac6a6"
+            accent-color "#9ba98e"
         }
     }
 }
 
+
 window-rule {
     match app-id=r#"^md\.obsidian\.Obsidian$"#
     border {
-        active-gradient from="#58476e" to="#796184" angle=45
-        inactive-gradient from="#58476e" to="#796184" angle=45
+        active-gradient from="#6c5878" to="#aa97b7" angle=45
+        inactive-gradient from="#463d4b" to="#64576c" angle=45
         knit {
             pattern "diamond"
-            accent-color "#c8badf"
+            accent-color "#aa97b7"
         }
     }
 }
+
 
 window-rule {
     match app-id=r#"^com\.mitchellh\.ghostty$"# title="^Oh My Pi$"
@@ -103,12 +110,12 @@ window-rule {
 }
 
 spawn-at-startup "ghostty" "--config-default-files=false" "--title=Sweaters / stockinette" "--window-decoration=false" "--font-size=16" "--background=#faf6ed" "--foreground=#38352e" "--window-padding-x=22" "--window-padding-y=24" "-e" "sh" "-c" r#"
-printf '\033[1mYOUR WINDOWS.\nIN SWEATERS.\033[0m\n\nProcedural knitted borders\nfor the niri compositor.\n\n\n01 / STOCKINETTE\n\nDense loops. Warm terracotta.\nRendered, not wallpapered.\n\n\nAlt + Left / Right  switch columns\nAlt + R             resize\nAlt + Shift + E     quit preview\n'
+printf '\033[1mYOUR WINDOWS.\nIN SWEATERS.\033[0m\n\nProcedural knitted borders\nfor the niri compositor.\n\n\n01 / STOCKINETTE\n\nDense loops. Warm oat.\nRendered, not wallpapered.\n\n\nAlt + Left / Right  switch columns\nAlt + R             resize\nAlt + Shift + E     quit preview\n'
 exec sleep infinity
 "#
 
 spawn-at-startup "ghostty" "--config-default-files=false" "--title=Sweaters / checker" "--window-decoration=false" "--font-size=16" "--background=#faf6ed" "--foreground=#38352e" "--window-padding-x=22" "--window-padding-y=24" "-e" "sh" "-c" r##"
-printf '\033[1mPICK YOUR PATTERN.\033[0m\n\nSix ways to dress a window.\n\n\n02 / CHECKER\n\nForest green + cream.\nA different sweater for every app.\n\n\nknit {\n    on\n    pattern "checker"\n    accent-color "#eadc9d"\n    stitch-size 8\n    relief 0.8\n    fuzz 0.35\n}\n'
+printf '\033[1mPICK YOUR PATTERN.\033[0m\n\nSix ways to dress a window.\n\n\n02 / CHECKER\n\nForest green + sage.\nA different sweater for every app.\n\n\nknit {\n    on\n    pattern "checker"\n    accent-color "#9ba98e"\n    stitch-size 8\n    relief 0.65\n    fuzz 0.15\n}\n'
 exec sleep infinity
 "##
 

@@ -427,6 +427,9 @@ Very tight turns limit changes in stitch width to preserve the body of the yarn.
 
 The nested `knit` options can also be overridden in a `window-rule` to give individual applications their own pattern and palette.
 Use `off` inside `knit` to return a matching window to the standard border renderer.
+
+For a step-by-step guide to corner radii, window clipping, stitch sizing and active/inactive palettes, see [Knitted Border Tuning](./Knitted-Border-Tuning.md).
+
 ### `shadow`
 
 <sup>Since: 25.02</sup>
