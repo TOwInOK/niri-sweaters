@@ -1396,6 +1396,43 @@ mod tests {
         assert_eq!(border.knit.relief, 0.6);
         assert_eq!(border.knit.fuzz, 0.7);
     }
+
+    #[test]
+    fn knit_off_rule_disables_knit() {
+        let config = Config::parse_mem(
+            r##"
+            layout {
+                border {
+                    on
+                    knit {
+                        on
+                        pattern "zigzag"
+                        stitch-size 5
+                    }
+                }
+            }
+
+            window-rule {
+                border {
+                    knit {
+                        off
+                    }
+                }
+            }
+            "##,
+        )
+        .unwrap();
+
+        let mut border = config.layout.border;
+        for rule in &config.window_rules {
+            border.merge_with(&rule.border);
+        }
+
+        assert!(border.knit.off);
+        assert_eq!(border.knit.pattern, KnitPattern::Zigzag);
+        assert_eq!(border.knit.stitch_size, 5.);
+    }
+
     #[test]
     fn rule_color_can_override_base_gradient() {
         let config = Config::parse_mem(

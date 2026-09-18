@@ -23,6 +23,7 @@ use crate::cases::gradient_srgb::GradientSrgb;
 use crate::cases::gradient_srgb_alpha::GradientSrgbAlpha;
 use crate::cases::gradient_srgblinear::GradientSrgbLinear;
 use crate::cases::gradient_srgblinear_alpha::GradientSrgbLinearAlpha;
+use crate::cases::knit::Knit;
 use crate::cases::layout::Layout;
 use crate::cases::tile::Tile;
 use crate::cases::window::Window;
@@ -115,6 +116,10 @@ fn build_ui(app: &adw::Application) {
         Layout::open_to_the_left_big,
         "Layout - Open To The Left - Big",
     );
+
+    s.add(Knit::patterns, "Knit - Patterns");
+    s.add(Knit::rounded_corners, "Knit - Rounded Corners");
+    s.add(Knit::resize_rounded, "Knit - Resize Rounded");
 
     s.add(GradientAngle::new, "Gradient - Angle");
     s.add(GradientArea::new, "Gradient - Area");

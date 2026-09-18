@@ -84,6 +84,10 @@ impl TestWindow {
         self.inner.borrow_mut().csd_shadow_width = width;
     }
 
+    pub fn set_rules(&mut self, rules: ResolvedWindowRules) {
+        self.rules = rules;
+    }
+
     pub fn communicate(&self) -> bool {
         let mut rv = false;
         let mut inner = self.inner.borrow_mut();
