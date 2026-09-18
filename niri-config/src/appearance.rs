@@ -301,7 +301,6 @@ pub struct KnitBorder {
     pub pattern: KnitPattern,
     pub accent_color: Color,
     pub stitch_size: f64,
-    // TODO: mb lithness
     pub relief: f64,
     pub fuzz: f64,
 }
