@@ -145,6 +145,18 @@ profile-with-tracy-allocations = ["profile-with-tracy"]
 # Enables dinit integration (global environment).
 dinit = []
 
+[[bench]]
+name = "border_bench"
+path = "benches/border_bench.rs"
+harness = false
+test = false
+
+[[test]]
+name = "border_bench_tests"
+path = "tests/border_bench_tests.rs"
+harness = true
+bench = false
+
 [lints.clippy]
 new_without_default = "allow"
 collapsible_match = "allow"
