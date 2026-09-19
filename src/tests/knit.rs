@@ -11,10 +11,8 @@ use super::client::ClientId;
 use super::*;
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
 
-/// Whether the primary renderer is llvmpipe.
-///
-/// The golden images are only deterministic on llvmpipe, so the tests skip on anything else.
-fn llvmpipe_renderer(state: &mut crate::niri::State) -> bool {
+/// The GL_RENDERER string of the primary renderer.
+fn renderer_name(state: &mut crate::niri::State) -> String {
     state
         .backend
         .headless()
@@ -23,16 +21,40 @@ fn llvmpipe_renderer(state: &mut crate::niri::State) -> bool {
                 .with_context(|gl| unsafe {
                     let ptr = gl.GetString(ffi::RENDERER);
                     if ptr.is_null() {
-                        return false;
+                        return String::new();
                     }
                     CStr::from_ptr(ptr as *const _)
                         .to_string_lossy()
-                        .to_lowercase()
-                        .contains("llvmpipe")
+                        .into_owned()
                 })
-                .unwrap_or(false)
+                .unwrap_or_default()
         })
-        .unwrap_or(false)
+        .unwrap_or_default()
+}
+
+/// Points GLVND at the Mesa EGL vendor so the surfaceless display uses llvmpipe.
+///
+/// Without this, systems with a proprietary driver (e.g. NVIDIA) pick it for the
+/// surfaceless EGL display and the golden tests cannot run deterministically.
+/// No-op when the variable is already set or Mesa is not installed.
+fn prefer_mesa_egl() {
+    const MESA_JSON: &str = "/usr/share/glvnd/egl_vendor.d/50_mesa.json";
+    if std::env::var_os("__EGL_VENDOR_LIBRARY_FILENAMES").is_none()
+        && PathBuf::from(MESA_JSON).exists()
+    {
+        std::env::set_var("__EGL_VENDOR_LIBRARY_FILENAMES", MESA_JSON);
+    }
+}
+
+/// The golden images are only deterministic on llvmpipe, so the tests require it.
+fn assert_llvmpipe(state: &mut crate::niri::State) {
+    let name = renderer_name(state);
+    assert!(
+        name.to_lowercase().contains("llvmpipe"),
+        "golden tests require the llvmpipe software renderer, got: {name}\n\
+         force Mesa EGL with: \
+         __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json cargo test knit"
+    );
 }
 
 /// Renders an output to a physical-size RGBA pixel buffer.
@@ -96,7 +118,7 @@ fn assert_golden(name: &str, size: Size<i32, Physical>, pixels: &[u8]) {
         Ok(file) => file,
         Err(err) => panic!(
             "error opening golden {}: {err}\n\
-             generate it with: LIBGL_ALWAYS_SOFTWARE=1 NIRI_GOLDEN_UPDATE=1 cargo test knit",
+             generate it with: NIRI_GOLDEN_UPDATE=1 cargo test knit",
             path.display()
         ),
     };
@@ -135,6 +157,7 @@ fn assert_golden(name: &str, size: Size<i32, Physical>, pixels: &[u8]) {
 }
 
 fn set_up(config_text: &str) -> Fixture {
+    prefer_mesa_egl();
     let config = Config::parse_mem(config_text).unwrap();
     let mut f = Fixture::with_config(config);
     f.niri_state().backend.headless().add_renderer().unwrap();
@@ -351,10 +374,7 @@ window-rule {
 #[test]
 fn knit_patterns() {
     let mut f = set_up(KNIT_PATTERNS_CONFIG);
-    if !llvmpipe_renderer(f.niri_state()) {
-        eprintln!("skipping: not llvmpipe");
-        return;
-    }
+    assert_llvmpipe(f.niri_state());
 
     let id = f.add_client();
 
@@ -386,10 +406,7 @@ fn knit_patterns() {
 #[test]
 fn knit_rounded_corners() {
     let mut f = set_up(KNIT_ROUNDED_CONFIG);
-    if !llvmpipe_renderer(f.niri_state()) {
-        eprintln!("skipping: not llvmpipe");
-        return;
-    }
+    assert_llvmpipe(f.niri_state());
 
     let id = f.add_client();
 
@@ -404,10 +421,7 @@ fn knit_rounded_corners() {
 #[test]
 fn knit_fractional_scale() {
     let mut f = set_up(KNIT_FRACTIONAL_CONFIG);
-    if !llvmpipe_renderer(f.niri_state()) {
-        eprintln!("skipping: not llvmpipe");
-        return;
-    }
+    assert_llvmpipe(f.niri_state());
 
     let id = f.add_client();
 
