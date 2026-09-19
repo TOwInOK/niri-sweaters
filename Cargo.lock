@@ -406,6 +406,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
 
 [[package]]
+name = "bin-rs"
+version = "0.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23f756521115a60a84bc45722261eaf03aa6a59d886c9c3b41d08ac1c39e3e24"
+
+[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2336,6 +2342,19 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "niri-visual-generator"
+version = "26.4.0"
+dependencies = [
+ "anyhow",
+ "niri",
+ "niri-config",
+ "pango",
+ "pangocairo",
+ "smithay",
+ "webp-rust",
 ]
 
 [[package]]
@@ -4281,6 +4300,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webp-rust"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9c8776fe97ff9083d2c7ebb62dd98f643124c2ce94cb50a7bbf1dfea5deb5a0"
+dependencies = [
+ "bin-rs",
 ]
 
 [[package]]
