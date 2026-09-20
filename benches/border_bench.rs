@@ -17,10 +17,8 @@
 //!
 //! ## Options
 //!
-//! - `--scenario <name|all>`:
-//!   Scenario to execute. Can be specified multiple times to run a subset.
-//!   Defaults to `all`.
-//!   Available scenarios:
+//! - `--scenario <name|all>`: Scenario to execute. Can be specified multiple times to run a subset.
+//!   Defaults to `all`. Available scenarios:
 //!   - `solid`: Solid color border without gradients or knit patterns.
 //!   - `gradient-srgb`: sRGB color space window-relative gradient.
 //!   - `gradient-oklch`: Oklch color space gradient with longer hue interpolation.
@@ -36,77 +34,58 @@
 //!   - `knit-gradient-dots`: Dots knit over an sRGB gradient.
 //!   - `all`: Runs all thirteen scenarios in order.
 //!
-//! - `--workload <name|all>`:
-//!   Workload to execute per scenario. Can be specified multiple times.
-//!   Defaults to `static`.
-//!   Available workloads:
-//!   - `static`: Elements are prepared once; every frame redraws identical
-//!     geometry. Measures render + clear + finish + completion wait.
-//!   - `resize`: Each frame advances one step of a 60-step resize cycle
-//!     (window contents 210x648 → 420x1296 → 210x648, cosine easing, sizes
-//!     rounded to physical pixels). Measures `FocusRing::update_render_elements`
+//! - `--workload <name|all>`: Workload to execute per scenario. Can be specified multiple times.
+//!   Defaults to `static`. Available workloads:
+//!   - `static`: Elements are prepared once; every frame redraws identical geometry. Measures
+//!     render + clear + finish + completion wait.
+//!   - `resize`: Each frame advances one step of a 60-step resize cycle (window contents 210x648 →
+//!     420x1296 → 210x648, cosine easing, sizes rounded to physical pixels). Measures
+//!     `FocusRing::update_render_elements`
 //!     + element collection + the full render path. `--frames` must be a
 //!     multiple of 60 so the series covers whole cycles. `--warmup` counts
 //!     cycle steps and needs no alignment. In `--smoke` mode one full cycle
 //!     (60 frames) is drawn unmeasured.
 //!   - `all`: Runs both workloads per scenario.
 //!
-//! - `--dump-dir`:
-//!   Saves the final rendered frame of each scenario as `<scenario>.png`
-//!   into `target/border_bench/`. For the resize workload, saves the cycle
-//!   extremes as `<scenario>-resize-min.png` and `<scenario>-resize-max.png`.
+//! - `--dump-dir`: Saves the final rendered frame of each scenario as `<scenario>.png` into
+//!   `target/border_bench/`. For the resize workload, saves the cycle extremes as
+//!   `<scenario>-resize-min.png` and `<scenario>-resize-max.png`.
 //!
-//! - `--warmup <N>`:
-//!   Number of unmeasured warmup frames per scenario (default: `30`).
-//!   Cannot be combined with `--smoke`.
+//! - `--warmup <N>`: Number of unmeasured warmup frames per scenario (default: `30`). Cannot be
+//!   combined with `--smoke`.
 //!
-//! - `--runs <N>`:
-//!   Repetitions of the whole scenario/workload series (default: `1`).
-//!   With N > 1, reported statistics are means of per-run statistics
-//!   (min/median/mean/p95/max), `samples_us` pools all runs, and each result
-//!   carries a `runs` array with per-run raw data. A `Total / Summary` block
-//!   is printed after the table. Can be combined with `--smoke` (each smoke
-//!   run is repeated N times).
+//! - `--runs <N>`: Repetitions of the whole scenario/workload series (default: `1`). With N > 1,
+//!   reported statistics are means of per-run statistics (min/median/mean/p95/max), `samples_us`
+//!   pools all runs, and each result carries a `runs` array with per-run raw data. A `Total /
+//!   Summary` block is printed after the table. Can be combined with `--smoke` (each smoke run is
+//!   repeated N times).
 //!
-//! - `--frames <N>`:
-//!   Number of measured frames per scenario (default: `300`).
-//!   Cannot be combined with `--smoke`.
+//! - `--frames <N>`: Number of measured frames per scenario (default: `300`). Cannot be combined
+//!   with `--smoke`.
 //!
-//! - `--smoke`:
-//!   Runs exactly 1 unmeasured frame per scenario to verify shader compilation,
-//!   geometry bounds, and GPU synchronization without collecting statistics.
-//!   Cannot be combined with `--warmup` or `--frames`.
+//! - `--smoke`: Runs exactly 1 unmeasured frame per scenario to verify shader compilation, geometry
+//!   bounds, and GPU synchronization without collecting statistics. Cannot be combined with
+//!   `--warmup` or `--frames`.
 //!
-//! - `--json`:
-//!   Emits a single JSON document on stdout (`schema_version: 3`).
-//!   All informational logs and diagnostic messages are redirected to stderr.
+//! - `--json`: Emits a single JSON document on stdout (`schema_version: 3`). All informational logs
+//!   and diagnostic messages are redirected to stderr.
 //!
 //! # Common Examples
 //!
-//! - Run the standard benchmark suite:
-//!   ```bash
-//!   cargo bench --locked -p niri --bench border_bench
+//! - Run the standard benchmark suite: ```bash cargo bench --locked -p niri --bench border_bench
 //!   ```
 //!
-//! - Fast smoke check (verify rendering pipelines and shaders):
-//!   ```bash
-//!   cargo bench --locked -p niri --bench border_bench -- --smoke
-//!   ```
+//! - Fast smoke check (verify rendering pipelines and shaders): ```bash cargo bench --locked -p
+//!   niri --bench border_bench -- --smoke ```
 //!
-//! - Dump rendered scenario images for visual inspection:
-//!   ```bash
-//!   cargo bench --locked -p niri --bench border_bench -- --smoke --dump-dir
-//!   ```
+//! - Dump rendered scenario images for visual inspection: ```bash cargo bench --locked -p niri
+//!   --bench border_bench -- --smoke --dump-dir ```
 //!
-//! - Benchmark a specific scenario with custom frame counts:
-//!   ```bash
-//!   cargo bench --locked -p niri --bench border_bench -- --scenario knit-zigzag --warmup 20 --frames 200
-//!   ```
+//! - Benchmark a specific scenario with custom frame counts: ```bash cargo bench --locked -p niri
+//!   --bench border_bench -- --scenario knit-zigzag --warmup 20 --frames 200 ```
 //!
-//! - Export machine-readable JSON results to a file:
-//!   ```bash
-//!   cargo bench --locked -p niri --bench border_bench -- --json > report.json
-//!   ```
+//! - Export machine-readable JSON results to a file: ```bash cargo bench --locked -p niri --bench
+//!   border_bench -- --json > report.json ```
 //!
 //! # Visual Regression Testing (Golden Images)
 //!
@@ -129,10 +108,8 @@
 //! - The test writes the newly rendered frame to `src/tests/golden/<test_name>.new.png`.
 //! - Compare `src/tests/golden/<test_name>.png` (golden reference) against
 //!   `src/tests/golden/<test_name>.new.png` to inspect the visual discrepancy.
-//! - If the change is intentional across patterns, regenerate the golden images:
-//!   ```bash
-//!   NIRI_GOLDEN_UPDATE=1 cargo test knit
-//!   ```
+//! - If the change is intentional across patterns, regenerate the golden images: ```bash
+//!   NIRI_GOLDEN_UPDATE=1 cargo test knit ```
 //!
 //! # JSON Output Schema (`schema_version: 3`)
 //!

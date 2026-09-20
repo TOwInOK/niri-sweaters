@@ -570,7 +570,7 @@ fn render_canvas(
         width * height * 4
     );
     ensure!(
-        pixels.chunks_exact(4).any(|px| px[3] != 0),
+        pixels.as_chunks::<4>().0.iter().any(|px| px[3] != 0),
         "{name}: rendered image is fully transparent"
     );
 
@@ -603,7 +603,7 @@ fn write_png_atomic(output: &Path, width: u32, height: u32, pixels: &[u8]) -> an
     {
         let file =
             File::create(&tmp).with_context(|| format!("error creating {}", tmp.display()))?;
-        write_png_rgba8(BufWriter::new(file), width, height, &pixels)
+        write_png_rgba8(BufWriter::new(file), width, height, pixels)
             .with_context(|| format!("error encoding {}", tmp.display()))?;
     }
     std::fs::rename(&tmp, output)
@@ -1105,7 +1105,7 @@ fn compose_patterns(renderer: &mut GlesRenderer, output: &Path) -> anyhow::Resul
 
         // Continuous light interior under both ring halves.
         elements.push(rounded_fill(
-            card_loc + Size::from(inner.loc.to_size()),
+            card_loc + inner.loc.to_size(),
             inner.size,
             CornerRadius::from(INNER_RADIUS),
             2.,

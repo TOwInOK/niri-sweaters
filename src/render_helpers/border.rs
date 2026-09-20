@@ -275,13 +275,13 @@ impl BorderRenderElement {
             // instead of per pixel. Mirrors knit_course() in border.frag.
             let stitch_width = (knit.stitch_size as f32).max(1.0);
             let inv_stitch_width = 1.0 / stitch_width;
-            let depth = ((border_width - 0.5).max(0.0) * 0.5)
-                .min(geo_size.x.min(geo_size.y) * 0.49);
+            let depth =
+                ((border_width - 0.5).max(0.0) * 0.5).min(geo_size.x.min(geo_size.y) * 0.49);
             let radii = <[f32; 4]>::from(corner_radius);
             let mut motif_bends = [0.0f32; 4];
             for (i, bend) in motif_bends.iter_mut().enumerate() {
                 let radius = (radii[(i + 1) % 4] - depth).max(0.0);
-                *bend = (radius * 1.57079633 * inv_stitch_width + 0.5)
+                *bend = (radius * 1.570_796_4 * inv_stitch_width + 0.5)
                     .floor()
                     .max(1.0)
                     * if radius >= 0.001 { 1.0 } else { 0.0 };
@@ -296,7 +296,15 @@ impl BorderRenderElement {
                 motif_bends,
             )
         } else {
-            (0., 0., Color::default().to_array_unpremul(), 1., 0., 0., [0.; 4])
+            (
+                0.,
+                0.,
+                Color::default().to_array_unpremul(),
+                1.,
+                0.,
+                0.,
+                [0.; 4],
+            )
         };
         self.inner.update(
             size,
