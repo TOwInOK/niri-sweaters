@@ -429,14 +429,21 @@ float knit_accent_mix(float column, float row) {
     return 0.0;
 }
 
+// FocusRing adds 0.5 logical pixels to hide corner AA seams. Knit backing
+// must use the actual band width, matching the straight segment geometry.
+float knit_border_width() {
+    return max(border_width - 0.5, 0.0);
+}
+
 vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, KnitCourse motif) {
+    float band_width = knit_border_width();
     float relief = clamp(knit_relief, 0.0, 1.0);
     float fuzz = clamp(knit_fuzz, 0.0, 1.0);
     float stitch_height = stitch_width * 0.94;
     vec3 frame = knit_border_frame(geometry_coords);
     // Broad curvature shades the whole band like a soft rounded strip. The
     // individual yarn normals add the smaller loop relief on top of this shape.
-    float roll = clamp(2.0 * frame.z / max(border_width, 0.001) - 1.0, -1.0, 1.0);
+    float roll = clamp(2.0 * frame.z / max(band_width, 0.001) - 1.0, -1.0, 1.0);
     float slope = roll / sqrt(max(1.0 - roll * roll, 0.20));
     vec3 band_normal = normalize(vec3(frame.xy * slope * 0.38 * relief, 1.0));
     float grid_row = frame.z / stitch_height;
@@ -590,12 +597,12 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
     // Cut the outer edge and expose backing under the inner yarn edge.
     // Noise follows the visible yarn, not screen pixels; unresolved yarn uses its mean.
     // Limit both the notches and their AA to preserve the centre of thin bands.
-    float edge_depth = min(stitch_width * mix(0.10, 0.20, pile), border_width * 0.20);
+    float edge_depth = min(stitch_width * mix(0.10, 0.20, pile), band_width * 0.20);
     float edge_noise = mix(0.5, bundles.x, resolved);
     float edge_inset = edge_depth * mix(0.2, 1.0, edge_noise);
-    float edge_aa = min(1.0 / max(niri_scale, 0.001), max(border_width * 0.25, 0.001));
+    float edge_aa = min(1.0 / max(niri_scale, 0.001), max(band_width * 0.25, 0.001));
     float outer_coverage = smoothstep(edge_inset, edge_inset + edge_aa, frame.z);
-    float inner_coverage = smoothstep(edge_inset, edge_inset + edge_aa, border_width - frame.z);
+    float inner_coverage = smoothstep(edge_inset, edge_inset + edge_aa, band_width - frame.z);
     // The backing reaches the window; inner notches change material, not coverage.
     fabric = mix(ground, fabric, inner_coverage);
     // Filter inner detail with the yarn, but keep the outer cuts at every LOD.
@@ -610,7 +617,7 @@ vec4 knit_color(vec2 geometry_coords, vec4 base_color) {
     float stitch_width = max(knit_stitch_size, 1.0);
     // A mid-band reference course supplies colour columns for every row. Its
     // count is adjusted below towards whole motif repeats to hide the closing seam.
-    KnitCourse motif = knit_course(min(border_width * 0.5, min(geo_size.x, geo_size.y) * 0.49), stitch_width);
+    KnitCourse motif = knit_course(min(knit_border_width() * 0.5, min(geo_size.x, geo_size.y) * 0.49), stitch_width);
     float period = 1.0;
     if (knit_pattern == 1.0)
         period = 3.0;
@@ -633,13 +640,14 @@ void main() {
 
     float ring_alpha = niri_rounding_alpha(coords_geo.xy, geo_size, outer_radius);
 
-    if (border_width > 0.0) {
-        vec2 inner_coords = coords_geo.xy - vec2(border_width);
-        vec2 inner_geo_size = geo_size - vec2(border_width * 2.0);
+    float width = knit_enabled == 1.0 ? knit_border_width() : border_width;
+    if (width > 0.0) {
+        vec2 inner_coords = coords_geo.xy - vec2(width);
+        vec2 inner_geo_size = geo_size - vec2(width * 2.0);
         if (0.0 <= inner_coords.x && inner_coords.x <= inner_geo_size.x
                 && 0.0 <= inner_coords.y && inner_coords.y <= inner_geo_size.y)
         {
-            vec4 inner_radius = max(outer_radius - vec4(border_width), 0.0);
+            vec4 inner_radius = max(outer_radius - vec4(width), 0.0);
             ring_alpha *= 1.0 - niri_rounding_alpha(inner_coords, inner_geo_size, inner_radius);
         }
     }
