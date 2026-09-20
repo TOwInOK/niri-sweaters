@@ -394,6 +394,12 @@ void knit_course_stitch(
 vec3 knit_border_frame(vec2 point) {
     vec4 distance = vec4(point.y, geo_size.x - point.x, geo_size.y - point.y, point.x);
     float depth = min(min(distance.x, distance.y), min(distance.z, distance.w));
+    // At a sharp inner corner the distance gradient has two valid directions.
+    // Average only that subpixel normal crease, not the yarn or motif.
+    vec4 weights = max(vec4(1.0) - (distance - vec4(depth))
+        / max(0.75 / niri_scale, 0.001), vec4(0.0));
+    vec2 inward = vec2(weights.w - weights.y, weights.x - weights.z);
+    inward /= max(length(inward), 0.001);
 
     vec2 center;
     float radius;
@@ -410,10 +416,7 @@ vec3 knit_border_frame(vec2 point) {
         radius = outer_radius.w;
         center = vec2(radius, geo_size.y - radius);
     } else {
-        float inv_crease = 1.0 / max(0.75 / niri_scale, 0.001);
-        vec4 weights = max(vec4(1.0) - (distance - vec4(depth)) * inv_crease, vec4(0.0));
-        vec2 inward = vec2(weights.w - weights.y, weights.x - weights.z);
-        return vec3(inward / max(length(inward), 0.001), depth);
+        return vec3(inward, depth);
     }
     vec2 delta = center - point;
     float radial_distance = length(delta);
@@ -450,7 +453,6 @@ const vec3 knit_light = normalize(vec3(-0.45, -0.65, 1.1));
 
 vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, KnitCourse motif) {
     float band_width = knit_border_width();
-    float inv_band_width = 1.0 / max(band_width, 0.001);
     float relief = clamp(knit_relief, 0.0, 1.0);
     float fuzz = clamp(knit_fuzz, 0.0, 1.0);
     float pile = 0.18 + fuzz * 0.82;
@@ -459,14 +461,13 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
     float resolved = smoothstep(1.0, 3.5, stitch_width * niri_scale);
     vec4 premul_accent = premul_rect(knit_accent_color);
     float stitch_height = stitch_width * 0.94;
-    float inv_stitch_height = 1.0 / stitch_height;
     vec3 frame = knit_border_frame(geometry_coords);
     // Broad curvature shades the whole band like a soft rounded strip. The
     // individual yarn normals add the smaller loop relief on top of this shape.
-    float roll = clamp(2.0 * frame.z * inv_band_width - 1.0, -1.0, 1.0);
+    float roll = clamp(2.0 * frame.z / max(band_width, 0.001) - 1.0, -1.0, 1.0);
     float slope = roll / sqrt(max(1.0 - roll * roll, 0.20));
     vec3 band_normal = normalize(vec3(frame.xy * slope * 0.38 * relief, 1.0));
-    float grid_row = frame.z * inv_stitch_height;
+    float grid_row = frame.z / stitch_height;
     float base_row = floor(grid_row);
     vec4 strand = vec4(100.0, 0.0, 0.0, 0.0);
     vec3 strand_normal = vec3(0.0, 0.0, 1.0);
