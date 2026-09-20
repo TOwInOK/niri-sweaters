@@ -62,6 +62,10 @@ animations {
     recent-windows-close {
         spring damping-ratio=1.0 stiffness=800 epsilon=0.001
     }
+
+    zoom {
+        spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
+    }
 }
 ```
 
@@ -436,6 +440,18 @@ The close fade-out animation of the recent windows switcher.
 animations {
     recent-windows-close {
         spring damping-ratio=1.0 stiffness=800 epsilon=0.001
+    }
+}
+```
+
+#### `zoom`
+
+The transition animation of the desktop zoom level for actions like `zoom-in`, `zoom-out`, `set-zoom-level`, `reset-zoom` and `toggle-zoom`.
+
+```kdl
+animations {
+    zoom {
+        spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
     }
 }
 ```

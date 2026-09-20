@@ -83,6 +83,7 @@ pub struct Config {
     pub blur: Blur,
     pub gestures: Gestures,
     pub overview: Overview,
+    pub zoom: Zoom,
     pub environment: Environment,
     pub xwayland_satellite: XwaylandSatellite,
     pub window_rules: Vec<WindowRule>,
@@ -203,6 +204,7 @@ where
                 "xwayland-satellite" => m_merge!(xwayland_satellite),
                 "switch-events" => m_merge!(switch_events),
                 "debug" => m_merge!(debug),
+                "zoom" => m_merge!(zoom),
 
                 // Multipart sections.
                 "output" => {
@@ -1691,6 +1693,18 @@ mod tests {
                         ),
                     },
                 ),
+                zoom: ZoomAnim(
+                    Animation {
+                        off: false,
+                        kind: Spring(
+                            SpringParams {
+                                damping_ratio: 1.0,
+                                stiffness: 800,
+                                epsilon: 0.0001,
+                            },
+                        ),
+                    },
+                ),
             },
             blur: Blur {
                 off: false,
@@ -1745,6 +1759,11 @@ mod tests {
                         a: 0.3137255,
                     },
                 },
+            },
+            zoom: Zoom {
+                max_zoom: 10.0,
+                increment_factor: 1.2,
+                deadzone_size: 0.5,
             },
             environment: Environment(
                 [
@@ -2538,5 +2557,145 @@ mod tests {
         +                0.66667,
         "#,
         );
+    }
+
+    #[test]
+    fn parse_zoom_defaults() {
+        let config = do_parse("");
+        assert_eq!(config.zoom.max_zoom, 10.);
+        assert_eq!(config.zoom.increment_factor, 1.2);
+        assert_eq!(config.zoom.deadzone_size, 0.5);
+    }
+
+    #[test]
+    fn parse_zoom() {
+        let config = do_parse(
+            r#"
+            zoom {
+                max-zoom 4
+                increment-factor 1.5
+                deadzone-size 0.25
+            }
+            "#,
+        );
+        assert_eq!(config.zoom.max_zoom, 4.);
+        assert_eq!(config.zoom.increment_factor, 1.5);
+        assert_eq!(config.zoom.deadzone_size, 0.25);
+
+        // Missing fields keep their defaults.
+        let config = do_parse(
+            r#"
+            zoom {
+                max-zoom 5
+            }
+            "#,
+        );
+        assert_eq!(config.zoom.max_zoom, 5.);
+        assert_eq!(config.zoom.increment_factor, 1.2);
+        assert_eq!(config.zoom.deadzone_size, 0.5);
+
+        // Integer literals are accepted for every field.
+        let config = do_parse(
+            r#"
+            zoom {
+                max-zoom 4
+                increment-factor 2
+                deadzone-size 1
+            }
+            "#,
+        );
+        assert_eq!(config.zoom.max_zoom, 4.);
+        assert_eq!(config.zoom.increment_factor, 2.);
+        assert_eq!(config.zoom.deadzone_size, 1.);
+
+        // Fractional literals.
+        let config = do_parse(
+            r#"
+            zoom {
+                max-zoom 3.5
+                increment-factor 1.15
+                deadzone-size 0.35
+            }
+            "#,
+        );
+        assert_eq!(config.zoom.max_zoom, 3.5);
+        assert_eq!(config.zoom.increment_factor, 1.15);
+        assert_eq!(config.zoom.deadzone_size, 0.35);
+    }
+
+    #[test]
+    fn parse_zoom_invalid() {
+        for text in [
+            "zoom { max-zoom 0 }",
+            "zoom { max-zoom 0.5 }",
+            "zoom { increment-factor 1 }",
+            "zoom { increment-factor 1.0 }",
+            "zoom { increment-factor 0.5 }",
+            "zoom { deadzone-size -1 }",
+            "zoom { deadzone-size -0.1 }",
+            "zoom { deadzone-size 2 }",
+            "zoom { deadzone-size 1.5 }",
+        ] {
+            assert!(
+                Config::parse_mem(text).is_err(),
+                "expected parse error for: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_zoom_animation() {
+        use crate::animations::{Curve, Kind};
+
+        // Default: the overview-style spring.
+        let config = do_parse("");
+        assert!(!config.animations.zoom.0.off);
+        assert!(matches!(
+            config.animations.zoom.0.kind,
+            Kind::Spring(params)
+                if params.damping_ratio == 1. && params.stiffness == 800
+        ));
+
+        let config = do_parse(
+            r#"
+            animations {
+                zoom {
+                    off
+                }
+            }
+            "#,
+        );
+        assert!(config.animations.zoom.0.off);
+
+        let config = do_parse(
+            r#"
+            animations {
+                zoom {
+                    duration-ms 200
+                    curve "ease-out-quad"
+                }
+            }
+            "#,
+        );
+        assert!(matches!(
+            config.animations.zoom.0.kind,
+            Kind::Easing(params)
+                if params.duration_ms == 200 && params.curve == Curve::EaseOutQuad
+        ));
+
+        let config = do_parse(
+            r#"
+            animations {
+                zoom {
+                    spring damping-ratio=0.8 stiffness=500 epsilon=0.001
+                }
+            }
+            "#,
+        );
+        assert!(matches!(
+            config.animations.zoom.0.kind,
+            Kind::Spring(params)
+                if params.damping_ratio == 0.8 && params.stiffness == 500
+        ));
     }
 }

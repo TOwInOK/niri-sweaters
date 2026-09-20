@@ -142,7 +142,7 @@ use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
 use crate::input::scroll_tracker::ScrollTracker;
 use crate::input::{
     apply_libinput_settings, mods_with_finger_scroll_binds, mods_with_mouse_binds,
-    mods_with_tablet_stylus_binds, mods_with_wheel_binds, TabletData,
+    mods_with_tablet_stylus_binds, mods_with_wheel_binds, TabletData, ZoomHoldState,
 };
 use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
@@ -183,6 +183,7 @@ use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRende
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
+use crate::utils::view::ViewportTransform;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
@@ -347,6 +348,12 @@ pub struct Niri {
     pub suppressed_buttons: HashSet<u32>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
+    /// Active `hold-zoom` session, if any.
+    ///
+    /// Owned by the physical trigger that started it; releasing the trigger
+    /// animates the saved zoom state back on the owning output, while
+    /// lost-release cleanup restores it immediately.
+    pub zoom_hold: Option<ZoomHoldState>,
     pub keyboard_focus: KeyboardFocus,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
@@ -958,6 +965,7 @@ impl State {
     }
 
     pub fn move_cursor(&mut self, location: Point<f64, Logical>) {
+        let (location, output) = self.prepare_zoom_warp_target(location);
         let mut under = match self.niri.pointer_visibility {
             PointerVisibility::Disabled => PointContents::default(),
             _ => self.niri.contents_under(location),
@@ -988,6 +996,11 @@ impl State {
         pointer.frame(self);
 
         self.niri.maybe_activate_pointer_constraint();
+
+        // A programmatic warp is a teleport, so update the destination output's zoom focal
+        // immediately from the final accepted canonical position. This only changes the camera;
+        // it does not generate another pointer motion event.
+        self.update_zoom_focal_for_cursor(location, output.as_ref());
 
         // We do not show the pointer on programmatic or keyboard movement.
 
@@ -1732,6 +1745,10 @@ impl State {
             xwls_changed = true;
         }
 
+        // A lower zoom max clamps existing zoom levels right away; other zoom
+        // settings only affect future actions and tracking.
+        let zoom_max_decreased = config.zoom.max_zoom < old_config.zoom.max_zoom;
+
         *old_config = config;
 
         if let Some(outputs) = preserved_output_config {
@@ -1740,6 +1757,11 @@ impl State {
 
         // Release the borrow.
         drop(old_config);
+
+        if zoom_max_decreased {
+            let max_zoom = self.niri.config.borrow().zoom.max_zoom;
+            self.niri.clamp_zoom_levels_to_max(max_zoom);
+        }
 
         // Now with a &mut self we can reload the xkb config.
         if let Some(mut xkb) = reload_xkb {
@@ -2702,6 +2724,7 @@ impl Niri {
             suppressed_buttons: HashSet::new(),
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
+            zoom_hold: None,
             presentation_state,
             security_context_state,
             gamma_control_manager_state,
@@ -3048,6 +3071,16 @@ impl Niri {
     }
 
     pub fn remove_output(&mut self, output: &Output) {
+        // A zoom hold owned by the removed output can no longer be restored;
+        // drop the session without moving the snapshot to another output.
+        if self
+            .zoom_hold
+            .as_ref()
+            .is_some_and(|hold| hold.output == *output)
+        {
+            self.zoom_hold = None;
+        }
+
         for layer in layer_map_for_output(output).layers() {
             layer.layer_surface().send_close();
         }
@@ -3204,7 +3237,45 @@ impl Niri {
         Some((output, pos_within_output))
     }
 
+    /// Maps a canonical global content position to its current global displayed
+    /// desktop position.
+    ///
+    /// The transform is taken from the output that owns the canonical position,
+    /// never from a candidate output the displayed position may overlap. When
+    /// the position is not on any output it is returned unchanged.
+    pub(crate) fn display_position_for_content(
+        &self,
+        content: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        let Some((output, content_local)) = self.output_under(content) else {
+            return content;
+        };
+        let origin = self.global_space.output_geometry(output).unwrap().loc;
+        let display_local = self
+            .layout
+            .monitor_for_output(output)
+            .map(|mon| mon.effective_zoom_transform().apply(content_local))
+            .unwrap_or(content_local);
+        origin.to_f64() + display_local
+    }
+
+    /// The current global displayed position of the pointer (or tablet cursor).
+    pub(crate) fn displayed_pointer_position(&self) -> Point<f64, Logical> {
+        let pointer_pos = self
+            .tablet_cursor_location
+            .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+        self.display_position_for_content(pointer_pos)
+    }
+
     fn is_inside_hot_corner(&self, output: &Output, pos: Point<f64, Logical>) -> bool {
+        // Hot corners are a display-space concept: the corner is where the pointer is
+        // displayed, not where it is in content coordinates.
+        let pos = self
+            .layout
+            .monitor_for_output(output)
+            .map(|mon| mon.effective_zoom_transform().apply(pos))
+            .unwrap_or(pos);
+
         let config = self.config.borrow();
         let hot_corners = output
             .user_data()
@@ -3612,6 +3683,56 @@ impl Niri {
         self.global_space.output_under(pos).next().cloned()
     }
 
+    /// Clamps every output's zoom level to `max_zoom`.
+    ///
+    /// Called when a config reload lowers `zoom.max-zoom` below a level that is
+    /// already in use. The pointer position on the output is used as the zoom
+    /// anchor; when the pointer is not on the output, the output center is
+    /// used instead. The zoom lock does not exempt an output from clamping.
+    pub fn clamp_zoom_levels_to_max(&mut self, max_zoom: f64) {
+        let pointer_pos = self
+            .seat
+            .get_pointer()
+            .map(|pointer| pointer.current_location());
+        let pointer_output =
+            pointer_pos.and_then(|pos| self.output_under(pos).map(|(output, _)| output.clone()));
+
+        let outputs: Vec<Output> = self.global_space.outputs().cloned().collect();
+        for output in outputs {
+            let needs_redraw = if let Some(mon) = self.layout.monitor_for_output_mut(&output) {
+                let view_size = mon.view_size();
+                let zoom = mon.zoom();
+                if zoom.level() > max_zoom || zoom.target_level() > max_zoom {
+                    let anchor = if pointer_output.as_ref() == Some(&output) {
+                        let geom = self.global_space.output_geometry(&output).unwrap();
+                        pointer_pos.unwrap() - geom.loc.to_f64()
+                    } else {
+                        view_size.to_point().downscale(2.)
+                    };
+
+                    if zoom.level() > max_zoom {
+                        // The displayed level is above the new maximum: clamp
+                        // immediately, cancelling any transition.
+                        mon.zoom_mut().set_level_immediate(max_zoom, anchor);
+                    } else {
+                        // Only the target exceeds the maximum: retarget the
+                        // in-progress transition (or start one) towards it.
+                        mon.zoom_to(max_zoom, anchor);
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if needs_redraw {
+                self.queue_redraw(&output);
+            }
+        }
+    }
+
     pub fn output_left_of(&self, current: &Output) -> Option<Output> {
         let current_geo = self.global_space.output_geometry(current)?;
         let extended_geo = Rectangle::new(
@@ -3839,8 +3960,21 @@ impl Niri {
         output: &Output,
         push: &mut dyn FnMut(PointerRenderElements<R>),
     ) {
+        self.render_pointer_with_transform(renderer, output, ViewportTransform::identity(), push);
+    }
+
+    /// Renders the pointer with the desktop zoom transform applied to its position.
+    ///
+    /// `transform` maps output-local content coordinates to displayed coordinates. The cursor
+    /// sprite itself is not scaled; only its position is transformed.
+    pub fn render_pointer_with_transform<R: NiriRenderer>(
+        &self,
+        renderer: &mut R,
+        output: &Output,
+        transform: ViewportTransform,
+        push: &mut dyn FnMut(PointerRenderElements<R>),
+    ) {
         let _span = tracy_client::span!("Niri::render_pointer");
-        let output_scale = output.current_scale();
         let output_pos = self.global_space.output_geometry(output).unwrap().loc;
 
         // Check whether we need to draw the tablet cursor or the regular cursor.
@@ -3848,6 +3982,26 @@ impl Niri {
             .tablet_cursor_location
             .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
         let pointer_pos = pointer_pos - output_pos.to_f64();
+
+        // The canonical pointer position is in content coordinates; the visual hotspot is the
+        // displayed position under the desktop zoom transform.
+        let pointer_pos = transform.apply(pointer_pos);
+
+        self.render_pointer_at_position(renderer, output, pointer_pos, push);
+    }
+
+    /// Renders the pointer at an output-local displayed position.
+    ///
+    /// The cursor sprite itself is not scaled; only its position is transformed.
+    pub(crate) fn render_pointer_at_position<R: NiriRenderer>(
+        &self,
+        renderer: &mut R,
+        output: &Output,
+        pointer_pos: Point<f64, Logical>,
+        push: &mut dyn FnMut(PointerRenderElements<R>),
+    ) {
+        let _span = tracy_client::span!("Niri::render_pointer");
+        let output_scale = output.current_scale();
 
         // Get the render cursor to draw.
         let cursor_scale = output_scale.integer_scale();
@@ -3974,6 +4128,29 @@ impl Niri {
         None
     }
 
+    /// Computes the pointer position for an output screencast.
+    ///
+    /// Returns the output-local displayed position when the pointer's global
+    /// displayed position is within the output, or `None` otherwise. The
+    /// transform is resolved through the output owning the canonical pointer
+    /// position, never through the cast target output.
+    pub(crate) fn pointer_pos_for_output_cast(
+        &self,
+        output: &Output,
+    ) -> Option<Point<f64, Logical>> {
+        if !self.pointer_visibility.is_visible() {
+            return None;
+        }
+
+        let output_geo = self.global_space.output_geometry(output).unwrap().to_f64();
+        let pointer_loc = self.displayed_pointer_position();
+        // Only render when the pointer is within the output. Otherwise, it will
+        // happily appear anywhere outside the output video source in OBS.
+        output_geo
+            .contains(pointer_loc)
+            .then(|| pointer_loc - output_geo.loc)
+    }
+
     pub fn refresh_pointer_outputs(&mut self) {
         if !self.pointer_visibility.is_visible() {
             return;
@@ -3982,9 +4159,12 @@ impl Niri {
         let _span = tracy_client::span!("Niri::refresh_pointer_outputs");
 
         // Check whether we need to draw the tablet cursor or the regular cursor.
-        let pointer_pos = self
-            .tablet_cursor_location
-            .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+        //
+        // The canonical pointer position is resolved once through the owning
+        // output's presentation transform into a single global displayed
+        // position; the cursor surface bbox below is then intersected with
+        // every output it actually overlaps.
+        let pointer_pos = self.displayed_pointer_position();
 
         match self.cursor_manager.cursor_image() {
             CursorImageStatus::Surface(ref surface) => {
@@ -4358,9 +4538,19 @@ impl Niri {
             push
         };
 
+        // Desktop zoom transform for the pointer and the desktop scene below.
+        // At effective level 1 it is the identity.
+        let desktop_zoom = self
+            .layout
+            .monitor_for_output(output)
+            .map(|mon| mon.effective_zoom_transform())
+            .unwrap_or_else(ViewportTransform::identity);
+
         // The pointer goes on the top.
         if include_pointer && self.pointer_visibility.is_visible() {
-            self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
+            self.render_pointer_with_transform(ctx.renderer, output, desktop_zoom, &mut |elem| {
+                push(elem.into())
+            });
         }
 
         // Next, the screen transition texture.
@@ -4413,8 +4603,7 @@ impl Niri {
             (0., 0.),
             1.,
             Kind::Unspecified,
-        )
-        .into();
+        );
 
         // If the screenshot UI is open, draw it.
         if self.screenshot_ui.is_open() {
@@ -4422,7 +4611,7 @@ impl Niri {
                 .render_output(output, ctx.target, &mut |elem| push(elem.into()));
 
             // Add the backdrop for outputs that were connected while the screenshot UI was open.
-            push(backdrop);
+            push(backdrop.into());
 
             return;
         }
@@ -4444,6 +4633,11 @@ impl Niri {
         let mon = self.layout.monitor_for_output(output).unwrap();
         let zoom = mon.overview_zoom();
 
+        // The desktop zoom transform was computed above; at level 1 elements are pushed
+        // without a wrapper.
+        let zoom_origin = desktop_zoom.focal().to_physical_precise_round(output_scale);
+        let zoom_level = desktop_zoom.factor();
+
         // Get layer-shell elements.
         let layer_map = layer_map_for_output(output);
 
@@ -4462,17 +4656,17 @@ impl Niri {
                 );
             }};
             ($layer:expr, true) => {{
-                push_popups_from_layer!($layer, None, XrayPos::default(), true, &mut |elem| push(
-                    elem.into()
-                ));
+                push_popups_from_layer!($layer, None, XrayPos::default(), true, &mut |elem| {
+                    push_desktop!(elem)
+                });
             }};
             ($layer:expr, $ns:expr, $xray_pos:expr, $push:expr) => {{
                 push_popups_from_layer!($layer, $ns, $xray_pos, false, $push);
             }};
             ($layer:expr) => {{
-                push_popups_from_layer!($layer, None, XrayPos::default(), false, &mut |elem| push(
-                    elem.into()
-                ));
+                push_popups_from_layer!($layer, None, XrayPos::default(), false, &mut |elem| {
+                    push_desktop!(elem)
+                });
             }};
         }
         macro_rules! push_normal_from_layer {
@@ -4489,7 +4683,7 @@ impl Niri {
             }};
             ($layer:expr, true) => {{
                 push_normal_from_layer!($layer, None, XrayPos::default(), true, &mut |elem| {
-                    push(elem.into())
+                    push_desktop!(elem)
                 });
             }};
             ($layer:expr, $ns:expr, $xray_pos:expr, $push:expr) => {{
@@ -4497,8 +4691,22 @@ impl Niri {
             }};
             ($layer:expr) => {{
                 push_normal_from_layer!($layer, None, XrayPos::default(), false, &mut |elem| {
-                    push(elem.into())
+                    push_desktop!(elem)
                 });
+            }};
+        }
+
+        // Pushes a desktop scene element, applying the desktop zoom transform when the
+        // committed zoom level is above 1. At level 1 the element is pushed unchanged.
+        macro_rules! push_desktop {
+            ($elem:expr) => {{
+                let elem = $elem;
+                if zoom_level == 1. {
+                    push(elem.into());
+                } else {
+                    let elem = RescaleRenderElement::from_element(elem, zoom_origin, zoom_level);
+                    push(elem.into());
+                }
             }};
         }
 
@@ -4510,11 +4718,15 @@ impl Niri {
         // Otherwise, we will render all layer-shell pop-ups and the top layer on top.
         if mon.render_above_top_layer() {
             self.layout
-                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
+                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| {
+                    push_desktop!(elem)
+                });
 
-            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| {
+                push_desktop!(elem)
+            });
 
-            mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+            mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push_desktop!(elem));
 
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
@@ -4526,23 +4738,27 @@ impl Niri {
 
             // We don't expect more than one workspace when render_above_top_layer().
             if let Some((ws, _geo)) = mon.workspaces_with_render_geo().next() {
-                push(ws.render_background().into());
+                push_desktop!(ws.render_background());
             }
         } else {
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
 
             self.layout
-                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
+                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| {
+                    push_desktop!(elem)
+                });
 
-            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| {
+                push_desktop!(elem)
+            });
 
             // Macro instead of closure to avoid borrowing push().
             macro_rules! process {
                 ($geo:expr) => {{
                     &mut |elem| {
                         if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, $geo) {
-                            push(elem.into());
+                            push_desktop!(elem);
                         }
                     }
                 }};
@@ -4555,7 +4771,7 @@ impl Niri {
                 push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
             }
 
-            mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+            mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push_desktop!(elem));
 
             for (ws, geo) in mon.workspaces_with_render_geo() {
                 // The render element namespace. This will be set to the workspace index for
@@ -4575,13 +4791,13 @@ impl Niri {
             }
         }
 
-        mon.render_workspace_shadows(ctx.renderer, &mut |elem| push(elem.into()));
+        mon.render_workspace_shadows(ctx.renderer, &mut |elem| push_desktop!(elem));
 
         // Then the backdrop.
         push_popups_from_layer!(Layer::Background, true);
         push_normal_from_layer!(Layer::Background, true);
 
-        push(backdrop);
+        push_desktop!(backdrop);
     }
 
     pub fn fill_xray_elements(&self, mut ctx: RenderCtx<GlesRenderer>, output: &Output) {
@@ -5831,6 +6047,55 @@ impl Niri {
         elements
     }
 
+    /// Computes the cursor hotspot position for an image-copy-capture cursor
+    /// session of `output`, in transformed buffer coordinates.
+    ///
+    /// The canonical pointer position is resolved once through the owning
+    /// output's presentation transform into a global displayed position, then
+    /// converted to the source output's physical buffer space. The cursor is
+    /// considered entered when any part of its image intersects the output, so
+    /// the returned position may be negative or past the edge.
+    pub(crate) fn image_copy_cursor_pos(
+        &self,
+        output: &Output,
+        geo: Rectangle<i32, Logical>,
+        mode: smithay::output::Mode,
+        cursor_size: Size<i32, Physical>,
+        hotspot: Point<i32, Physical>,
+    ) -> Option<Point<i32, Physical>> {
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let pointer_pos = self.displayed_pointer_position();
+
+        // Unlike frame damage, the position is in transformed buffer coordinates, i.e. the
+        // displayed orientation, so the output transform is not undone here. This matches
+        // wlroots.
+        let pos: Point<i32, Physical> =
+            (pointer_pos - geo.loc.to_f64()).to_physical_precise_round(scale);
+
+        // Cursors are considered to have entered if any part of the image
+        // intersects the output, not just the hotspot, so the position may
+        // be negative or past the edge.
+        //
+        // The imagecopy protocol specifies this interpretation
+        // specifically, even though it differs from wl_pointer.enter,
+        // including the coordinates being outside the output bounds. This
+        // is also how wlroots implements it.
+        //
+        // This intentionally differs from how PipeWire casts work since PW
+        // requires the pointer to be within the output bounds, but this
+        // isn't relevant (or wanted) for the imagecopy protocol.
+        let image = Rectangle::new(pos - hotspot, cursor_size);
+        let output_rect =
+            Rectangle::from_size(output.current_transform().transform_size(mode.size));
+        if self.pointer_visibility.is_visible() && image.overlaps(output_rect) {
+            // not geo.to_f64().contains(pointer_pos)
+            Some(pos)
+        } else {
+            None
+        }
+    }
+
+
     /// Sends cursor position, hotspot and size to cursor sessions independently
     /// of the cursor image.
     pub fn refresh_image_copy_cursor_sessions(&mut self) {
@@ -5839,10 +6104,6 @@ impl Niri {
         }
 
         let _span = tracy_client::span!("Niri::refresh_image_copy_cursor_sessions");
-
-        let pointer_pos = self
-            .tablet_cursor_location
-            .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
 
         let mut sessions = mem::take(&mut self.image_copy_cursor_sessions);
         for s in &mut sessions {
@@ -5858,8 +6119,6 @@ impl Niri {
                 s.session.set_cursor_pos(None);
                 continue;
             };
-
-            let scale = Scale::from(output.current_scale().fractional_scale());
 
             // Update the constraints if the cursor image size changed.
             let constraints = image_copy_capture_impl::cursor_capture_constraints(self, &output);
@@ -5881,34 +6140,10 @@ impl Niri {
             let hotspot = image_copy_capture_impl::cursor_capture_hotspot(self, &output);
             s.session.set_cursor_hotspot((hotspot.x, hotspot.y));
 
-            // Unlike frame damage, the position is in transformed buffer coordinates, i.e. the
-            // displayed orientation, so the output transform is not undone here. This matches
-            // wlroots.
-            let pos: Point<i32, Physical> =
-                (pointer_pos - geo.loc.to_f64()).to_physical_precise_round(scale);
-
-            // Cursors are considered to have entered if any part of the image
-            // intersects the output, not just the hotspot, so the position may
-            // be negative or past the edge.
-            //
-            // The imagecopy protocol specifies this interpretation
-            // specifically, even though it differs from wl_pointer.enter,
-            // including the coordinates being outside the output bounds. This
-            // is also how wlroots implements it.
-            //
-            // This intentionally differs from how PipeWire casts work since PW
-            // requires the pointer to be within the output bounds, but this
-            // isn't relevant (or wanted) for the imagecopy protocol.
             let hotspot = Point::<i32, Physical>::from((hotspot.x, hotspot.y));
-            let image = Rectangle::new(pos - hotspot, Size::from((cursor_size.w, cursor_size.h)));
-            let output_rect =
-                Rectangle::from_size(output.current_transform().transform_size(mode.size));
-            if self.pointer_visibility.is_visible() && image.overlaps(output_rect) {
-                // not geo.to_f64().contains(pointer_pos)
-                s.session.set_cursor_pos(Some(Point::from((pos.x, pos.y))));
-            } else {
-                s.session.set_cursor_pos(None);
-            }
+            let cursor_size = Size::<i32, Physical>::from((cursor_size.w, cursor_size.h));
+            let pos = self.image_copy_cursor_pos(&output, geo, mode, cursor_size, hotspot);
+            s.session.set_cursor_pos(pos.map(|pos| Point::from((pos.x, pos.y))));
         }
         // This shouldn't be possible since sessions are only added from the
         // ImageCopyCaptureHandler callbacks, which run in dispatch_clients()
@@ -6043,7 +6278,15 @@ impl Niri {
                 // show the pointer even when it's hidden through cursor {} options. The user can
                 // then toggle it in the screenshot UI as needed.
                 if self.pointer_visibility != PointerVisibility::Disabled {
-                    self.render_pointer(renderer, &output, &mut |elem| pointer.push(elem));
+                    self.render_pointer_with_transform(
+                        renderer,
+                        &output,
+                        self.layout
+                            .monitor_for_output(&output)
+                            .map(|mon| mon.effective_zoom_transform())
+                            .unwrap_or_else(ViewportTransform::identity),
+                        &mut |elem| pointer.push(elem),
+                    );
                 }
 
                 let res_pointer = if pointer.is_empty() {
@@ -7121,6 +7364,22 @@ niri_render_elements! {
         RelocatedColor = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
             SolidColorRenderElement
         >>>,
+        // Desktop-zoomed variants of the desktop scene elements above. Used when the
+        // output's committed zoom level is above 1.
+        ZoomedMonitor = RescaleRenderElement<MonitorRenderElement<R>>,
+        ZoomedRescaledTile = RescaleRenderElement<RescaleRenderElement<TileRenderElement<R>>>,
+        ZoomedLayerSurface = RescaleRenderElement<LayerSurfaceRenderElement<R>>,
+        ZoomedRelocatedLayerSurface = RescaleRenderElement<
+            CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+                LayerSurfaceRenderElement<R>
+            >>>,
+        >,
+        ZoomedRelocatedColor = RescaleRenderElement<
+            CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+                SolidColorRenderElement
+            >>>,
+        >,
+        ZoomedSolidColor = RescaleRenderElement<SolidColorRenderElement>,
         Pointer = PointerRenderElements<R>,
         Wayland = WaylandSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,

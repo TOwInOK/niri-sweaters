@@ -224,7 +224,9 @@ impl PointerConstraintsHandler for State {
             return;
         }
 
+        let (target, output) = self.prepare_zoom_warp_target(target);
         pointer.set_location(target);
+        self.update_zoom_focal_for_cursor(target, output.as_ref());
 
         // Redraw to update the cursor position if it's visible.
         if self.niri.pointer_visibility.is_visible() {

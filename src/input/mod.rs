@@ -48,11 +48,13 @@ use self::spatial_movement_grab::SpatialMovementGrab;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
+use crate::layout::zoom::ZoomSnapshot;
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
+use crate::utils::view::ViewportTransform;
 use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
 
 pub mod backend_ext;
@@ -68,12 +70,51 @@ pub mod swipe_tracker;
 pub mod touch_overview_grab;
 
 use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
-
 pub const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
+
+/// Zoom-out results within this distance of 1 are snapped to exactly 1 so that
+/// repeated zoom-in/out cycles do not leave a floating-point residue that keeps
+/// the zoom nominally active.
+const ZOOM_SNAP_TO_ONE_EPSILON: f64 = 1e-9;
+
+/// The physical control that started a zoom hold session.
+///
+/// Identifies the release event that ends the hold. Uses physical codes rather
+/// than keysyms, modifiers or the bind itself: the layout, modifier state and
+/// the bind table may all change while the hold is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoomHoldTrigger {
+    /// A keyboard key, identified by its physical key code.
+    Key(Keycode),
+    /// A pointer button, identified by its button code.
+    PointerButton(u32),
+    /// A tablet stylus button, identified by its button code.
+    TabletButton(u32),
+}
+
+/// An active `hold-zoom` session.
+///
+/// Created when a `hold-zoom` bind press is executed and owned by the trigger
+/// and the output resolved at that moment. Releasing the trigger animates the
+/// saved zoom state back on the owning output.
+#[derive(Debug, Clone)]
+pub struct ZoomHoldState {
+    /// The physical control whose release ends the hold.
+    pub trigger: ZoomHoldTrigger,
+    /// The output the hold applies to, fixed at press time.
+    pub output: Output,
+    /// The zoom state to restore on release.
+    pub previous: ZoomSnapshot,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabletData {
     pub aspect_ratio: f64,
+}
+struct AbsoluteLocation {
+    display: Point<f64, Logical>,
+    content: Point<f64, Logical>,
+    output: Option<Output>,
 }
 
 pub enum AnyStartData<D: SeatHandler + TabletSeatHandler> {
@@ -273,6 +314,12 @@ impl State {
     }
 
     fn on_device_removed(&mut self, device: impl Device) {
+        // The removed device may never deliver the release that would end an
+        // active zoom hold. The session does not track which device its
+        // trigger came from, so any removal ends it. This is a lost-release
+        // cleanup, so the restore is immediate.
+        self.cancel_zoom_hold_immediate();
+
         if device.has_capability(DeviceCapability::TabletTool) {
             let tablet_seat = self.niri.seat.tablet_seat();
 
@@ -302,14 +349,16 @@ impl State {
         )
     }
 
-    /// Computes the cursor position for the tablet event.
+    /// Computes both display-space and canonical positions for the tablet event.
     ///
-    /// This function handles the tablet output mapping, as well as coordinate clamping and aspect
-    /// ratio correction.
-    fn compute_tablet_position<I: InputBackend>(
+    /// Output mapping follows the absolute pointer path: existing device/output mapping produces
+    /// a displayed position, which is then converted to content coordinates through the effective
+    /// viewport transform. Focused-window mapping is different: its target rectangle is already in
+    /// content coordinates, so it must not pass through the viewport inverse.
+    fn compute_tablet_location<I: InputBackend>(
         &self,
         event: &(impl Event<I> + TabletToolEvent<I>),
-    ) -> Option<Point<f64, Logical>>
+    ) -> Option<AbsoluteLocation>
     where
         I::Device: 'static,
     {
@@ -318,51 +367,86 @@ impl State {
         let device_output = device_output.as_ref();
         let mapped_output = device_output.or_else(|| self.niri.output_for_tablet());
 
-        // If the tablet is configured to map to the focused window, use that window's geometry on
-        // the mapped output (or on the focused output if no specific output is mapped).
         let map_to_focused_window = self.niri.config.borrow().input.tablet.map_to_focused_window;
-        // But only if the keyboard focus is on the layout, so that it doesn't trigger on the lock
-        // screen and such.
-        let window_target = if map_to_focused_window && self.niri.keyboard_focus.is_layout() {
-            let output = mapped_output.or_else(|| self.niri.layout.active_output());
-            output.and_then(|output| {
-                let monitor = self.niri.layout.monitor_for_output(output)?;
-                let mut rect = monitor.active_window_visual_rectangle()?;
-                let output_geo = self.niri.global_space.output_geometry(output)?;
-                rect.loc += output_geo.loc.to_f64();
-                Some((rect, output))
-            })
-        } else {
-            None
-        };
+        if map_to_focused_window && self.niri.keyboard_focus.is_layout() {
+            // The focused-window rectangle is already global content geometry. Keep this path
+            // separate from output mapping so desktop zoom cannot be applied twice.
+            let window_target = mapped_output
+                .or_else(|| self.niri.layout.active_output())
+                .and_then(|output| {
+                    let monitor = self.niri.layout.monitor_for_output(output)?;
+                    let mut rect = monitor.active_window_visual_rectangle()?;
+                    let output_geo = self.niri.global_space.output_geometry(output)?;
+                    rect.loc += output_geo.loc.to_f64();
+                    Some((rect, output))
+                });
 
-        let (target_geo, keep_ratio, px, transform) = if let Some((rect, output)) = window_target {
-            (
-                rect,
+            if let Some((target_geo, output)) = window_target {
+                let content = self.compute_tablet_target_position(
+                    event,
+                    target_geo,
+                    true,
+                    1. / output.current_scale().fractional_scale(),
+                    output.current_transform(),
+                );
+                return Some(AbsoluteLocation {
+                    display: self.niri.display_position_for_content(content),
+                    content,
+                    output: Some(output.clone()),
+                });
+            }
+        }
+
+        if let Some(output) = mapped_output {
+            let target_geo = self
+                .niri
+                .global_space
+                .output_geometry(output)
+                .unwrap()
+                .to_f64();
+            let display = self.compute_tablet_target_position(
+                event,
+                target_geo,
                 true,
                 1. / output.current_scale().fractional_scale(),
                 output.current_transform(),
-            )
-        } else if let Some(output) = mapped_output {
-            let geo = self.niri.global_space.output_geometry(output).unwrap();
-            (
-                geo.to_f64(),
-                true,
-                1. / output.current_scale().fractional_scale(),
-                output.current_transform(),
-            )
-        } else {
-            let geo = self.global_bounding_rectangle()?.to_f64();
+            );
+            return Some(self.absolute_location_from_display(display, Some(output.clone())));
+        }
 
-            // FIXME: this 1 px size should ideally somehow be computed for the rightmost output
-            // corresponding to the position on the right when clamping.
-            let output = self.niri.global_space.outputs().next().unwrap();
-            let scale = output.current_scale().fractional_scale();
+        let target_geo = self.global_bounding_rectangle()?.to_f64();
 
-            // Do not keep ratio for the unified mode as this is what OpenTabletDriver expects.
-            (geo, false, 1. / scale, Transform::Normal)
-        };
+        // FIXME: this 1 px size should ideally somehow be computed for the rightmost output
+        // corresponding to the position on the right when clamping.
+        let output = self.niri.global_space.outputs().next().unwrap();
+        let scale = output.current_scale().fractional_scale();
 
+        // Do not keep ratio for the unified mode as this is what OpenTabletDriver expects.
+        let display = self.compute_tablet_target_position(
+            event,
+            target_geo,
+            false,
+            1. / scale,
+            Transform::Normal,
+        );
+        Some(self.absolute_location_from_display(display, None))
+    }
+
+    /// Applies the existing tablet target mapping without desktop zoom.
+    ///
+    /// The target rectangle is either an output rectangle in display space or a focused-window
+    /// rectangle in content space. The caller chooses which coordinate-space result it means.
+    fn compute_tablet_target_position<I: InputBackend>(
+        &self,
+        event: &(impl Event<I> + TabletToolEvent<I>),
+        target_geo: Rectangle<f64, Logical>,
+        keep_ratio: bool,
+        px: f64,
+        transform: Transform,
+    ) -> Point<f64, Logical>
+    where
+        I::Device: 'static,
+    {
         let mut pos = {
             let size = transform.invert().transform_size(target_geo.size);
             transform.transform_point_in(event.position_transformed(size.to_i32_round()), &size)
@@ -394,9 +478,8 @@ impl State {
 
         pos.x = pos.x.clamp(0.0, target_geo.size.w - px);
         pos.y = pos.y.clamp(0.0, target_geo.size.h - px);
-        Some(pos + target_geo.loc)
+        pos + target_geo.loc
     }
-
     fn is_inhibiting_shortcuts(&self) -> bool {
         self.niri
             .keyboard_focus
@@ -431,6 +514,11 @@ impl State {
             if let Some(token) = self.niri.bind_repeat_timer.take() {
                 self.niri.event_loop.remove(token);
             }
+
+            // End an active zoom hold owned by this key. Checked by physical
+            // key code before any bind lookup so that it stays correct across
+            // modifier changes, layout changes and config reloads.
+            self.end_zoom_hold_for_trigger(ZoomHoldTrigger::Key(event.key_code()));
         }
 
         if pressed {
@@ -599,13 +687,15 @@ impl State {
             return;
         }
 
-        self.handle_bind(bind.clone());
+        self.handle_bind(bind.clone(), Some(ZoomHoldTrigger::Key(event.key_code())));
 
         self.start_key_repeat(bind);
     }
 
-    fn start_key_repeat(&mut self, bind: Bind) {
-        if !bind.repeat {
+    pub(crate) fn start_key_repeat(&mut self, bind: Bind) {
+        // hold-zoom is intrinsically non-repeatable: it is driven by the
+        // press/release lifecycle, not by key repeat.
+        if !bind.repeat || matches!(bind.action, Action::HoldZoom(_)) {
             return;
         }
 
@@ -630,7 +720,7 @@ impl State {
             .niri
             .event_loop
             .insert_source(repeat_timer, move |_, _, state| {
-                state.handle_bind(bind.clone());
+                state.handle_bind(bind.clone(), None);
                 TimeoutAction::ToDuration(repeat_duration)
             })
             .unwrap();
@@ -660,9 +750,14 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
-    pub fn handle_bind(&mut self, bind: Bind) {
+    /// Executes a resolved bind.
+    ///
+    /// `hold_trigger` is the physical control that produced the press, needed
+    /// by `hold-zoom` to own the ending release. Callers without a real
+    /// trigger (key repeat, scroll ticks) pass `None`.
+    pub fn handle_bind(&mut self, bind: Bind, hold_trigger: Option<ZoomHoldTrigger>) {
         let Some(cooldown) = bind.cooldown else {
-            self.do_action(bind.action, bind.allow_when_locked);
+            self.do_action_with_trigger(bind.action, bind.allow_when_locked, hold_trigger);
             return;
         };
 
@@ -688,12 +783,21 @@ impl State {
                     .unwrap();
                 entry.insert(token);
 
-                self.do_action(bind.action, bind.allow_when_locked);
+                self.do_action_with_trigger(bind.action, bind.allow_when_locked, hold_trigger);
             }
         }
     }
 
     pub fn do_action(&mut self, action: Action, allow_when_locked: bool) {
+        self.do_action_with_trigger(action, allow_when_locked, None);
+    }
+
+    fn do_action_with_trigger(
+        &mut self,
+        action: Action,
+        allow_when_locked: bool,
+        hold_trigger: Option<ZoomHoldTrigger>,
+    ) {
         if self.niri.is_locked() && !(allow_when_locked || allowed_when_locked(&action)) {
             return;
         }
@@ -714,13 +818,17 @@ impl State {
             }
             Action::ChangeVt(vt) => {
                 self.backend.change_vt(vt);
-                // Changing VT may not deliver the key releases, so clear the state.
+                // Changing VT may not deliver the key releases, so clear the
+                // state. The hold restore is immediate: no frames may remain
+                // for an animation to complete on.
                 self.niri.suppressed_keys.clear();
+                self.cancel_zoom_hold_immediate();
             }
             Action::Suspend => {
                 self.backend.suspend();
                 // Suspend may not deliver the key releases, so clear the state.
                 self.niri.suppressed_keys.clear();
+                self.cancel_zoom_hold_immediate();
             }
             Action::PowerOffMonitors => {
                 self.niri.deactivate_monitors(&mut self.backend);
@@ -2428,6 +2536,53 @@ impl State {
                     self.niri.queue_redraw_mru_output();
                 }
             }
+            Action::ZoomIn => {
+                let factor = self.niri.config.borrow().zoom.increment_factor;
+                self.zoom_by(factor);
+            }
+            Action::ZoomOut => {
+                let factor = self.niri.config.borrow().zoom.increment_factor;
+                self.zoom_by(1. / factor);
+            }
+            Action::SetZoomLevel(level) => {
+                let level = level.0;
+                if !level.is_finite() || level < 1. {
+                    warn!("ignoring set-zoom-level with invalid level: {level}");
+                    return;
+                }
+                self.set_zoom_level(level);
+            }
+            Action::ResetZoom => {
+                self.set_zoom_level(1.);
+            }
+            Action::ToggleZoomLock => {
+                if let Some((output, _)) = self.zoom_target() {
+                    if let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) {
+                        mon.zoom_mut().toggle_locked();
+                        self.niri.queue_redraw(&output);
+                    }
+                }
+            }
+            Action::ToggleZoom(preset) => {
+                let preset = preset.0;
+                if !preset.is_finite() || preset <= 1. {
+                    warn!("ignoring toggle-zoom with invalid level: {preset}");
+                    return;
+                }
+                self.toggle_zoom(preset);
+            }
+            Action::HoldZoom(preset) => {
+                let preset = preset.0;
+                if !preset.is_finite() || preset <= 1. {
+                    warn!("ignoring hold-zoom with invalid level: {preset}");
+                    return;
+                }
+                let Some(trigger) = hold_trigger else {
+                    warn!("ignoring hold-zoom without a physical trigger");
+                    return;
+                };
+                self.begin_zoom_hold(trigger, preset);
+            }
         }
     }
 
@@ -2444,11 +2599,23 @@ impl State {
         let serial = SERIAL_COUNTER.next_serial();
 
         let pointer = self.niri.seat.get_pointer().unwrap();
-
         let pos = pointer.current_location();
 
+        // Relative motion is scaled by the effective zoom presentation of the output under the
+        // current pointer position.
+        let zoom_level = self
+            .niri
+            .global_space
+            .output_under(pos)
+            .next()
+            .and_then(|output| self.niri.layout.monitor_for_output(output))
+            .map(|mon| mon.effective_zoom_transform().factor())
+            .unwrap_or(1.);
+        let delta = event.delta().downscale(zoom_level);
+        let delta_unaccel = event.delta_unaccel().downscale(zoom_level);
+
         // We have an output, so we can compute the new location and focus.
-        let mut new_pos = pos + event.delta();
+        let mut new_pos = pos + delta;
 
         // We received an event for the regular pointer, so show it now.
         self.niri.pointer_visibility = PointerVisibility::Visible;
@@ -2494,8 +2661,8 @@ impl State {
                     self,
                     Some(under.clone()),
                     &RelativeMotionEvent {
-                        delta: event.delta(),
-                        delta_unaccel: event.delta_unaccel(),
+                        delta,
+                        delta_unaccel,
                         time: event.time(),
                     },
                 );
@@ -2564,9 +2731,18 @@ impl State {
             }
         }
 
+        // While the zoom is locked, the viewport stays fixed and the pointer cannot leave the
+        // content it currently displays. The owning output is the one under the previous
+        // pointer position.
+        if let Some(output) = self.niri.global_space.output_under(pos).next().cloned() {
+            new_pos = self.clamp_pointer_to_locked_viewport(new_pos, &output);
+        }
+
+        let display_pos = self.niri.display_position_for_content(new_pos);
+
         if let Some(output) = self.niri.screenshot_ui.selection_output() {
             let geom = self.niri.global_space.output_geometry(output).unwrap();
-            let point = (new_pos - geom.loc.to_f64())
+            let point = (display_pos - geom.loc.to_f64())
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
@@ -2574,7 +2750,7 @@ impl State {
         }
 
         if let Some(mru_output) = self.niri.window_mru_ui.output() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(new_pos) {
+            if let Some((output, pos_within_output)) = self.niri.output_under(display_pos) {
                 if mru_output == output {
                     self.niri.window_mru_ui.pointer_motion(pos_within_output);
                 }
@@ -2605,8 +2781,8 @@ impl State {
                     self,
                     Some(focus_surface),
                     &RelativeMotionEvent {
-                        delta: event.delta(),
-                        delta_unaccel: event.delta_unaccel(),
+                        delta,
+                        delta_unaccel,
                         time: event.time(),
                     },
                 );
@@ -2631,12 +2807,16 @@ impl State {
             },
         );
 
+        // Move the zoomed viewport to follow the accepted pointer position. This is a camera
+        // movement, not a cursor movement, so it does not produce another pointer motion.
+        self.update_zoom_focal_for_cursor(pointer.current_location(), None);
+
         pointer.relative_motion(
             self,
             under.surface,
             &RelativeMotionEvent {
-                delta: event.delta(),
-                delta_unaccel: event.delta_unaccel(),
+                delta,
+                delta_unaccel,
                 time: event.time(),
             },
         );
@@ -2687,13 +2867,14 @@ impl State {
         // Any of the early returns here mean that the pointer is not inside the hot corner.
         self.niri.pointer_inside_hot_corner = false;
 
-        let Some(pos) = self.compute_absolute_location(&event, None).or_else(|| {
-            self.global_bounding_rectangle().map(|output_geo| {
-                event.position_transformed(output_geo.size) + output_geo.loc.to_f64()
-            })
-        }) else {
+        let Some(location) = self.compute_absolute_location(&event, None) else {
             return;
         };
+        let pos = location
+            .output
+            .as_ref()
+            .map(|output| self.clamp_pointer_to_locked_viewport(location.content, output))
+            .unwrap_or(location.content);
 
         let serial = SERIAL_COUNTER.next_serial();
 
@@ -2701,7 +2882,7 @@ impl State {
 
         if let Some(output) = self.niri.screenshot_ui.selection_output() {
             let geom = self.niri.global_space.output_geometry(output).unwrap();
-            let point = (pos - geom.loc.to_f64())
+            let point = (location.display - geom.loc.to_f64())
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
@@ -2709,7 +2890,7 @@ impl State {
         }
 
         if let Some(mru_output) = self.niri.window_mru_ui.output() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+            if let Some((output, pos_within_output)) = self.niri.output_under(location.display) {
                 if mru_output == output {
                     self.niri.window_mru_ui.pointer_motion(pos_within_output);
                 }
@@ -2731,6 +2912,7 @@ impl State {
                 time: event.time(),
             },
         );
+        self.update_zoom_focal_for_cursor(pointer.current_location(), location.output.as_ref());
 
         pointer.frame(self);
 
@@ -2788,6 +2970,13 @@ impl State {
 
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
 
+        // End an active zoom hold owned by this button. Checked by physical
+        // button code before the suppression early-return so that the release
+        // still ends the hold even though it is not delivered to clients.
+        if button_state == ButtonState::Released {
+            self.end_zoom_hold_for_trigger(ZoomHoldTrigger::PointerButton(button_code));
+        }
+
         // Ignore release events for mouse clicks that triggered a bind.
         if self.niri.suppressed_buttons.remove(&button_code) {
             return;
@@ -2839,7 +3028,10 @@ impl State {
                     !self.niri.screenshot_ui.is_open() || allowed_during_screenshot(&bind.action)
                 }) {
                     self.niri.suppressed_buttons.insert(button_code);
-                    self.handle_bind(bind.clone());
+                    self.handle_bind(
+                        bind.clone(),
+                        Some(ZoomHoldTrigger::PointerButton(button_code)),
+                    );
                     return;
                 };
             }
@@ -3056,18 +3248,21 @@ impl State {
 
         if button == Some(MouseButton::Left) && self.niri.screenshot_ui.is_open() {
             if button_state == ButtonState::Pressed {
+                // The screenshot UI works in displayed coordinates, same as
+                // pointer motion and tablet/touch pointer_down.
                 let pos = pointer.current_location();
+                let display_pos = self.niri.display_position_for_content(pos);
 
                 // If we'll be moving the existing selection, use the selection output.
                 let output = if mod_down {
                     self.niri.screenshot_ui.selection_output()
                 } else {
-                    self.niri.output_under(pos).map(|(out, _)| out)
+                    self.niri.output_under(display_pos).map(|(out, _)| out)
                 };
 
                 if let Some(output) = output.cloned() {
                     let geom = self.niri.global_space.output_geometry(&output).unwrap();
-                    let point = (pos - geom.loc.to_f64())
+                    let point = (display_pos - geom.loc.to_f64())
                         .to_physical(output.current_scale().fractional_scale())
                         .to_i32_round();
 
@@ -3211,12 +3406,12 @@ impl State {
 
                     if let Some(right) = bind_right {
                         for _ in 0..ticks {
-                            self.handle_bind(right.clone());
+                            self.handle_bind(right.clone(), None);
                         }
                     }
                     if let Some(left) = bind_left {
                         for _ in ticks..0 {
-                            self.handle_bind(left.clone());
+                            self.handle_bind(left.clone(), None);
                         }
                     }
                 }
@@ -3302,12 +3497,12 @@ impl State {
 
                     if let Some(down) = bind_down {
                         for _ in 0..ticks {
-                            self.handle_bind(down.clone());
+                            self.handle_bind(down.clone(), None);
                         }
                     }
                     if let Some(up) = bind_up {
                         for _ in ticks..0 {
-                            self.handle_bind(up.clone());
+                            self.handle_bind(up.clone(), None);
                         }
                     }
                 }
@@ -3454,12 +3649,12 @@ impl State {
 
                     if let Some(right) = bind_right {
                         for _ in 0..ticks {
-                            self.handle_bind(right.clone());
+                            self.handle_bind(right.clone(), None);
                         }
                     }
                     if let Some(left) = bind_left {
                         for _ in ticks..0 {
-                            self.handle_bind(left.clone());
+                            self.handle_bind(left.clone(), None);
                         }
                     }
                 }
@@ -3492,12 +3687,12 @@ impl State {
 
                     if let Some(down) = bind_down {
                         for _ in 0..ticks {
-                            self.handle_bind(down.clone());
+                            self.handle_bind(down.clone(), None);
                         }
                     }
                     if let Some(up) = bind_up {
                         for _ in ticks..0 {
-                            self.handle_bind(up.clone());
+                            self.handle_bind(up.clone(), None);
                         }
                     }
                 }
@@ -3585,23 +3780,25 @@ impl State {
     where
         I::Device: 'static, // Needed for downcasting.
     {
-        self.update_tablet_tool::<I>(&event, true);
+        let _ = self.update_tablet_tool::<I>(&event, true);
     }
 
     fn update_tablet_tool<I: InputBackend>(
         &mut self,
         event: &(impl Event<I> + TabletToolEvent<I>),
         send_frame: bool,
-    ) where
+    ) -> Option<AbsoluteLocation>
+    where
         I::Device: 'static,
     {
-        let Some(pos) = self.compute_tablet_position(event) else {
-            return;
+        let Some(location) = self.compute_tablet_location(event) else {
+            return None;
         };
+        let pos = location.content;
 
         if let Some(output) = self.niri.screenshot_ui.selection_output() {
             let geom = self.niri.global_space.output_geometry(output).unwrap();
-            let point = (pos - geom.loc.to_f64())
+            let point = (location.display - geom.loc.to_f64())
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
@@ -3609,7 +3806,7 @@ impl State {
         }
 
         if let Some(mru_output) = self.niri.window_mru_ui.output() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+            if let Some((output, pos_within_output)) = self.niri.output_under(location.display) {
                 if mru_output == output {
                     self.niri.window_mru_ui.pointer_motion(pos_within_output);
                 }
@@ -3658,6 +3855,7 @@ impl State {
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
         self.niri.queue_redraw_all();
+        Some(location)
     }
 
     fn on_tablet_tool_tip<I: InputBackend>(&mut self, event: I::TabletToolTipEvent)
@@ -3671,10 +3869,12 @@ impl State {
         };
 
         let tip_state = event.tip_state();
-        if tip_state == TabletToolTipState::Down {
+        let tablet_location = if tip_state == TabletToolTipState::Down {
             // Tip events can come together with axis event data with no separate axis event.
-            self.update_tablet_tool::<I>(&event, false);
-        }
+            self.update_tablet_tool::<I>(&event, false)
+        } else {
+            None
+        };
 
         let serial = SERIAL_COUNTER.next_serial();
         let time = event.time();
@@ -3683,6 +3883,10 @@ impl State {
             TabletToolTipState::Down => {
                 if let Some(pos) = self.niri.tablet_cursor_location {
                     let under = self.niri.contents_under(pos);
+                    let display_pos = tablet_location
+                        .as_ref()
+                        .map(|location| location.display)
+                        .unwrap_or_else(|| self.niri.display_position_for_content(pos));
 
                     let mod_key = self.backend.mod_key(&self.niri.config.borrow());
                     let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
@@ -3699,7 +3903,7 @@ impl State {
 
                         if let Some(output) = output.cloned() {
                             let geom = self.niri.global_space.output_geometry(&output).unwrap();
-                            let point = (pos - geom.loc.to_f64())
+                            let point = (display_pos - geom.loc.to_f64())
                                 .to_physical(output.current_scale().fractional_scale())
                                 .to_i32_round();
 
@@ -3712,7 +3916,9 @@ impl State {
                             }
                         }
                     } else if let Some(mru_output) = self.niri.window_mru_ui.output() {
-                        if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+                        if let Some((output, pos_within_output)) =
+                            self.niri.output_under(display_pos)
+                        {
                             if mru_output == output {
                                 let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
                                 if id.is_some() {
@@ -3809,7 +4015,7 @@ impl State {
 
                 tool.up(self, &tablet::tool::UpEvent { serial, time });
 
-                self.update_tablet_tool::<I>(&event, false);
+                let _ = self.update_tablet_tool::<I>(&event, false);
             }
         }
 
@@ -3820,9 +4026,10 @@ impl State {
     where
         I::Device: 'static, // Needed for downcasting.
     {
-        let Some(pos) = self.compute_tablet_position(&event) else {
+        let Some(location) = self.compute_tablet_location(&event) else {
             return;
         };
+        let pos = location.content;
 
         let under = self.niri.contents_under(pos);
 
@@ -3901,6 +4108,13 @@ impl State {
         if let Some(tool) = tool {
             let button = event.button();
 
+            // End an active zoom hold owned by this stylus button. Checked by
+            // physical button code before the suppression early-return so that
+            // the release still ends the hold.
+            if event.button_state() == ButtonState::Released {
+                self.end_zoom_hold_for_trigger(ZoomHoldTrigger::TabletButton(button));
+            }
+
             if self.niri.suppressed_buttons.remove(&button) {
                 return;
             }
@@ -3930,7 +4144,10 @@ impl State {
                         });
                         if let Some(bind) = bind {
                             self.niri.suppressed_buttons.insert(button);
-                            self.handle_bind(bind.clone());
+                            self.handle_bind(
+                                bind.clone(),
+                                Some(ZoomHoldTrigger::TabletButton(button)),
+                            );
                             return;
                         }
                     }
@@ -4261,21 +4478,361 @@ impl State {
         );
     }
 
-    fn compute_absolute_location<I: InputBackend>(
+    fn compute_absolute_display_location<I: InputBackend>(
         &self,
         evt: &impl AbsolutePositionEvent<I>,
         fallback_output: Option<&Output>,
-    ) -> Option<Point<f64, Logical>> {
+    ) -> Option<(Output, Point<f64, Logical>)> {
         let output = evt.device().output(self);
         let output = output.filter(|output| self.niri.output_exists(output));
         let output = output.as_ref().or(fallback_output)?;
         let output_geo = self.niri.global_space.output_geometry(output).unwrap();
         let transform = output.current_transform();
         let size = transform.invert().transform_size(output_geo.size);
-        Some(
-            transform.transform_point_in(evt.position_transformed(size), &size.to_f64())
-                + output_geo.loc.to_f64(),
-        )
+        let display_local =
+            transform.transform_point_in(evt.position_transformed(size), &size.to_f64());
+        Some((output.clone(), display_local + output_geo.loc.to_f64()))
+    }
+
+    fn compute_absolute_location<I: InputBackend>(
+        &self,
+        evt: &impl AbsolutePositionEvent<I>,
+        fallback_output: Option<&Output>,
+    ) -> Option<AbsoluteLocation> {
+        if let Some((output, display)) =
+            self.compute_absolute_display_location(evt, fallback_output)
+        {
+            return Some(self.absolute_location_from_display(display, Some(output)));
+        }
+
+        let output_geo = self.global_bounding_rectangle()?;
+        let display = evt.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+        Some(self.absolute_location_from_display(display, None))
+    }
+
+    fn absolute_location_from_display(
+        &self,
+        display: Point<f64, Logical>,
+        mapped_output: Option<Output>,
+    ) -> AbsoluteLocation {
+        let output = mapped_output.or_else(|| {
+            self.niri
+                .output_under(display)
+                .map(|(output, _)| output.clone())
+        });
+        let content = output
+            .as_ref()
+            .map(|output| {
+                let origin = self
+                    .niri
+                    .global_space
+                    .output_geometry(output)
+                    .unwrap()
+                    .loc
+                    .to_f64();
+                let transform = self
+                    .niri
+                    .layout
+                    .monitor_for_output(output)
+                    .map(|mon| mon.effective_zoom_transform())
+                    .unwrap_or_else(ViewportTransform::identity);
+                Self::display_to_content(origin, display, transform)
+            })
+            .unwrap_or(display);
+
+        AbsoluteLocation {
+            display,
+            content,
+            output,
+        }
+    }
+
+    pub(crate) fn prepare_zoom_warp_target(
+        &self,
+        requested: Point<f64, Logical>,
+    ) -> (Point<f64, Logical>, Option<Output>) {
+        let Some((output, _)) = self.niri.output_under(requested) else {
+            return (requested, None);
+        };
+
+        let target = self.clamp_pointer_to_locked_viewport(requested, output);
+        (target, Some(output.clone()))
+    }
+
+    fn display_to_content(
+        output_origin: Point<f64, Logical>,
+        display: Point<f64, Logical>,
+        transform: ViewportTransform,
+    ) -> Point<f64, Logical> {
+        output_origin + transform.apply_inverse(display - output_origin)
+    }
+
+    fn clamp_pointer_to_locked_viewport(
+        &self,
+        pos: Point<f64, Logical>,
+        output: &Output,
+    ) -> Point<f64, Logical> {
+        let Some(mon) = self.niri.layout.monitor_for_output(output) else {
+            return pos;
+        };
+        let zoom = mon.zoom();
+        let effective = mon.effective_zoom_transform();
+        if !zoom.is_locked() || effective.factor() <= 1. {
+            return pos;
+        }
+
+        let geom = self.niri.global_space.output_geometry(output).unwrap();
+        let viewport = mon.effective_viewport();
+        let origin = geom.loc.to_f64();
+        let local = pos - origin;
+        origin
+            + Point::from((
+                local
+                    .x
+                    .clamp(viewport.loc.x, viewport.loc.x + viewport.size.w),
+                local
+                    .y
+                    .clamp(viewport.loc.y, viewport.loc.y + viewport.size.h),
+            ))
+    }
+
+    pub(crate) fn update_zoom_focal_for_cursor(
+        &mut self,
+        cursor: Point<f64, Logical>,
+        output_hint: Option<&Output>,
+    ) {
+        let (output, cursor_local) = if let Some(output) = output_hint {
+            let Some(geom) = self.niri.global_space.output_geometry(output) else {
+                return;
+            };
+            (output.clone(), cursor - geom.loc.to_f64())
+        } else {
+            let Some((output, cursor_local)) = self.niri.output_under(cursor) else {
+                return;
+            };
+            (output.clone(), cursor_local)
+        };
+
+        let deadzone_size = self.niri.config.borrow().zoom.deadzone_size;
+        if let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) {
+            if mon.overview_active() {
+                return;
+            }
+            if mon
+                .zoom_mut()
+                .update_focal_for_cursor(cursor_local, deadzone_size)
+            {
+                self.niri.queue_redraw(&output);
+            }
+        }
+    }
+
+    /// The output a zoom action applies to, and the zoom anchor in its
+    /// output-local content coordinates.
+    ///
+    /// The target output is the one under the canonical pointer position, or
+    /// the active output when the pointer is not on any output. The anchor is
+    /// the pointer position when it is on the target output, and the output
+    /// center otherwise.
+    fn zoom_target(&self) -> Option<(Output, Point<f64, Logical>)> {
+        let pointer_pos = self
+            .niri
+            .seat
+            .get_pointer()
+            .map(|pointer| pointer.current_location());
+
+        let pointer_output = pointer_pos.and_then(|pos| {
+            self.niri
+                .output_under(pos)
+                .map(|(output, local)| (output.clone(), local))
+        });
+
+        if let Some((output, anchor)) = pointer_output {
+            return Some((output, anchor));
+        }
+
+        let output = self.niri.layout.active_output()?.clone();
+        let anchor = self
+            .niri
+            .layout
+            .monitor_for_output(&output)
+            .map(|mon| mon.view_size().to_point().downscale(2.))
+            .unwrap_or_else(|| Point::from((0., 0.)));
+        Some((output, anchor))
+    }
+
+    /// Applies `level` to the zoom target output with an animated transition,
+    /// keeping the anchor at its displayed position where the output bounds
+    /// allow it.
+    fn set_zoom_level(&mut self, level: f64) {
+        let max_zoom = self.niri.config.borrow().zoom.max_zoom;
+        let Some((output, anchor)) = self.zoom_target() else {
+            return;
+        };
+        let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) else {
+            return;
+        };
+
+        mon.zoom_to(level.clamp(1., max_zoom), anchor);
+        self.niri.queue_redraw(&output);
+    }
+
+    fn zoom_by(&mut self, factor: f64) {
+        let max_zoom = self.niri.config.borrow().zoom.max_zoom;
+        let Some((output, anchor)) = self.zoom_target() else {
+            return;
+        };
+        let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) else {
+            return;
+        };
+
+        // Incremental actions are based on the target level so that they stay
+        // correct while zoom transitions are animated.
+        let mut level = (mon.zoom().target_level() * factor).clamp(1., max_zoom);
+        if level < 1. + ZOOM_SNAP_TO_ONE_EPSILON {
+            level = 1.;
+        }
+
+        mon.zoom_to(level, anchor);
+        self.niri.queue_redraw(&output);
+    }
+
+    /// Toggles the zoom target output between 1 and `preset`.
+    ///
+    /// The decision is made on `target_level` (user intent), not on the
+    /// displayed `level`, so it stays correct while transitions are animated.
+    fn toggle_zoom(&mut self, preset: f64) {
+        let max_zoom = self.niri.config.borrow().zoom.max_zoom;
+        let Some((output, anchor)) = self.zoom_target() else {
+            return;
+        };
+        let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) else {
+            return;
+        };
+
+        let level = if mon.zoom().target_level() > 1. {
+            1.
+        } else {
+            preset.clamp(1., max_zoom)
+        };
+
+        mon.zoom_to(level, anchor);
+        self.niri.queue_redraw(&output);
+    }
+
+    /// Starts a `hold-zoom` session owned by `trigger`.
+    ///
+    /// Snapshots the current zoom state of the target output, then animates
+    /// towards `preset` (clamped to the current `max-zoom`) like a regular
+    /// zoom action. If a hold is already active, it is replaced: on the same
+    /// output the new session keeps the original pre-hold snapshot and simply
+    /// retargets the current viewport; on another output the old session ends
+    /// with an animated restore first.
+    pub(crate) fn begin_zoom_hold(&mut self, trigger: ZoomHoldTrigger, preset: f64) {
+        let max_zoom = self.niri.config.borrow().zoom.max_zoom;
+        let Some((output, anchor)) = self.zoom_target() else {
+            return;
+        };
+
+        // A new hold press replaces the active session (replace, not
+        // nesting). On the same output the original pre-hold snapshot is
+        // kept: restoring it first would produce a pointless intermediate
+        // restore animation.
+        if let Some(hold) = self.niri.zoom_hold.as_mut() {
+            if hold.output == output {
+                hold.trigger = trigger;
+            } else {
+                self.end_zoom_hold_animated();
+            }
+        }
+
+        let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) else {
+            return;
+        };
+
+        if self.niri.zoom_hold.is_none() {
+            let previous = mon.zoom().snapshot();
+            self.niri.zoom_hold = Some(ZoomHoldState {
+                trigger,
+                output: output.clone(),
+                previous,
+            });
+        }
+
+        mon.zoom_to(preset.clamp(1., max_zoom), anchor);
+        self.niri.queue_redraw(&output);
+    }
+
+    /// Ends the active `hold-zoom` session with an animated restore.
+    ///
+    /// The viewport animates back to the saved state: the level towards the
+    /// saved target and the focal point towards the saved focal. The restored
+    /// levels are clamped to the current `max-zoom` and the focal to the
+    /// current view size, so a config reload during the hold cannot restore
+    /// an out-of-range state. The zoom lock is not restored: it is a user
+    /// preference, not part of the temporary viewport override; while locked,
+    /// only the level animates back.
+    ///
+    /// This is a cleanup path, not a new user action: it is intentionally not
+    /// gated on the compositor lock or the screenshot UI allow-list.
+    pub(crate) fn end_zoom_hold_animated(&mut self) {
+        let Some(hold) = self.niri.zoom_hold.take() else {
+            return;
+        };
+
+        let Some(mon) = self.niri.layout.monitor_for_output_mut(&hold.output) else {
+            // The owning output is gone; there is nothing to restore.
+            return;
+        };
+
+        let max_zoom = self.niri.config.borrow().zoom.max_zoom;
+        let mut snapshot = hold.previous;
+        snapshot.level = snapshot.level.clamp(1., max_zoom);
+        snapshot.target_level = snapshot.target_level.clamp(1., max_zoom);
+
+        mon.zoom_restore(snapshot);
+        self.niri.queue_redraw(&hold.output);
+    }
+
+    /// Ends the active `hold-zoom` session, restoring the saved zoom state
+    /// immediately.
+    ///
+    /// Used by lost-release cleanup paths (VT switch, suspend, device
+    /// removal, focus loss) where no frames may remain for an animated
+    /// restore to complete on.
+    pub(crate) fn cancel_zoom_hold_immediate(&mut self) {
+        let Some(hold) = self.niri.zoom_hold.take() else {
+            return;
+        };
+
+        let Some(mon) = self.niri.layout.monitor_for_output_mut(&hold.output) else {
+            // The owning output is gone; there is nothing to restore.
+            return;
+        };
+
+        let max_zoom = self.niri.config.borrow().zoom.max_zoom;
+        let mut snapshot = hold.previous;
+        snapshot.level = snapshot.level.clamp(1., max_zoom);
+        snapshot.target_level = snapshot.target_level.clamp(1., max_zoom);
+
+        let view_size = mon.view_size();
+        mon.zoom_mut().restore_immediate(snapshot, view_size);
+        self.niri.queue_redraw(&hold.output);
+    }
+
+    /// Ends the active `hold-zoom` session if it is owned by `trigger`.
+    ///
+    /// Called on release events; a release of any other control is a no-op.
+    /// The release is a normal user action, so the restore is animated.
+    pub(crate) fn end_zoom_hold_for_trigger(&mut self, trigger: ZoomHoldTrigger) {
+        if self
+            .niri
+            .zoom_hold
+            .as_ref()
+            .is_some_and(|h| h.trigger == trigger)
+        {
+            self.end_zoom_hold_animated();
+        }
     }
 
     /// Computes the cursor position for the touch event.
@@ -4284,7 +4841,7 @@ impl State {
     fn compute_touch_location<I: InputBackend>(
         &self,
         evt: &impl AbsolutePositionEvent<I>,
-    ) -> Option<Point<f64, Logical>> {
+    ) -> Option<AbsoluteLocation> {
         self.compute_absolute_location(evt, self.niri.output_for_touch())
     }
 
@@ -4292,9 +4849,10 @@ impl State {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
-        let Some(pos) = self.compute_touch_location(&evt) else {
+        let Some(location) = self.compute_touch_location(&evt) else {
             return;
         };
+        let pos = location.content;
         let slot = evt.slot();
 
         let serial = SERIAL_COUNTER.next_serial();
@@ -4311,12 +4869,12 @@ impl State {
             let output = if mod_down {
                 self.niri.screenshot_ui.selection_output()
             } else {
-                under.output.as_ref()
+                location.output.as_ref().or(under.output.as_ref())
             };
 
             if let Some(output) = output.cloned() {
                 let geom = self.niri.global_space.output_geometry(&output).unwrap();
-                let point = (pos - geom.loc.to_f64())
+                let point = (location.display - geom.loc.to_f64())
                     .to_physical(output.current_scale().fractional_scale())
                     .to_i32_round();
 
@@ -4329,7 +4887,7 @@ impl State {
                 }
             }
         } else if let Some(mru_output) = self.niri.window_mru_ui.output() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+            if let Some((output, pos_within_output)) = self.niri.output_under(location.display) {
                 if mru_output == output {
                     let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
                     if id.is_some() {
@@ -4448,14 +5006,15 @@ impl State {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
-        let Some(pos) = self.compute_touch_location(&evt) else {
+        let Some(location) = self.compute_touch_location(&evt) else {
             return;
         };
+        let pos = location.content;
         let slot = evt.slot();
 
         if let Some(output) = self.niri.screenshot_ui.selection_output().cloned() {
             let geom = self.niri.global_space.output_geometry(&output).unwrap();
-            let point = (pos - geom.loc.to_f64())
+            let point = (location.display - geom.loc.to_f64())
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
@@ -5684,6 +6243,29 @@ mod tests {
                 },
             ),
             None,
+        );
+    }
+    #[test]
+    fn display_to_content_identity_preserves_global_origin() {
+        let origin = Point::from((1920., 100.));
+        let display = Point::from((2075., 325.));
+
+        assert_eq!(
+            State::display_to_content(origin, display, ViewportTransform::identity()),
+            display
+        );
+    }
+
+    #[test]
+    fn display_to_content_inverts_zoom_after_localizing() {
+        let origin = Point::from((1920., 100.));
+        let transform = ViewportTransform::new(Point::from((100., 100.)), 2.);
+        let content = Point::from((2020., 300.));
+        let display = origin + transform.apply(content - origin);
+
+        assert_eq!(
+            State::display_to_content(origin, display, transform),
+            content
         );
     }
 }

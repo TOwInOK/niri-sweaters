@@ -479,6 +479,13 @@ fn action_name(action: &Action) -> String {
             String::from("Switch Focus Between Floating and Tiling")
         }
         Action::ToggleOverview => String::from("Open the Overview"),
+        Action::ZoomIn => String::from("Zoom In"),
+        Action::ZoomOut => String::from("Zoom Out"),
+        Action::SetZoomLevel(_) => String::from("Set Zoom Level"),
+        Action::ResetZoom => String::from("Reset Zoom"),
+        Action::ToggleZoomLock => String::from("Toggle Zoom Lock"),
+        Action::ToggleZoom(_) => String::from("Toggle Zoom"),
+        Action::HoldZoom(_) => String::from("Hold Zoom"),
         Action::Screenshot(_, _) => String::from("Take a Screenshot"),
         Action::Spawn(args) => format!(
             "Spawn <span face='monospace' bgcolor='#000000'>{}</span>",
@@ -612,6 +619,7 @@ fn prettify_keysym_name(screen_reader: bool, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use insta::assert_snapshot;
+    use niri_config::{FloatOrInt, ZoomLevelPreset};
 
     use super::*;
 
@@ -713,5 +721,20 @@ mod tests {
             ),
             @" Super + P : Hello"
         );
+    }
+
+    #[test]
+    fn zoom_action_names() {
+        for (action, name) in [
+            (Action::ZoomIn, "Zoom In"),
+            (Action::ZoomOut, "Zoom Out"),
+            (Action::SetZoomLevel(FloatOrInt(2.)), "Set Zoom Level"),
+            (Action::ResetZoom, "Reset Zoom"),
+            (Action::ToggleZoomLock, "Toggle Zoom Lock"),
+            (Action::ToggleZoom(ZoomLevelPreset(2.)), "Toggle Zoom"),
+            (Action::HoldZoom(ZoomLevelPreset(2.)), "Hold Zoom"),
+        ] {
+            assert_eq!(action_name(&action), name);
+        }
     }
 }

@@ -308,6 +308,55 @@ impl Animation {
         self.value()
     }
 
+    /// Returns the current velocity of the animation, if it can be computed.
+    ///
+    /// The velocity is in the same units as the `initial_velocity` passed to
+    /// [`Animation::new`]: value units per unadjusted second.
+    ///
+    /// Returns `None` for animation kinds without a reliable analytical
+    /// derivative (easing curves). Returns `Some(0)` once the animation is
+    /// complete.
+    pub fn velocity(&self) -> Option<f64> {
+        self.velocity_at(self.clock.now())
+    }
+
+    /// Returns the velocity of the animation at the given clock time.
+    ///
+    /// See [`velocity()`](Self::velocity).
+    pub fn velocity_at(&self, at: Duration) -> Option<f64> {
+        if let Kind::Easing { .. } = self.kind {
+            return None;
+        }
+
+        if self.is_off || self.clock.should_complete_instantly() {
+            return Some(0.);
+        }
+
+        if at <= self.start_time {
+            return Some(self.initial_velocity * self.clock.rate());
+        } else if self.start_time + self.duration <= at {
+            return Some(0.);
+        }
+
+        let passed = at.saturating_sub(self.start_time);
+
+        let velocity = match self.kind {
+            Kind::Easing { .. } => unreachable!(),
+            Kind::Spring(spring) => spring.velocity_at(passed),
+            Kind::Deceleration {
+                initial_velocity,
+                deceleration_rate,
+            } => {
+                let passed = passed.as_secs_f64();
+                initial_velocity * deceleration_rate.powf(1000. * passed)
+            }
+        };
+
+        // The stored initial velocity is scaled by the clock rate; scale the
+        // current velocity back the same way.
+        Some(velocity * self.clock.rate())
+    }
+
     pub fn to(&self) -> f64 {
         self.to
     }

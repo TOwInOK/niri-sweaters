@@ -14,7 +14,7 @@ use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
 /// Whether the primary renderer is llvmpipe.
 ///
 /// The golden images are only deterministic on llvmpipe, so the tests skip on anything else.
-fn llvmpipe_renderer(state: &mut crate::niri::State) -> bool {
+pub(crate) fn llvmpipe_renderer(state: &mut crate::niri::State) -> bool {
     state
         .backend
         .headless()
@@ -36,7 +36,7 @@ fn llvmpipe_renderer(state: &mut crate::niri::State) -> bool {
 }
 
 /// Renders an output to a physical-size RGBA pixel buffer.
-fn render_output_rgba(
+pub(crate) fn render_output_rgba(
     state: &mut crate::niri::State,
     output: &Output,
 ) -> (Size<i32, Physical>, Vec<u8>) {
@@ -142,7 +142,14 @@ fn set_up(config_text: &str) -> Fixture {
     f
 }
 
-fn open_window(f: &mut Fixture, id: ClientId, title: &str, w: u16, h: u16, rgba: [u32; 4]) {
+pub(crate) fn open_window(
+    f: &mut Fixture,
+    id: ClientId,
+    title: &str,
+    w: u16,
+    h: u16,
+    rgba: [u32; 4],
+) {
     let window = f.client(id).create_window();
     let surface = window.surface.clone();
     window.set_title(title);

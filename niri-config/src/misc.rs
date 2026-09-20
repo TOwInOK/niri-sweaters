@@ -1,3 +1,5 @@
+use knuffel::errors::DecodeError;
+
 use crate::appearance::{Color, WorkspaceShadow, WorkspaceShadowPart, DEFAULT_BACKDROP_COLOR};
 use crate::utils::{Flag, MergeWith};
 use crate::FloatOrInt;
@@ -196,5 +198,107 @@ impl MergeWith<XwaylandSatellitePart> for XwaylandSatellite {
         }
 
         merge_clone!((self, part), path);
+    }
+}
+
+/// Desktop zoom settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Zoom {
+    /// Maximum zoom level.
+    pub max_zoom: f64,
+    /// Multiplicative step factor for zoom-in and zoom-out.
+    pub increment_factor: f64,
+    /// Fraction of the output size along each axis that the cursor can
+    /// traverse before the zoomed viewport starts following it.
+    pub deadzone_size: f64,
+}
+
+impl Default for Zoom {
+    fn default() -> Self {
+        Self {
+            max_zoom: 10.,
+            increment_factor: 1.2,
+            deadzone_size: 0.5,
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct ZoomPart {
+    #[knuffel(child, unwrap(argument))]
+    pub max_zoom: Option<FloatOrInt<1, { i32::MAX }>>,
+    #[knuffel(child, unwrap(argument))]
+    pub increment_factor: Option<ZoomIncrementFactor>,
+    #[knuffel(child, unwrap(argument))]
+    pub deadzone_size: Option<FloatOrInt<0, 1>>,
+}
+
+impl MergeWith<ZoomPart> for Zoom {
+    fn merge_with(&mut self, part: &ZoomPart) {
+        merge!((self, part), max_zoom, increment_factor, deadzone_size);
+    }
+}
+
+/// Zoom-in/out step factor: a finite number strictly greater than 1.
+///
+/// A factor of 1 would make zoom-in and zoom-out no-ops, and a factor below 1
+/// would invert them, so unlike [`FloatOrInt`] the lower bound is exclusive.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct ZoomIncrementFactor(pub f64);
+
+impl MergeWith<ZoomIncrementFactor> for f64 {
+    fn merge_with(&mut self, part: &ZoomIncrementFactor) {
+        *self = part.0;
+    }
+}
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for ZoomIncrementFactor {
+    fn type_check(
+        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) {
+        if let Some(type_name) = &type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+    }
+
+    fn raw_decode(
+        val: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let value = match &**val {
+            knuffel::ast::Literal::Int(value) => match i32::try_from(value) {
+                Ok(v) => f64::from(v),
+                Err(e) => {
+                    ctx.emit_error(DecodeError::conversion(val, e));
+                    return Ok(Self::default());
+                }
+            },
+            knuffel::ast::Literal::Decimal(value) => match f64::try_from(value) {
+                Ok(v) => v,
+                Err(e) => {
+                    ctx.emit_error(DecodeError::conversion(val, e));
+                    return Ok(Self::default());
+                }
+            },
+            _ => {
+                ctx.emit_error(DecodeError::unsupported(
+                    val,
+                    "Unsupported value, only numbers are recognized",
+                ));
+                return Ok(Self::default());
+            }
+        };
+
+        if value.is_finite() && value > 1. {
+            Ok(ZoomIncrementFactor(value))
+        } else {
+            ctx.emit_error(DecodeError::conversion(val, "value must be greater than 1"));
+            Ok(Self::default())
+        }
     }
 }

@@ -35,9 +35,22 @@ impl PickColorGrab {
         state.niri.queue_redraw_all();
     }
 
-    fn pick_color_at_point(location: Point<f64, Logical>, data: &mut State) -> Option<PickedColor> {
+    pub(crate) fn pick_color_at_point(
+        location: Point<f64, Logical>,
+        data: &mut State,
+    ) -> Option<PickedColor> {
         let (output, pos_within_output) = data.niri.output_under(location)?;
         let output = output.clone();
+
+        // The picker is WYSIWYG: sample the pixel actually displayed under the
+        // visible cursor, i.e. the canonical content position mapped through
+        // the output's effective presentation transform.
+        let pos_within_output = data
+            .niri
+            .layout
+            .monitor_for_output(&output)
+            .map(|mon| mon.effective_zoom_transform().apply(pos_within_output))
+            .unwrap_or(pos_within_output);
 
         data.backend
             .with_primary_renderer(|renderer| {

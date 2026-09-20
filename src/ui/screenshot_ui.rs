@@ -798,6 +798,20 @@ impl ScreenshotUi {
         }
     }
 
+    /// The current selection corner points, for tests.
+    #[cfg(test)]
+    pub(crate) fn selection_points(&self) -> Option<(Point<i32, Physical>, Point<i32, Physical>)> {
+        if let Self::Open {
+            selection: (_, p1, p2),
+            ..
+        } = self
+        {
+            Some((*p1, *p2))
+        } else {
+            None
+        }
+    }
+
     /// The pointer has moved to `point` relative to the current selection output.
     ///
     /// The point may be outside output bounds.

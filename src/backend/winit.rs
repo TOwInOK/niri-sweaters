@@ -137,7 +137,14 @@ impl Winit {
                     state.niri.output_resized(&winit.output);
                 }
                 WinitEvent::Input(event) => state.process_input_event(event),
-                WinitEvent::Focus(_) => (),
+                WinitEvent::Focus(focused) => {
+                    // Focus loss may swallow the release that would end an
+                    // active zoom hold; end it immediately instead of leaving
+                    // it stuck.
+                    if !focused {
+                        state.cancel_zoom_hold_immediate();
+                    }
+                }
                 WinitEvent::Redraw => state.niri.queue_redraw(&state.backend.winit().output),
                 WinitEvent::CloseRequested => state.niri.stop_signal.stop(),
             })

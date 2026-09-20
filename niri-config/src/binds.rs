@@ -14,7 +14,7 @@ use smithay::input::keyboard::xkb::{keysym_from_name, KEYSYM_CASE_INSENSITIVE, K
 use smithay::input::keyboard::Keysym;
 
 use crate::recent_windows::{MruDirection, MruFilter, MruScope};
-use crate::utils::{expect_only_children, MergeWith};
+use crate::utils::{expect_only_children, FloatOrInt, MergeWith};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Binds(pub Vec<Bind>);
@@ -393,6 +393,73 @@ pub enum Action {
     MruSetScope(MruScope),
     #[knuffel(skip)]
     MruCycleScope,
+    ZoomIn,
+    ZoomOut,
+    SetZoomLevel(#[knuffel(argument)] FloatOrInt<1, { i32::MAX }>),
+    ResetZoom,
+    ToggleZoomLock,
+    ToggleZoom(#[knuffel(argument)] ZoomLevelPreset),
+    HoldZoom(#[knuffel(argument)] ZoomLevelPreset),
+}
+
+/// A zoom level preset for `toggle-zoom` and `hold-zoom`: a finite number
+/// strictly greater than 1.
+///
+/// A preset of 1 would make activation a no-op, so unlike [`FloatOrInt`] the
+/// lower bound is exclusive. Values above `zoom.max-zoom` are allowed here and
+/// clamped at runtime, since the maximum can change on config reload.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct ZoomLevelPreset(pub f64);
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for ZoomLevelPreset {
+    fn type_check(
+        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) {
+        if let Some(type_name) = &type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+    }
+
+    fn raw_decode(
+        val: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let value = match &**val {
+            knuffel::ast::Literal::Int(value) => match i32::try_from(value) {
+                Ok(v) => f64::from(v),
+                Err(e) => {
+                    ctx.emit_error(DecodeError::conversion(val, e));
+                    return Ok(Self::default());
+                }
+            },
+            knuffel::ast::Literal::Decimal(value) => match f64::try_from(value) {
+                Ok(v) => v,
+                Err(e) => {
+                    ctx.emit_error(DecodeError::conversion(val, e));
+                    return Ok(Self::default());
+                }
+            },
+            _ => {
+                ctx.emit_error(DecodeError::unsupported(
+                    val,
+                    "Unsupported value, only numbers are recognized",
+                ));
+                return Ok(Self::default());
+            }
+        };
+
+        if value.is_finite() && value > 1. {
+            Ok(ZoomLevelPreset(value))
+        } else {
+            ctx.emit_error(DecodeError::conversion(val, "value must be greater than 1"));
+            Ok(Self::default())
+        }
+    }
 }
 
 impl From<niri_ipc::Action> for Action {
@@ -704,6 +771,12 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::SetWindowUrgent { id } => Self::SetWindowUrgent(id),
             niri_ipc::Action::UnsetWindowUrgent { id } => Self::UnsetWindowUrgent(id),
             niri_ipc::Action::LoadConfigFile { path } => Self::LoadConfigFile(path),
+            niri_ipc::Action::ZoomIn {} => Self::ZoomIn,
+            niri_ipc::Action::ZoomOut {} => Self::ZoomOut,
+            niri_ipc::Action::SetZoomLevel { level } => Self::SetZoomLevel(FloatOrInt(level)),
+            niri_ipc::Action::ResetZoom {} => Self::ResetZoom,
+            niri_ipc::Action::ToggleZoomLock {} => Self::ToggleZoomLock,
+            niri_ipc::Action::ToggleZoom { level } => Self::ToggleZoom(ZoomLevelPreset(level)),
         }
     }
 }
@@ -918,6 +991,27 @@ where
                         allow_inhibiting = false;
                     }
 
+                    // Scroll triggers have no release event, so a hold bound to
+                    // one could never end.
+                    if matches!(action, Action::HoldZoom(_))
+                        && matches!(
+                            key.trigger,
+                            Trigger::WheelScrollDown
+                                | Trigger::WheelScrollUp
+                                | Trigger::WheelScrollLeft
+                                | Trigger::WheelScrollRight
+                                | Trigger::TouchpadScrollDown
+                                | Trigger::TouchpadScrollUp
+                                | Trigger::TouchpadScrollLeft
+                                | Trigger::TouchpadScrollRight
+                        )
+                    {
+                        ctx.emit_error(DecodeError::unsupported(
+                            &node.node_name,
+                            "hold-zoom requires a trigger with a release event",
+                        ));
+                    }
+
                     Ok(Self {
                         key,
                         action,
@@ -1108,5 +1202,111 @@ mod tests {
                 modifiers: Modifiers::ISO_LEVEL5_SHIFT
             },
         );
+    }
+
+    #[test]
+    fn parse_zoom_actions() {
+        let config = crate::Config::parse_mem(
+            r#"
+            binds {
+                Mod+equal { zoom-in; }
+                Mod+minus { zoom-out; }
+                Mod+0 { set-zoom-level 2; }
+                Mod+9 { set-zoom-level 1.5; }
+                Mod+Shift+0 { reset-zoom; }
+                Mod+Shift+L { toggle-zoom-lock; }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let actions: Vec<&Action> = config.binds.0.iter().map(|bind| &bind.action).collect();
+        assert_eq!(
+            actions,
+            [
+                &Action::ZoomIn,
+                &Action::ZoomOut,
+                &Action::SetZoomLevel(FloatOrInt(2.)),
+                &Action::SetZoomLevel(FloatOrInt(1.5)),
+                &Action::ResetZoom,
+                &Action::ToggleZoomLock,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_toggle_and_hold_zoom() {
+        let config = crate::Config::parse_mem(
+            r#"
+            binds {
+                Mod+Z { toggle-zoom 2.0; }
+                Mod+Shift+Z { toggle-zoom 4; }
+                Mod+X { hold-zoom 2.0; }
+                Mod+MouseBack { hold-zoom 3; }
+                Mod+TabletStylusButton1 { hold-zoom 1.5; }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let actions: Vec<_> = config.binds.0.iter().map(|bind| &bind.action).collect();
+        assert_eq!(
+            actions,
+            [
+                &Action::ToggleZoom(ZoomLevelPreset(2.)),
+                &Action::ToggleZoom(ZoomLevelPreset(4.)),
+                &Action::HoldZoom(ZoomLevelPreset(2.)),
+                &Action::HoldZoom(ZoomLevelPreset(3.)),
+                &Action::HoldZoom(ZoomLevelPreset(1.5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_zoom_preset_invalid() {
+        // Presets must be finite and strictly greater than 1; 1x is not a
+        // meaningful activation level.
+        for action in [
+            "toggle-zoom 1",
+            "toggle-zoom 1.0",
+            "toggle-zoom 0.5",
+            "toggle-zoom 0",
+            "toggle-zoom -1",
+            "hold-zoom 1",
+            "hold-zoom 0.5",
+            "hold-zoom -2",
+        ] {
+            let text = format!("binds {{ Mod+Z {{ {action}; }} }}");
+            assert!(
+                crate::Config::parse_mem(&text).is_err(),
+                "expected parse error for: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_hold_zoom_rejects_scroll_triggers() {
+        // Scroll triggers have no release event, so a hold bound to one could
+        // never end.
+        for trigger in [
+            "WheelScrollUp",
+            "WheelScrollDown",
+            "WheelScrollLeft",
+            "WheelScrollRight",
+            "TouchpadScrollUp",
+            "TouchpadScrollDown",
+            "TouchpadScrollLeft",
+            "TouchpadScrollRight",
+        ] {
+            let text = format!("binds {{\n    Mod+{trigger} {{ hold-zoom 2.0; }}\n}}");
+            assert!(
+                crate::Config::parse_mem(&text).is_err(),
+                "expected parse error for: {text}"
+            );
+        }
+
+        // Toggle is a press-only action and stays valid on scroll triggers.
+        let text = "binds {\n    Mod+WheelScrollUp { toggle-zoom 2.0; }\n}";
+        assert!(crate::Config::parse_mem(text).is_ok());
     }
 }

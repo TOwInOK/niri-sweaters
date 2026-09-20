@@ -24,16 +24,18 @@ use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_lay
 };
 use smithay::reexports::wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
 use smithay::reexports::wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
-use wayland_backend::client::Backend;
+use wayland_backend::client::{Backend, ObjectId};
 use wayland_client::globals::Global;
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
+use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
+use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
-use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle};
+use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle, WEnum};
 
 use crate::utils::id::IdCounter;
 
@@ -58,6 +60,18 @@ pub struct State {
     pub virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
+    pub seat: Option<WlSeat>,
+    pub pointer: Option<WlPointer>,
+
+    /// Serial of the last wl_pointer.enter event, for set_cursor.
+    pub pointer_enter_serial: Option<u32>,
+
+    /// Output names each surface is currently entered on.
+    pub surface_outputs: HashMap<ObjectId, Vec<String>>,
+    /// Last preferred buffer scale received per surface.
+    pub surface_scales: HashMap<ObjectId, i32>,
+    /// Last preferred buffer transform received per surface.
+    pub surface_transforms: HashMap<ObjectId, wl_output::Transform>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
@@ -185,6 +199,12 @@ impl Client {
             virtual_pointer_manager: None,
             spbm: None,
             viewporter: None,
+            seat: None,
+            pointer: None,
+            pointer_enter_serial: None,
+            surface_outputs: HashMap::new(),
+            surface_scales: HashMap::new(),
+            surface_transforms: HashMap::new(),
             windows: Vec::new(),
             layers: Vec::new(),
         };
@@ -245,6 +265,65 @@ impl Client {
             .unwrap()
             .0
             .clone()
+    }
+
+    /// Creates a plain wl_surface with a 1x1 buffer scaled to `w`x`h` logical
+    /// via the viewport, for use as a pointer cursor image.
+    pub fn create_cursor_surface(&mut self, w: u16, h: u16) -> WlSurface {
+        let surface = self
+            .state
+            .compositor
+            .as_ref()
+            .unwrap()
+            .create_surface(&self.qh, ());
+        let viewport = self
+            .state
+            .viewporter
+            .as_ref()
+            .unwrap()
+            .get_viewport(&surface, &self.qh, ());
+        viewport.set_destination(i32::from(w), i32::from(h));
+        let buffer = self
+            .state
+            .spbm
+            .as_ref()
+            .unwrap()
+            .create_u32_rgba_buffer(0xff, 0xff, 0xff, 0xff, &self.qh, ());
+        surface.attach(Some(&buffer), 0, 0);
+        surface
+    }
+
+    /// Sets the cursor image to `surface` with the given hotspot, using the
+    /// serial of the last pointer enter event.
+    pub fn set_cursor(&mut self, surface: Option<&WlSurface>, hotspot: (i32, i32)) {
+        let serial = self.state.pointer_enter_serial.unwrap();
+        self.state
+            .pointer
+            .as_ref()
+            .unwrap()
+            .set_cursor(serial, surface, hotspot.0, hotspot.1);
+    }
+
+    /// Output names the surface is currently entered on.
+    pub fn surface_outputs(&mut self, surface: &WlSurface) -> Vec<String> {
+        self.state
+            .surface_outputs
+            .get(&surface.id())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Last preferred buffer scale received on the surface.
+    pub fn surface_scale(&mut self, surface: &WlSurface) -> Option<i32> {
+        self.state.surface_scales.get(&surface.id()).copied()
+    }
+
+    /// Last preferred buffer transform received on the surface.
+    pub fn surface_transform(
+        &mut self,
+        surface: &WlSurface,
+    ) -> Option<wl_output::Transform> {
+        self.state.surface_transforms.get(&surface.id()).copied()
     }
 }
 
@@ -534,6 +613,9 @@ impl Dispatch<WlRegistry, ()> for State {
                     let version = min(version, WlOutput::interface().version);
                     let output = registry.bind(name, version, qh, ());
                     state.outputs.insert(output, String::new());
+                } else if interface == WlSeat::interface().name {
+                    let version = min(version, WlSeat::interface().version);
+                    state.seat = Some(registry.bind(name, version, qh, ()));
                 }
 
                 let global = Global {
@@ -621,19 +703,79 @@ wayland_client::delegate_noop!(State: ZwlrVirtualPointerV1);
 
 impl Dispatch<WlSurface, ()> for State {
     fn event(
-        _state: &mut Self,
-        _proxy: &WlSurface,
+        state: &mut Self,
+        surface: &WlSurface,
         event: <WlSurface as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
         match event {
-            wl_surface::Event::Enter { .. } => (),
-            wl_surface::Event::Leave { .. } => (),
-            wl_surface::Event::PreferredBufferScale { .. } => (),
-            wl_surface::Event::PreferredBufferTransform { .. } => (),
+            wl_surface::Event::Enter { output } => {
+                let name = state.outputs.get(&output).cloned().unwrap_or_default();
+                state
+                    .surface_outputs
+                    .entry(surface.id())
+                    .or_default()
+                    .push(name);
+            }
+            wl_surface::Event::Leave { output } => {
+                if let Some(outputs) = state.surface_outputs.get_mut(&surface.id()) {
+                    if let Some(name) = state.outputs.get(&output) {
+                        outputs.retain(|n| n != name);
+                    }
+                }
+            }
+            wl_surface::Event::PreferredBufferScale { factor } => {
+                state.surface_scales.insert(surface.id(), factor);
+            }
+            wl_surface::Event::PreferredBufferTransform { transform } => {
+                if let WEnum::Value(transform) = transform {
+                    state.surface_transforms.insert(surface.id(), transform);
+                }
+            }
             _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<WlSeat, ()> for State {
+    fn event(
+        state: &mut Self,
+        seat: &WlSeat,
+        event: <WlSeat as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_seat::Event::Capabilities {
+                capabilities: WEnum::Value(capability),
+            } => {
+                if capability.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
+                    state.pointer = Some(seat.get_pointer(qh, ()));
+                }
+            }
+            wl_seat::Event::Name { .. } => (),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<WlPointer, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WlPointer,
+        event: <WlPointer as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_pointer::Event::Enter { serial, .. } => {
+                state.pointer_enter_serial = Some(serial);
+            }
+            _ => (),
         }
     }
 }

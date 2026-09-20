@@ -86,6 +86,7 @@ pub mod shadow;
 pub mod tab_indicator;
 pub mod tile;
 pub mod workspace;
+pub mod zoom;
 
 #[cfg(test)]
 mod tests;
@@ -4611,6 +4612,25 @@ impl<W: LayoutElement> Layout<W> {
             mon.overview_open = self.overview_open;
             mon.set_overview_progress(self.overview_progress.as_ref());
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn set_overview_progress_for_test(&mut self, progress: Option<f64>) {
+        self.overview_open = progress.is_some_and(|value| value > 0.);
+        self.overview_progress = progress.map(|value| {
+            OverviewProgress::Gesture(OverviewGesture {
+                tracker: SwipeTracker::new(),
+                start: value,
+                value,
+            })
+        });
+        self.set_monitors_overview_state();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_overview_open_for_test(&mut self, open: bool) {
+        self.overview_open = open;
+        self.overview_progress = open.then_some(OverviewProgress::Open);
+        self.set_monitors_overview_state();
     }
 
     pub fn toggle_overview(&mut self) {

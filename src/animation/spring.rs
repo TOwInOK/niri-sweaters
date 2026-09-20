@@ -175,6 +175,49 @@ impl Spring {
                     * (x0 * (omega2 * t).cosh() + ((beta * x0 + v0) / omega2) * (omega2 * t).sinh())
         }
     }
+
+    /// Returns the spring velocity at a given time in seconds.
+    ///
+    /// This is the analytical derivative of [`oscillate()`](Self::oscillate).
+    fn velocity(&self, t: f64) -> f64 {
+        let b = self.params.damping;
+        let m = self.params.mass;
+        let k = self.params.stiffness;
+        let v0 = self.initial_velocity;
+
+        let beta = b / (2. * m);
+        let omega0 = (k / m).sqrt();
+
+        let x0 = self.from - self.to;
+
+        let envelope = (-beta * t).exp();
+
+        // Derivatives of the solutions in oscillate().
+        if (beta - omega0).abs() <= f64::from(f32::EPSILON) {
+            // Critically damped: x = to + e^(-βt) * (x0 + (βx0 + v0) t).
+            let c = beta * x0 + v0;
+            envelope * (c - beta * (x0 + c * t))
+        } else if beta < omega0 {
+            // Underdamped: x = to + e^(-βt) * (x0 cos(ωt) + c sin(ωt)).
+            let omega1 = ((omega0 * omega0) - (beta * beta)).sqrt();
+            let c = (beta * x0 + v0) / omega1;
+            envelope
+                * (omega1 * (c * (omega1 * t).cos() - x0 * (omega1 * t).sin())
+                    - beta * (x0 * (omega1 * t).cos() + c * (omega1 * t).sin()))
+        } else {
+            // Overdamped: x = to + e^(-βt) * (x0 cosh(ωt) + c sinh(ωt)).
+            let omega2 = ((beta * beta) - (omega0 * omega0)).sqrt();
+            let c = (beta * x0 + v0) / omega2;
+            envelope
+                * (omega2 * (x0 * (omega2 * t).sinh() + c * (omega2 * t).cosh())
+                    - beta * (x0 * (omega2 * t).cosh() + c * (omega2 * t).sinh()))
+        }
+    }
+
+    /// Returns the spring velocity at a given time.
+    pub fn velocity_at(&self, t: Duration) -> f64 {
+        self.velocity(t.as_secs_f64())
+    }
 }
 
 #[cfg(test)]
@@ -205,5 +248,99 @@ mod tests {
         let _ = spring.duration();
         let _ = spring.clamped_duration();
         let _ = spring.value_at(Duration::ZERO);
+    }
+
+    /// Springs covering each damping regime.
+    fn springs() -> [Spring; 3] {
+        [
+            // Underdamped.
+            Spring {
+                from: 0.,
+                to: 1.,
+                initial_velocity: 0.5,
+                params: SpringParams::new(0.6, 800., 0.0001),
+            },
+            // Critically damped.
+            Spring {
+                from: 0.,
+                to: 1.,
+                initial_velocity: -0.5,
+                params: SpringParams::new(1., 800., 0.0001),
+            },
+            // Overdamped.
+            Spring {
+                from: 1.,
+                to: 0.,
+                initial_velocity: 0.5,
+                params: SpringParams::new(1.5, 800., 0.0001),
+            },
+        ]
+    }
+
+    #[test]
+    fn velocity_at_start_is_initial_velocity() {
+        for spring in springs() {
+            let v = spring.velocity_at(Duration::ZERO);
+            assert!(
+                (v - spring.initial_velocity).abs() < 1e-9,
+                "velocity at t=0 must equal initial_velocity: {v} vs {}",
+                spring.initial_velocity
+            );
+        }
+    }
+
+    #[test]
+    fn velocity_matches_finite_difference() {
+        const DT: f64 = 1e-6;
+
+        for spring in springs() {
+            for ms in [10, 50, 100, 250] {
+                let t = Duration::from_millis(ms);
+                let analytical = spring.velocity_at(t);
+
+                let numerical = (spring.value_at(t + Duration::from_secs_f64(DT))
+                    - spring.value_at(t - Duration::from_secs_f64(DT)))
+                    / (2. * DT);
+
+                assert!(
+                    (analytical - numerical).abs() < 1e-3,
+                    "velocity mismatch at {ms}ms: analytical {analytical} vs numerical {numerical}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn velocity_near_completion_is_zero() {
+        for spring in springs() {
+            let duration = spring.duration();
+            if duration == Duration::MAX {
+                continue;
+            }
+
+            // duration() is where the position settles within epsilon; the
+            // velocity keeps decaying, so sample a second past it.
+            let v = spring.velocity_at(duration + Duration::from_secs(1));
+            assert!(
+                v.abs() < 0.01,
+                "velocity at rest must be near zero, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn velocity_sign_on_reversal() {
+        // A spring moving away from its target has a negative velocity
+        // relative to the from→to direction.
+        let spring = Spring {
+            from: 0.,
+            to: 1.,
+            initial_velocity: -2.,
+            params: SpringParams::new(1., 800., 0.0001),
+        };
+
+        assert!(spring.velocity_at(Duration::ZERO) < 0.);
+        // The spring eventually reverses and moves towards the target.
+        assert!(spring.velocity_at(Duration::from_millis(200)) > 0.);
     }
 }

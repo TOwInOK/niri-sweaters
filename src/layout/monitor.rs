@@ -17,6 +17,7 @@ use super::workspace::{
     compute_working_area, OutputId, Workspace, WorkspaceAddWindowTarget, WorkspaceId,
     WorkspaceRenderElement,
 };
+use super::zoom::{OutputZoomState, ZoomSnapshot};
 use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
@@ -29,6 +30,7 @@ use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
 use crate::utils::transaction::Transaction;
+use crate::utils::view::ViewportTransform;
 use crate::utils::{
     output_size, round_logical_in_physical, round_logical_in_physical_max1, ResizeEdge,
 };
@@ -81,6 +83,8 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
     overview_progress: Option<OverviewProgress>,
+    /// Desktop zoom state for this output.
+    zoom: OutputZoomState,
     /// Clock for driving animations.
     pub(super) clock: Clock,
     /// Configurable properties of the layout as received from the parent layout.
@@ -157,6 +161,7 @@ struct InsertHintRenderLoc {
 pub(super) enum OverviewProgress {
     Animation(Animation),
     Value(f64),
+    Open,
 }
 
 /// Where to put a newly added window.
@@ -268,6 +273,7 @@ impl OverviewProgress {
         match self {
             OverviewProgress::Animation(anim) => anim.value(),
             OverviewProgress::Value(v) => *v,
+            OverviewProgress::Open => 1.,
         }
     }
 
@@ -275,6 +281,7 @@ impl OverviewProgress {
         match self {
             OverviewProgress::Animation(anim) => anim.clamped_value(),
             OverviewProgress::Value(v) => *v,
+            OverviewProgress::Open => 1.,
         }
     }
 }
@@ -284,7 +291,7 @@ impl From<&super::OverviewProgress> for OverviewProgress {
         match value {
             super::OverviewProgress::Animation(anim) => Self::Animation(anim.clone()),
             super::OverviewProgress::Gesture(gesture) => Self::Value(gesture.value),
-            super::OverviewProgress::Open => Self::Value(1.),
+            super::OverviewProgress::Open => Self::Open,
         }
     }
 }
@@ -342,6 +349,7 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
+            zoom: OutputZoomState::new(view_size),
             workspace_switch: None,
             clock,
             base_options,
@@ -1065,15 +1073,24 @@ impl<W: LayoutElement> Monitor<W> {
             None => (),
         }
 
+        self.zoom.advance_animations();
+
         for ws in &mut self.workspaces {
             ws.advance_animations();
         }
     }
 
     pub(super) fn are_animations_ongoing(&self) -> bool {
+        let zoom_visible_animation = self.zoom.is_animating()
+            && !self
+                .overview_progress
+                .as_ref()
+                .is_some_and(|progress| matches!(progress, OverviewProgress::Open));
+
         self.workspace_switch
             .as_ref()
             .is_some_and(|s| s.is_animation_ongoing())
+            || zoom_visible_animation
             || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
     }
 
@@ -1234,6 +1251,7 @@ impl<W: LayoutElement> Monitor<W> {
         self.scale = self.output.current_scale();
         self.view_size = output_size(&self.output);
         self.working_area = compute_working_area(&self.output);
+        self.zoom.update_view_size(self.view_size);
 
         for ws in &mut self.workspaces {
             ws.update_output_size();
@@ -1374,6 +1392,42 @@ impl<W: LayoutElement> Monitor<W> {
     pub fn overview_zoom(&self) -> f64 {
         let progress = self.overview_progress.as_ref().map(|p| p.value());
         compute_overview_zoom(&self.options, progress)
+    }
+    /// Returns whether this monitor is participating in an Overview presentation.
+    ///
+    /// This remains true throughout opening, gestures, the resting open state, and
+    /// closing. It follows presentation progress rather than the Overview intent flag,
+    /// which is already false during closing.
+    pub fn overview_active(&self) -> bool {
+        self.overview_progress.is_some()
+    }
+
+    /// Returns the desktop zoom transform currently visible on this monitor.
+    ///
+    /// Overview suppression is derived only at this presentation boundary: it moves
+    /// the stored level toward 1x in log2 space without changing stored state.
+    pub fn effective_zoom_transform(&self) -> ViewportTransform {
+        let stored = self.zoom.viewport_transform();
+        let Some(progress) = &self.overview_progress else {
+            return stored;
+        };
+
+        let progress = progress.clamped_value().clamp(0., 1.);
+        if progress <= 0. {
+            return stored;
+        }
+        if progress >= 1. {
+            return ViewportTransform::identity();
+        }
+
+        let effective_level = (stored.factor().log2() * (1. - progress)).exp2();
+        ViewportTransform::new(stored.focal(), effective_level)
+    }
+
+    /// Returns the content viewport represented by the effective presentation.
+    pub fn effective_viewport(&self) -> Rectangle<f64, Logical> {
+        self.effective_zoom_transform()
+            .apply_inverse_rect(Rectangle::from_size(self.view_size))
     }
 
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
@@ -2112,6 +2166,38 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn working_area(&self) -> Rectangle<f64, Logical> {
         self.working_area
+    }
+
+    pub fn zoom(&self) -> &OutputZoomState {
+        &self.zoom
+    }
+
+    pub fn zoom_mut(&mut self) -> &mut OutputZoomState {
+        &mut self.zoom
+    }
+
+    /// Starts an animated transition of the desktop zoom level towards
+    /// `level`, keeping `anchor` at its displayed position where possible.
+    ///
+    /// `anchor` is a content position in output-local logical coordinates.
+    /// Uses the current `animations.zoom` config; when it is `off` the level
+    /// is set immediately.
+    pub fn zoom_to(&mut self, level: f64, anchor: Point<f64, Logical>) {
+        let clock = self.clock.clone();
+        let config = self.options.animations.zoom.0;
+        self.zoom.set_target_level(level, anchor, &clock, config);
+    }
+
+    /// Starts an animated transition of the desktop zoom towards the saved
+    /// `snapshot` state: the level animates towards `snapshot.target_level`
+    /// while the focal point interpolates towards `snapshot.focal`.
+    ///
+    /// Used to end a `hold-zoom` session. Uses the current `animations.zoom`
+    /// config; when it is `off` the snapshot is restored immediately.
+    pub fn zoom_restore(&mut self, snapshot: ZoomSnapshot) {
+        let clock = self.clock.clone();
+        let config = self.options.animations.zoom.0;
+        self.zoom.restore_animated(snapshot, &clock, config);
     }
 
     pub fn layout_config(&self) -> Option<&niri_config::LayoutPart> {

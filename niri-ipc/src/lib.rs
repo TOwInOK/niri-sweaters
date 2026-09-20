@@ -943,6 +943,44 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         path: Option<String>,
     },
+    /// Zoom in on an output.
+    ///
+    /// Zooms the output under the pointer, or the focused output if the pointer is not on any
+    /// output.
+    ZoomIn {},
+    /// Zoom out on an output.
+    ///
+    /// Zooms the output under the pointer, or the focused output if the pointer is not on any
+    /// output.
+    ZoomOut {},
+    /// Set the zoom level of an output.
+    ///
+    /// Zooms the output under the pointer, or the focused output if the pointer is not on any
+    /// output.
+    SetZoomLevel {
+        /// Zoom level to set, with 1 meaning no zoom.
+        #[cfg_attr(feature = "clap", arg(allow_hyphen_values = true))]
+        level: f64,
+    },
+    /// Reset the zoom level of an output back to 1.
+    ///
+    /// Zooms the output under the pointer, or the focused output if the pointer is not on any
+    /// output.
+    ResetZoom {},
+    /// Toggle the zoom lock of an output.
+    ///
+    /// While locked, the zoomed viewport does not follow the pointer. Applies to the output under
+    /// the pointer, or the focused output if the pointer is not on any output.
+    ToggleZoomLock {},
+    /// Toggle the zoom level of an output between 1 and a preset level.
+    ///
+    /// Zooms the output under the pointer, or the focused output if the pointer is not on any
+    /// output. If the target zoom level is above 1, resets it to 1; otherwise sets it to `level`.
+    ToggleZoom {
+        /// Zoom level to toggle to, must be greater than 1.
+        #[cfg_attr(feature = "clap", arg(allow_hyphen_values = true))]
+        level: f64,
+    },
 }
 
 /// Change in window or column size.
@@ -2170,5 +2208,21 @@ mod tests {
         );
         assert!("-".parse::<PositionChange>().is_err());
         assert!("10% ".parse::<PositionChange>().is_err());
+    }
+
+    #[test]
+    fn zoom_actions_round_trip() {
+        for action in [
+            Action::ZoomIn {},
+            Action::ZoomOut {},
+            Action::SetZoomLevel { level: 2.5 },
+            Action::ResetZoom {},
+            Action::ToggleZoomLock {},
+            Action::ToggleZoom { level: 2. },
+        ] {
+            let json = serde_json::to_string(&action).unwrap();
+            let parsed: Action = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+        }
     }
 }
