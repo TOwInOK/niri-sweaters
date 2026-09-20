@@ -200,14 +200,13 @@ vec3 knit_noise(vec2 p) {
     vec2 f = fract(p);
     vec2 blend = f * f * (3.0 - 2.0 * f);
     vec2 derivative = 6.0 * f * (1.0 - f);
-    float a = knit_hash(cell);
-    float b = knit_hash(cell + vec2(1.0, 0.0));
-    float c = knit_hash(cell + vec2(0.0, 1.0));
-    float d = knit_hash(cell + vec2(1.0, 1.0));
+    vec4 dots = (cell.x + vec4(0.0, 1.0, 0.0, 1.0)) * 127.1 + (cell.y + vec4(0.0, 0.0, 1.0, 1.0)) * 311.7;
+    vec4 h = fract(sin(dots) * 43758.5453123);
+    vec2 mix_x = mix(h.xz, h.yw, blend.x);
     return vec3(
-        mix(mix(a, b, blend.x), mix(c, d, blend.x), blend.y),
-        mix(b - a, d - c, blend.y) * derivative.x,
-        mix(c - a, d - b, blend.x) * derivative.y
+        mix(mix_x.x, mix_x.y, blend.y),
+        mix(h.y - h.x, h.w - h.z, blend.y) * derivative.x,
+        mix(h.z - h.x, h.w - h.y, blend.x) * derivative.y
     );
 }
 
