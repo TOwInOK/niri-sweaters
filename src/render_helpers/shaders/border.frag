@@ -270,10 +270,13 @@ vec4 knit_leg(vec2 point, float side, float seed, float radius, out vec3 normal,
 struct KnitCourse {
     vec2 size;
     vec4 radius;
+    vec4 lengths;
+    vec4 inv_lengths;
     // Per-side stitch counts, not lengths: top, right, bottom, left.
     vec4 edges;
     vec4 bends;
     float depth;
+    float total;
 };
 
 KnitCourse knit_course(float depth, float stitch_width) {
@@ -282,11 +285,14 @@ KnitCourse knit_course(float depth, float stitch_width) {
     course.size = max(geo_size - vec2(2.0 * depth), vec2(0.001));
     // Clockwise, beginning with the corner at the end of the top edge.
     course.radius = max(outer_radius.yzwx - vec4(depth), vec4(0.0));
-    vec4 lengths = max(vec4(course.size.x, course.size.y, course.size.x, course.size.y)
+    course.lengths = max(vec4(course.size.x, course.size.y, course.size.x, course.size.y)
         - course.radius.wxyz - course.radius, vec4(0.0));
-    course.edges = max(floor(lengths / stitch_width + 0.5), vec4(1.0)) * step(0.001, lengths);
-    course.bends = max(floor(course.radius * 1.57079633 / stitch_width + 0.5), vec4(1.0))
+    float inv_stitch_width = 1.0 / stitch_width;
+    course.edges = max(floor(course.lengths * inv_stitch_width + 0.5), vec4(1.0)) * step(0.001, course.lengths);
+    course.bends = max(floor(course.radius * 1.57079633 * inv_stitch_width + 0.5), vec4(1.0))
         * step(0.001, course.radius);
+    course.inv_lengths = 1.0 / max(course.lengths, vec4(0.001));
+    course.total = max(dot(course.edges + course.bends, vec4(1.0)), 1.0);
     return course;
 }
 
@@ -312,12 +318,12 @@ float knit_course_coordinate(vec2 point, KnitCourse course) {
     vec4 distance = vec4(p.y, size.x - p.x, size.y - p.y, p.x);
     float nearest = min(min(distance.x, distance.y), min(distance.z, distance.w));
     if (nearest == distance.x)
-        return clamp((p.x - r.w) / max(size.x - r.w - r.x, 0.001), 0.0, 1.0) * e.x;
+        return clamp((p.x - r.w) * course.inv_lengths.x, 0.0, 1.0) * e.x;
     if (nearest == distance.y)
-        return right + clamp((p.y - r.x) / max(size.y - r.x - r.y, 0.001), 0.0, 1.0) * e.y;
+        return right + clamp((p.y - r.x) * course.inv_lengths.y, 0.0, 1.0) * e.y;
     if (nearest == distance.z)
-        return bottom + clamp((size.x - r.y - p.x) / max(size.x - r.y - r.z, 0.001), 0.0, 1.0) * e.z;
-    return left + clamp((size.y - r.z - p.y) / max(size.y - r.z - r.w, 0.001), 0.0, 1.0) * e.w;
+        return bottom + clamp((size.x - r.y - p.x) * course.inv_lengths.z, 0.0, 1.0) * e.z;
+    return left + clamp((size.y - r.z - p.y) * course.inv_lengths.w, 0.0, 1.0) * e.w;
 }
 
 // Convert a course coordinate to a centre and width in logical pixels plus a unit
@@ -327,7 +333,7 @@ void knit_course_stitch(
     float coordinate, KnitCourse course, KnitCourse motif,
     out vec2 center, out vec2 tangent, out float width, out float column, out vec2 stitch_id
 ) {
-    float s = mod(coordinate, max(dot(course.edges + course.bends, vec4(1.0)), 1.0));
+    float s = mod(coordinate, course.total);
     center = vec2(0.0);
     tangent = vec2(1.0, 0.0);
     width = max(knit_stitch_size, 1.0);
@@ -349,14 +355,14 @@ void knit_course_stitch(
             tangent = vec2(0.0, -1.0);
         }
         int previous = side == 0 ? 3 : side - 1;
-        float length = (side == 0 || side == 2 ? course.size.x : course.size.y)
-            - course.radius[previous] - course.radius[side];
+        float length = course.lengths[side];
         float edges = course.edges[side];
         float bends = course.bends[side];
         if (s < edges) {
-            float fraction = s / edges;
+            float inv_edges = 1.0 / edges;
+            float fraction = s * inv_edges;
             center = start + tangent * (fraction * length) + vec2(course.depth);
-            width = length / edges;
+            width = length * inv_edges;
             // One colour column per real stitch; resampling skips or duplicates colours.
             column = motif.bends[previous] + floor(s);
             stitch_id = vec2(floor(s), float(side) * 2.0);
@@ -364,14 +370,15 @@ void knit_course_stitch(
         }
         s -= edges;
         if (s < bends) {
-            float fraction = s / bends;
+            float inv_bends = 1.0 / bends;
+            float fraction = s * inv_bends;
             float angle = fraction * 1.57079633;
             vec2 inward = vec2(-tangent.y, tangent.x);
             float radius = course.radius[side];
             center = start + tangent * length + inward * radius
                 + radius * (tangent * sin(angle) - inward * cos(angle)) + vec2(course.depth);
             tangent = tangent * cos(angle) + inward * sin(angle);
-            width = 2.0 * radius * sin(0.78539816 / bends);
+            width = 2.0 * radius * sin(0.78539816 * inv_bends);
             column = floor(fraction * motif.bends[side]);
             stitch_id = vec2(floor(s), float(side) * 2.0 + 1.0);
             return;
