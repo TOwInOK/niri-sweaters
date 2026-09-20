@@ -219,3 +219,12 @@ Rules:
 - resize-workload results may add `update med` / `render med` stage lines
   under each scenario;
 - golden test status closes the report.
+
+## Performance regressions
+
+If the comparison shows a real regression — not noise, confirmed across
+repeated `--runs` — the change is reverted rather than merged with a known
+slowdown. Revert commits follow the same convention and carry the benchmark
+numbers showing the regression being undone (see `796e277e` for an example).
+A regression that only shows up in `p95`/`max` still counts: tail latency is
+part of the frame budget.
