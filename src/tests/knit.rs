@@ -32,20 +32,6 @@ fn renderer_name(state: &mut crate::niri::State) -> String {
         .unwrap_or_default()
 }
 
-/// Points GLVND at the Mesa EGL vendor so the surfaceless display uses llvmpipe.
-///
-/// Without this, systems with a proprietary driver (e.g. NVIDIA) pick it for the
-/// surfaceless EGL display and the golden tests cannot run deterministically.
-/// No-op when the variable is already set or Mesa is not installed.
-fn prefer_mesa_egl() {
-    const MESA_JSON: &str = "/usr/share/glvnd/egl_vendor.d/50_mesa.json";
-    if std::env::var_os("__EGL_VENDOR_LIBRARY_FILENAMES").is_none()
-        && PathBuf::from(MESA_JSON).exists()
-    {
-        std::env::set_var("__EGL_VENDOR_LIBRARY_FILENAMES", MESA_JSON);
-    }
-}
-
 /// The golden images are only deterministic on llvmpipe, so the tests require it.
 fn assert_llvmpipe(state: &mut crate::niri::State) {
     let name = renderer_name(state);
@@ -157,7 +143,6 @@ fn assert_golden(name: &str, size: Size<i32, Physical>, pixels: &[u8]) {
 }
 
 fn set_up(config_text: &str) -> Fixture {
-    prefer_mesa_egl();
     let config = Config::parse_mem(config_text).unwrap();
     let mut f = Fixture::with_config(config);
     f.niri_state().backend.headless().add_renderer().unwrap();
