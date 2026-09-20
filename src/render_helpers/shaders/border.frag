@@ -240,25 +240,28 @@ vec2 knit_filaments(vec2 p, vec2 footprint) {
 vec4 knit_leg(vec2 point, float side, float seed, float radius, out vec3 normal, out vec2 tangent) {
     vec2 start = vec2(side * 0.40, -0.56);
     vec2 axis = vec2(-side * 0.34, 1.12);
-    float axis_squared = dot(axis, axis);
     // Project onto the straight axis, then refine once against its bowed centreline.
-    float t = clamp(dot(point - start, axis) / axis_squared, 0.0, 1.0);
+    // dot(axis, axis) = (-side * 0.34)^2 + 1.12^2 = 0.1156 + 1.2544 = 1.37 identically.
+    float t = clamp(dot(point - start, axis) * (1.0 / 1.37), 0.0, 1.0);
     float bow = side * (0.035 + 0.012 * seed);
-    vec2 center = start + axis * t + vec2(bow * 4.0 * t * (1.0 - t), 0.0);
-    tangent = axis + vec2(bow * (4.0 - 8.0 * t), 0.0);
+    float bow_4 = bow * 4.0;
+    vec2 center = start + axis * t + vec2(bow_4 * t * (1.0 - t), 0.0);
+    tangent = axis + vec2(bow_4 * (1.0 - 2.0 * t), 0.0);
     t = clamp(t + dot(point - center, tangent) / dot(tangent, tangent), 0.0, 1.0);
-    center = start + axis * t + vec2(bow * 4.0 * t * (1.0 - t), 0.0);
-    tangent = normalize(axis + vec2(bow * (4.0 - 8.0 * t), 0.0));
+    center = start + axis * t + vec2(bow_4 * t * (1.0 - t), 0.0);
+    tangent = normalize(axis + vec2(bow_4 * (1.0 - 2.0 * t), 0.0));
     vec2 across = vec2(tangent.y, -tangent.x);
-    float u = dot(point - center, across) / radius;
+    float inv_radius = 1.0 / radius;
+    float inv_radius_sq = inv_radius * inv_radius;
+    float u = dot(point - center, across) * inv_radius;
     float v = t * 2.0 - 1.0;
     // Include distance past the endpoints; clamping t must not extrude the tips.
     float end_distance = dot(point - center, tangent);
     // Keep a narrow yarn neck at each end: the strand tucks into the next
     // course instead of ending as a separate pointed bead.
-    float ellipse = u * u + v * v * 0.86 + end_distance * end_distance / (radius * radius);
+    float ellipse = u * u + v * v * 0.86 + (end_distance * end_distance) * inv_radius_sq;
     float dome = sqrt(max(1.0 - ellipse, 0.0));
-    normal = vec3(across * u + tangent * (v * radius * 1.46), max(dome / 0.78, 0.08));
+    normal = vec3(across * u + tangent * (v * radius * 1.46), max(dome * (1.0 / 0.78), 0.08));
     return vec4((sqrt(ellipse) - 1.0) * radius, dome * radius, u, t);
 }
 
