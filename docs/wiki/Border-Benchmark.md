@@ -118,7 +118,7 @@ cargo test --locked -p niri --test border_bench_tests
 
 ### Visual regression testing (golden images)
 
-When optimizing knit shaders or border rendering paths, always verify that the rendering results match the golden reference images:
+Every change that touches border rendering — knit shaders, gradient paths, `BorderRenderElement`, `FocusRing` — must pass the golden image tests before commit. A golden failure is a regression on the same level as a performance regression: fix it or revert, never commit with a known visual change unless it is intentional and the references are regenerated in the same commit.
 
 ```bash
 cargo test knit
@@ -134,6 +134,10 @@ If a test fails due to pixel differences exceeding 1%:
 - A newly rendered image `<test_name>.new.png` is generated directly in `src/tests/golden/`.
 - Compare `src/tests/golden/<test_name>.png` with `src/tests/golden/<test_name>.new.png` to review the visual discrepancy.
 - If the visual change is intentional, update the reference images with `NIRI_GOLDEN_UPDATE=1 cargo test knit`.
+
+Golden status is part of the benchmark report convention: the commit message
+format ends with `Golden tests: <passed>/<total> passed`, so a commit that
+skips the check is visible immediately.
 
 Warmup frames run before the measured series so that one-time costs — shader warm-up, allocator caches, driver state — do not pollute the samples. They are drawn but never timed. Single runs are noisy: use `--runs N` to average statistics across repetitions and compare medians, not individual runs.
 
@@ -228,3 +232,7 @@ slowdown. Revert commits follow the same convention and carry the benchmark
 numbers showing the regression being undone (see `796e277e` for an example).
 A regression that only shows up in `p95`/`max` still counts: tail latency is
 part of the frame budget.
+
+The same rule applies to golden tests: a failing `cargo test knit` after a
+rendering change means revert or regenerate references intentionally — not
+committing a silent visual regression.
