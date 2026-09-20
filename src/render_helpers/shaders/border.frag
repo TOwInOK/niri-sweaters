@@ -71,26 +71,24 @@ vec3 linear_to_srgb(vec3 color) {
 }
 
 vec3 lch_to_lab(vec3 color) {
-    float a = color.y * clamp(cos(radians(color.z)), -1.0, 1.0);
-    float b = color.y * clamp(sin(radians(color.z)), -1.0, 1.0);
-    return vec3(
-        color.x,
-        a,
-        b
-    );
+    float rad = radians(color.z);
+    float a = color.y * clamp(cos(rad), -1.0, 1.0);
+    float b = color.y * clamp(sin(rad), -1.0, 1.0);
+    return vec3(color.x, a, b);
 }
 
+const mat3 oklab_to_lms = mat3(
+    vec3(1.0, 0.3963377774, 0.2158037573),
+    vec3(1.0, -0.1055613458, -0.0638541728),
+    vec3(1.0, -0.0894841775, -1.2914855480)
+);
+const mat3 lms_to_rgb = mat3(
+    vec3(4.0767416621, -3.3077115913, 0.2309699292),
+    vec3(-1.2684380046, 2.6097574011, -0.3413193965),
+    vec3(-0.0041960863, -0.7034186147, 1.7076147010)
+);
+
 vec3 oklab_to_linear(vec3 color){
-    mat3 oklab_to_lms = mat3(
-        vec3(1.0, 0.3963377774, 0.2158037573),
-        vec3(1.0, -0.1055613458, -0.0638541728),
-        vec3(1.0, -0.0894841775, -1.2914855480)
-    );
-    mat3 lms_to_rgb = mat3(
-        vec3(4.0767416621, -3.3077115913, 0.2309699292),
-        vec3(-1.2684380046, 2.6097574011, -0.3413193965),
-        vec3(-0.0041960863, -0.7034186147, 1.7076147010)
-    );
     vec3 lms = color * oklab_to_lms;
     // Multiplication instead of pow(): lms can go negative out of gamut,
     // where pow() is undefined.
@@ -122,8 +120,10 @@ vec4 color_mix(vec4 color1, vec4 color2, float color_ratio) {
 
         float min_hue = min(color1.z, color2.z);
         float max_hue = max(color1.z, color2.z);
-        float path_direct_distance = (max_hue - min_hue) * color_ratio;
-        float path_mod_distance = (360.0 - max_hue + min_hue) * color_ratio;
+        float d_hue = max_hue - min_hue;
+        float d_hue_wrap = 360.0 - d_hue;
+        float path_direct_distance = d_hue * color_ratio;
+        float path_mod_distance = d_hue_wrap * color_ratio;
 
         float path_mod =
             color1.z == min_hue ?
@@ -137,13 +137,13 @@ vec4 color_mix(vec4 color1, vec4 color2, float color_ratio) {
         // shorter
         if (hue_interpolation == 0.0) {
             color_out.z =
-                max_hue - min_hue > 360.0 - max_hue + min_hue ?
+                d_hue > d_hue_wrap ?
                     path_mod :
                     path_direct ;
         // longer
         } else if (hue_interpolation == 1.0) {
             color_out.z =
-                max_hue - min_hue <= 360.0 - max_hue + min_hue ?
+                d_hue <= d_hue_wrap ?
                     path_mod :
                     path_direct ;
         // increasing
@@ -166,6 +166,9 @@ vec4 color_mix(vec4 color1, vec4 color2, float color_ratio) {
 }
 
 vec4 gradient_color(vec2 coords) {
+    if (colorspace == 0.0 && color_from == color_to)
+        return premul_rect(color_from);
+
     coords = coords + grad_offset;
 
     if ((grad_vec.x < 0.0 && 0.0 <= grad_vec.y) || (0.0 <= grad_vec.x && grad_vec.y < 0.0))
