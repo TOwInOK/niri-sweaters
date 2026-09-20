@@ -211,6 +211,13 @@ pub struct Zoom {
     /// Fraction of the output size along each axis that the cursor can
     /// traverse before the zoomed viewport starts following it.
     pub deadzone_size: f64,
+    /// Number of fingers of a touchpad pinch gesture that controls the
+    /// desktop zoom.
+    ///
+    /// `None` disables compositor pinch zoom: all pinch gestures are
+    /// forwarded to clients. Setting this is an explicit opt-in that hands
+    /// matching pinch sequences to the compositor instead of applications.
+    pub pinch_fingers: Option<u32>,
 }
 
 impl Default for Zoom {
@@ -219,6 +226,7 @@ impl Default for Zoom {
             max_zoom: 10.,
             increment_factor: 1.2,
             deadzone_size: 0.5,
+            pinch_fingers: None,
         }
     }
 }
@@ -231,11 +239,19 @@ pub struct ZoomPart {
     pub increment_factor: Option<ZoomIncrementFactor>,
     #[knuffel(child, unwrap(argument))]
     pub deadzone_size: Option<FloatOrInt<0, 1>>,
+    #[knuffel(child, unwrap(argument))]
+    pub pinch_fingers: Option<PinchFingers>,
 }
 
 impl MergeWith<ZoomPart> for Zoom {
     fn merge_with(&mut self, part: &ZoomPart) {
-        merge!((self, part), max_zoom, increment_factor, deadzone_size);
+        merge!(
+            (self, part),
+            max_zoom,
+            increment_factor,
+            deadzone_size,
+            pinch_fingers
+        );
     }
 }
 
@@ -298,6 +314,63 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for ZoomIncrementFa
             Ok(ZoomIncrementFactor(value))
         } else {
             ctx.emit_error(DecodeError::conversion(val, "value must be greater than 1"));
+            Ok(Self::default())
+        }
+    }
+}
+
+/// Finger count of a touchpad pinch gesture that controls the desktop zoom.
+///
+/// A pinch needs at least two fingers, so values below 2 are rejected. There
+/// is no upper bound: the input API does not limit the finger count.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct PinchFingers(pub u32);
+
+impl MergeWith<PinchFingers> for Option<u32> {
+    fn merge_with(&mut self, part: &PinchFingers) {
+        *self = Some(part.0);
+    }
+}
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for PinchFingers {
+    fn type_check(
+        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) {
+        if let Some(type_name) = &type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+    }
+
+    fn raw_decode(
+        val: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let value = match &**val {
+            knuffel::ast::Literal::Int(value) => match u32::try_from(value) {
+                Ok(v) => v,
+                Err(e) => {
+                    ctx.emit_error(DecodeError::conversion(val, e));
+                    return Ok(Self::default());
+                }
+            },
+            _ => {
+                ctx.emit_error(DecodeError::unsupported(
+                    val,
+                    "Unsupported value, only integers are recognized",
+                ));
+                return Ok(Self::default());
+            }
+        };
+
+        if value >= 2 {
+            Ok(PinchFingers(value))
+        } else {
+            ctx.emit_error(DecodeError::conversion(val, "value must be at least 2"));
             Ok(Self::default())
         }
     }

@@ -501,7 +501,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::wayland::seat::WaylandFocus;
 use smithay::backend::input::Keycode;
 use smithay::input::keyboard::Keysym;
-use crate::input::ZoomHoldTrigger;
+use crate::input::{ZoomHoldTrigger, ZoomPinchRouting};
 
 fn color_bbox(
     pixels: &[u8],
@@ -5168,4 +5168,448 @@ fn zoom_mru_button_displayed_off_output_cancels() {
 
     assert!(!f.niri().window_mru_ui.is_open());
     assert_eq!(f.niri().layout.focus().map(|m| m.id()), focus_before);
+}
+
+// --- Touchpad pinch zoom ---------------------------------------------------
+
+fn set_up_with_pinch() -> Fixture {
+    set_up_with_zoom("zoom { pinch-fingers 3; }")
+}
+
+fn zoom_pinch(f: &mut Fixture) -> Option<ZoomPinchRouting> {
+    f.niri().zoom_pinch.clone()
+}
+
+fn zoom_gesturing(f: &mut Fixture, output: &Output) -> bool {
+    f.niri()
+        .layout
+        .monitor_for_output(output)
+        .unwrap()
+        .zoom()
+        .is_gesturing()
+}
+
+fn zoom_animating(f: &mut Fixture, output: &Output) -> bool {
+    f.niri()
+        .layout
+        .monitor_for_output(output)
+        .unwrap()
+        .zoom()
+        .is_animating()
+}
+
+#[test]
+fn zoom_pinch_claim_requires_config() {
+    // Pinch zoom is disabled by default: no finger count may be claimed.
+    let mut f = set_up();
+    assert!(!f.niri_state().can_claim_zoom_pinch(2));
+    assert!(!f.niri_state().can_claim_zoom_pinch(3));
+    assert!(!f.niri_state().can_claim_zoom_pinch(4));
+}
+
+#[test]
+fn zoom_pinch_claim_finger_match() {
+    let mut f = set_up_with_pinch();
+    assert!(f.niri_state().can_claim_zoom_pinch(3));
+    assert!(!f.niri_state().can_claim_zoom_pinch(2));
+    assert!(!f.niri_state().can_claim_zoom_pinch(4));
+}
+
+#[test]
+fn zoom_pinch_claim_gates() {
+    use crate::input::{zoom_pinch_claim_allowed, ZoomPinchGates};
+
+    let clear = ZoomPinchGates {
+        pinch_fingers: Some(3),
+        fingers: 3,
+        session_locked: false,
+        screenshot_ui_open: false,
+        mru_open: false,
+        pointer_grabbed: false,
+        overview_active: false,
+    };
+    assert!(zoom_pinch_claim_allowed(clear));
+
+    // Every gate independently blocks the claim.
+    for gates in [
+        ZoomPinchGates {
+            pinch_fingers: None,
+            ..clear
+        },
+        ZoomPinchGates {
+            pinch_fingers: Some(2),
+            ..clear
+        },
+        ZoomPinchGates {
+            fingers: 2,
+            ..clear
+        },
+        ZoomPinchGates {
+            session_locked: true,
+            ..clear
+        },
+        ZoomPinchGates {
+            screenshot_ui_open: true,
+            ..clear
+        },
+        ZoomPinchGates {
+            mru_open: true,
+            ..clear
+        },
+        ZoomPinchGates {
+            pointer_grabbed: true,
+            ..clear
+        },
+        ZoomPinchGates {
+            overview_active: true,
+            ..clear
+        },
+    ] {
+        assert!(!zoom_pinch_claim_allowed(gates), "{gates:?}");
+    }
+}
+
+#[test]
+fn zoom_pinch_claim_blocked_by_screenshot_ui() {
+    let mut f = set_up_with_pinch();
+    f.niri_state().open_screenshot_ui(true, None);
+    assert!(f.niri().screenshot_ui.is_open());
+
+    assert!(!f.niri_state().can_claim_zoom_pinch(3));
+}
+
+#[test]
+fn zoom_pinch_claim_blocked_by_mru() {
+    let mut f = set_up_with_config(&format!("{MRU_CONFIG}\nzoom {{ pinch-fingers 3; }}"));
+    let id = f.add_client();
+    open_window(&mut f, id, "one", 100, 100, [255, 0, 0, 255]);
+    open_mru(&mut f);
+
+    assert!(!f.niri_state().can_claim_zoom_pinch(3));
+}
+
+#[test]
+fn zoom_pinch_claim_blocked_by_overview() {
+    let mut f = set_up_with_pinch();
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+    f.niri().layout.toggle_overview();
+
+    assert!(!f.niri_state().can_claim_zoom_pinch(3));
+}
+
+#[test]
+fn zoom_pinch_begin_claims() {
+    let mut f = set_up_with_pinch();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+
+    assert!(matches!(
+        zoom_pinch(&mut f),
+        Some(ZoomPinchRouting::Active {
+            output: ref owner,
+            device_id: ref dev,
+        }) if *owner == output && dev == "dev0"
+    ));
+    assert!(zoom_gesturing(&mut f, &output));
+    assert!(!zoom_animating(&mut f, &output));
+}
+
+#[test]
+fn zoom_pinch_update_drives_level() {
+    let mut f = set_up_with_pinch();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    f.niri_state().update_zoom_pinch(&output, 2.);
+
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert_eq!(zoom_target_level(&mut f, &output), 2.);
+    assert!(zoom_gesturing(&mut f, &output));
+    // Updates never allocate an animation.
+    assert!(!zoom_animating(&mut f, &output));
+}
+
+#[test]
+fn zoom_pinch_update_clamps() {
+    let mut f = set_up_with_zoom("zoom { pinch-fingers 3; max-zoom 4; }");
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+
+    // Past the configured maximum.
+    f.niri_state().update_zoom_pinch(&output, 20.);
+    assert_eq!(zoom_level(&mut f, &output), 4.);
+
+    // Back below 1 snaps to the exact identity.
+    f.niri_state().update_zoom_pinch(&output, 0.1);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert_eq!(zoom_target_level(&mut f, &output), 1.);
+}
+
+#[test]
+fn zoom_pinch_commit_on_end() {
+    let mut f = set_up_with_pinch();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    f.niri_state().update_zoom_pinch(&output, 2.);
+    f.niri_state().commit_zoom_pinch();
+
+    assert!(zoom_pinch(&mut f).is_none());
+    assert!(!zoom_gesturing(&mut f, &output));
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert_eq!(zoom_target_level(&mut f, &output), 2.);
+}
+
+#[test]
+fn zoom_pinch_interrupt_commits_and_swallows() {
+    let mut f = set_up_with_pinch();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    f.niri_state().update_zoom_pinch(&output, 2.);
+    f.niri_state().interrupt_zoom_pinch();
+
+    // The current gesture state is committed, the rest of the sequence is
+    // swallowed rather than forwarded.
+    assert!(matches!(
+        zoom_pinch(&mut f),
+        Some(ZoomPinchRouting::Swallowing { ref device_id }) if device_id == "dev0"
+    ));
+    assert!(!zoom_gesturing(&mut f, &output));
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+
+    // The physical end clears the routing.
+    f.niri_state().commit_zoom_pinch();
+    assert!(zoom_pinch(&mut f).is_none());
+}
+
+#[test]
+fn zoom_pinch_explicit_action_interrupts() {
+    let mut f = set_up_with_pinch();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    f.niri_state().update_zoom_pinch(&output, 2.);
+
+    // An explicit zoom action takes over the transition; the next pinch
+    // event commits the gesture and swallows the rest of the sequence.
+    f.niri_state().do_action(Action::ZoomIn, false);
+    f.niri_state().update_zoom_pinch(&output, 3.);
+
+    assert!(matches!(
+        zoom_pinch(&mut f),
+        Some(ZoomPinchRouting::Swallowing { .. })
+    ));
+    assert!(!zoom_gesturing(&mut f, &output));
+}
+
+#[test]
+fn zoom_pinch_hold_release_interrupts() {
+    let mut f = set_up_with_pinch();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    // A hold started before the pinch keeps its snapshot; the pinch drives
+    // the temporary hold viewport.
+    let trigger = key_trigger(100);
+    f.niri_state().begin_zoom_hold(trigger, 2.);
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    f.niri_state().update_zoom_pinch(&output, 1.5);
+    assert_eq!(zoom_level(&mut f, &output), 3.);
+
+    // Releasing the hold restores the snapshot and replaces the gesture;
+    // the next pinch event swallows the rest of the sequence.
+    hold_release(&mut f, trigger);
+    f.niri_state().update_zoom_pinch(&output, 2.);
+
+    assert!(matches!(
+        zoom_pinch(&mut f),
+        Some(ZoomPinchRouting::Swallowing { .. })
+    ));
+    assert!(!zoom_gesturing(&mut f, &output));
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+}
+
+#[test]
+fn zoom_pinch_output_removal_swallows() {
+    let mut f = set_up_with_pinch();
+    let output1 = f.niri_output(1);
+    f.add_output(2, (1920, 720));
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    f.niri_state().update_zoom_pinch(&output1, 2.);
+
+    // Removing the owner output cannot forward the rest of the sequence:
+    // the client never saw the begin.
+    f.niri().remove_output(&output1);
+
+    assert!(matches!(
+        zoom_pinch(&mut f),
+        Some(ZoomPinchRouting::Swallowing { .. })
+    ));
+
+    f.niri_state().commit_zoom_pinch();
+    assert!(zoom_pinch(&mut f).is_none());
+}
+
+#[test]
+fn zoom_pinch_device_removal_commits() {
+    let mut f = set_up_with_pinch();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    f.niri_state().update_zoom_pinch(&output, 2.);
+
+    // A different device going away does not disturb the gesture.
+    f.niri_state().commit_zoom_pinch_for_device("dev1");
+    assert!(matches!(
+        zoom_pinch(&mut f),
+        Some(ZoomPinchRouting::Active { .. })
+    ));
+    assert!(zoom_gesturing(&mut f, &output));
+
+    // The owner device going away commits the gesture; no physical end will
+    // arrive, so the routing is cleared rather than swallowed.
+    f.niri_state().commit_zoom_pinch_for_device("dev0");
+    assert!(zoom_pinch(&mut f).is_none());
+    assert!(!zoom_gesturing(&mut f, &output));
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+}
+
+#[test]
+fn zoom_pinch_owner_output_fixed_at_begin() {
+    let mut f = set_up_with_pinch();
+    let output1 = f.niri_output(1);
+    f.add_output(2, (1920, 720));
+    let output2 = f.niri_output(2);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+
+    // The pointer moves to another output mid-gesture; updates still drive
+    // the owner output.
+    f.niri_state().move_cursor(Point::from((2000., 100.)));
+    f.niri_state().update_zoom_pinch(&output1, 2.);
+
+    assert_eq!(zoom_level(&mut f, &output1), 2.);
+    assert_eq!(zoom_level(&mut f, &output2), 1.);
+}
+
+#[test]
+fn zoom_pinch_config_reload_keeps_sequence() {
+    let mut f = set_up_with_pinch();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    f.niri_state().update_zoom_pinch(&output, 2.);
+
+    // Disabling pinch mid-gesture does not re-route the claimed sequence;
+    // the new setting applies to the next begin.
+    reload_with_zoom(&mut f, "");
+    assert!(matches!(
+        zoom_pinch(&mut f),
+        Some(ZoomPinchRouting::Active { .. })
+    ));
+    assert!(!f.niri_state().can_claim_zoom_pinch(3));
+
+    f.niri_state().update_zoom_pinch(&output, 1.5);
+    assert_eq!(zoom_level(&mut f, &output), 1.5);
+}
+
+#[test]
+fn zoom_pinch_max_decrease_interrupts() {
+    let mut f = set_up_with_zoom("zoom { pinch-fingers 3; max-zoom 4; }");
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    f.niri_state().update_zoom_pinch(&output, 4.);
+    assert_eq!(zoom_level(&mut f, &output), 4.);
+
+    // Lowering max-zoom clamps the level immediately, replacing the gesture;
+    // the rest of the sequence is swallowed.
+    reload_with_zoom(&mut f, "zoom { pinch-fingers 3; max-zoom 2; }");
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+
+    f.niri_state().update_zoom_pinch(&output, 1.);
+    assert!(matches!(
+        zoom_pinch(&mut f),
+        Some(ZoomPinchRouting::Swallowing { .. })
+    ));
+}
+
+#[test]
+fn zoom_pinch_deadzone_suppressed() {
+    let mut f = set_up_with_pinch();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    f.niri_state().update_zoom_pinch(&output, 2.);
+
+    let focal = f
+        .niri()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .zoom()
+        .focal();
+
+    // Pointer motion does not re-pin the gesture anchor.
+    f.niri_state()
+        .update_zoom_focal_for_cursor(Point::from((1800., 600.)), None);
+    let after = f
+        .niri()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .zoom()
+        .focal();
+    assert_eq!(after, focal);
+}
+
+#[test]
+fn zoom_pinch_begin_from_animation() {
+    let mut f = set_up_with_config(&format!("{ANIMATED_CONFIG}\nzoom {{ pinch-fingers 3; }}"));
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    // Start an animated zoom and freeze it mid-flight.
+    f.niri_state()
+        .do_action(Action::SetZoomLevel(FloatOrInt(2.)), false);
+    freeze_clock(&mut f);
+    advance_clock(&mut f, 50);
+    let displayed = zoom_level(&mut f, &output);
+    assert!(displayed > 1. && displayed < 2.);
+
+    // The gesture base is the displayed level, not the animation target.
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    assert_abs_diff_eq!(zoom_level(&mut f, &output), displayed, epsilon = EPS);
+    assert_abs_diff_eq!(zoom_target_level(&mut f, &output), displayed, epsilon = EPS);
+
+    f.niri_state().update_zoom_pinch(&output, 2.);
+    assert_abs_diff_eq!(zoom_level(&mut f, &output), displayed * 2., epsilon = EPS);
+}
+
+#[test]
+fn zoom_pinch_second_device_not_claimed() {
+    let mut f = set_up_with_pinch();
+    let _output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+
+    // While a sequence is routed, no second zoom gesture is claimed.
+    assert!(!f.niri_state().can_claim_zoom_pinch(3));
 }

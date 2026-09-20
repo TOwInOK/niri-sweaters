@@ -143,6 +143,7 @@ use crate::input::scroll_tracker::ScrollTracker;
 use crate::input::{
     apply_libinput_settings, mods_with_finger_scroll_binds, mods_with_mouse_binds,
     mods_with_tablet_stylus_binds, mods_with_wheel_binds, TabletData, ZoomHoldState,
+    ZoomPinchRouting,
 };
 use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
@@ -354,6 +355,12 @@ pub struct Niri {
     /// animates the saved zoom state back on the owning output, while
     /// lost-release cleanup restores it immediately.
     pub zoom_hold: Option<ZoomHoldState>,
+    /// Routing state of a compositor-owned touchpad pinch gesture, if any.
+    ///
+    /// Owned by the input layer: `Active` sequences drive the desktop zoom of
+    /// their owner output, `Swallowing` sequences are consumed without
+    /// reaching clients until the physical end.
+    pub zoom_pinch: Option<ZoomPinchRouting>,
     pub keyboard_focus: KeyboardFocus,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
@@ -2725,6 +2732,7 @@ impl Niri {
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
             zoom_hold: None,
+            zoom_pinch: None,
             presentation_state,
             security_context_state,
             gamma_control_manager_state,
@@ -3079,6 +3087,22 @@ impl Niri {
             .is_some_and(|hold| hold.output == *output)
         {
             self.zoom_hold = None;
+        }
+
+        // A zoom pinch owned by the removed output can no longer control the
+        // zoom, but its client never saw the begin: swallow the rest of the
+        // sequence instead of dropping the routing state.
+        if matches!(
+            self.zoom_pinch,
+            Some(ZoomPinchRouting::Active {
+                output: ref owner,
+                ..
+            }) if owner == output
+        ) {
+            let routing = self.zoom_pinch.take().unwrap();
+            self.zoom_pinch = Some(ZoomPinchRouting::Swallowing {
+                device_id: routing.device_id().to_owned(),
+            });
         }
 
         for layer in layer_map_for_output(output).layers() {

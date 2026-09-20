@@ -1764,6 +1764,7 @@ mod tests {
                 max_zoom: 10.0,
                 increment_factor: 1.2,
                 deadzone_size: 0.5,
+                pinch_fingers: None,
             },
             environment: Environment(
                 [
@@ -2565,6 +2566,7 @@ mod tests {
         assert_eq!(config.zoom.max_zoom, 10.);
         assert_eq!(config.zoom.increment_factor, 1.2);
         assert_eq!(config.zoom.deadzone_size, 0.5);
+        assert_eq!(config.zoom.pinch_fingers, None);
     }
 
     #[test]
@@ -2635,12 +2637,45 @@ mod tests {
             "zoom { deadzone-size -0.1 }",
             "zoom { deadzone-size 2 }",
             "zoom { deadzone-size 1.5 }",
+            "zoom { pinch-fingers 0; }",
+            "zoom { pinch-fingers 1; }",
+            "zoom { pinch-fingers -1; }",
+            "zoom { pinch-fingers 1.5; }",
         ] {
             assert!(
                 Config::parse_mem(text).is_err(),
                 "expected parse error for: {text}"
             );
         }
+    }
+
+    #[test]
+    fn parse_zoom_pinch_fingers() {
+        // Disabled by default.
+        let config = do_parse("zoom { max-zoom 4; }");
+        assert_eq!(config.zoom.pinch_fingers, None);
+
+        // Three fingers: the recommended opt-in.
+        let config = do_parse("zoom { pinch-fingers 3; }");
+        assert_eq!(config.zoom.pinch_fingers, Some(3));
+
+        // Two fingers are allowed as an explicit opt-in.
+        let config = do_parse("zoom { pinch-fingers 2; }");
+        assert_eq!(config.zoom.pinch_fingers, Some(2));
+
+        // Other zoom fields are unaffected.
+        let config = do_parse(
+            r#"
+            zoom {
+                max-zoom 4
+                pinch-fingers 3
+            }
+            "#,
+        );
+        assert_eq!(config.zoom.max_zoom, 4.);
+        assert_eq!(config.zoom.increment_factor, 1.2);
+        assert_eq!(config.zoom.deadzone_size, 0.5);
+        assert_eq!(config.zoom.pinch_fingers, Some(3));
     }
 
     #[test]

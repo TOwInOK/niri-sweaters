@@ -48,7 +48,7 @@ use self::spatial_movement_grab::SpatialMovementGrab;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
-use crate::layout::zoom::ZoomSnapshot;
+use crate::layout::zoom::{ZoomSnapshot, ZOOM_SNAP_TO_ONE_EPSILON};
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
@@ -71,11 +71,6 @@ pub mod touch_overview_grab;
 
 use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
 pub const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
-
-/// Zoom-out results within this distance of 1 are snapped to exactly 1 so that
-/// repeated zoom-in/out cycles do not leave a floating-point residue that keeps
-/// the zoom nominally active.
-const ZOOM_SNAP_TO_ONE_EPSILON: f64 = 1e-9;
 
 /// The physical control that started a zoom hold session.
 ///
@@ -107,6 +102,43 @@ pub struct ZoomHoldState {
     pub previous: ZoomSnapshot,
 }
 
+/// Routing state of a compositor-owned touchpad pinch gesture.
+///
+/// The Wayland pinch protocol requires a `begin → update* → end` sequence, so
+/// a gesture is claimed only at begin time and a claimed sequence is never
+/// partially forwarded: once the compositor owns a sequence, its remaining
+/// events are consumed until the physical end.
+///
+/// `device_id` identifies the owning input device so that a concurrent pinch
+/// sequence from another device still reaches clients.
+#[derive(Debug, Clone)]
+pub enum ZoomPinchRouting {
+    /// The gesture currently drives the desktop zoom of `output`.
+    Active {
+        /// The output whose zoom the gesture controls, fixed at begin.
+        output: Output,
+        /// `Device::id()` of the touchpad that owns the sequence.
+        device_id: String,
+    },
+    /// The gesture was claimed but can no longer control the zoom (the
+    /// session locked, the Overview opened, an explicit zoom action took
+    /// over, the owner output was removed, …). The client never saw the
+    /// begin, so the remaining updates and the end are swallowed.
+    Swallowing {
+        /// `Device::id()` of the touchpad that owns the sequence.
+        device_id: String,
+    },
+}
+
+impl ZoomPinchRouting {
+    /// `Device::id()` of the touchpad that owns the routed sequence.
+    pub fn device_id(&self) -> &str {
+        match self {
+            ZoomPinchRouting::Active { device_id, .. }
+            | ZoomPinchRouting::Swallowing { device_id } => device_id,
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabletData {
     pub aspect_ratio: f64,
@@ -319,6 +351,11 @@ impl State {
         // trigger came from, so any removal ends it. This is a lost-release
         // cleanup, so the restore is immediate.
         self.cancel_zoom_hold_immediate();
+
+        // The removed device may never deliver the pinch end that would
+        // commit its zoom gesture. Commit it now; sequences owned by other
+        // devices are unaffected.
+        self.commit_zoom_pinch_for_device(&device.id());
 
         if device.has_capability(DeviceCapability::TabletTool) {
             let tablet_seat = self.niri.seat.tablet_seat();
@@ -823,12 +860,14 @@ impl State {
                 // for an animation to complete on.
                 self.niri.suppressed_keys.clear();
                 self.cancel_zoom_hold_immediate();
+                self.commit_zoom_pinch();
             }
             Action::Suspend => {
                 self.backend.suspend();
                 // Suspend may not deliver the key releases, so clear the state.
                 self.niri.suppressed_keys.clear();
                 self.cancel_zoom_hold_immediate();
+                self.commit_zoom_pinch();
             }
             Action::PowerOffMonitors => {
                 self.niri.deactivate_monitors(&mut self.backend);
@@ -4375,6 +4414,28 @@ impl State {
     }
 
     fn on_gesture_pinch_begin<I: InputBackend>(&mut self, event: I::GesturePinchBeginEvent) {
+        let device_id = event.device().id();
+
+        // A begin from the device that already owns a routed sequence is part
+        // of that sequence: the client never saw its begin, so it must not
+        // see this one either.
+        if self
+            .niri
+            .zoom_pinch
+            .as_ref()
+            .is_some_and(|routing| routing.device_id() == device_id)
+        {
+            return;
+        }
+
+        // A begin from another device while a sequence is routed is a
+        // concurrent client gesture: it is never claimed as a second zoom
+        // gesture and falls through to the normal client path.
+        if self.niri.zoom_pinch.is_none() && self.can_claim_zoom_pinch(event.fingers()) {
+            self.begin_zoom_pinch(device_id);
+            return;
+        }
+
         let serial = SERIAL_COUNTER.next_serial();
         let pointer = self.niri.seat.get_pointer().unwrap();
 
@@ -4393,6 +4454,26 @@ impl State {
     }
 
     fn on_gesture_pinch_update<I: InputBackend>(&mut self, event: I::GesturePinchUpdateEvent) {
+        let device_id = event.device().id();
+
+        let routing = self
+            .niri
+            .zoom_pinch
+            .as_ref()
+            .filter(|routing| routing.device_id() == device_id)
+            .cloned();
+
+        match routing {
+            Some(ZoomPinchRouting::Active { output, .. }) => {
+                self.update_zoom_pinch(&output, event.scale());
+                return;
+            }
+            // The compositor owns the sequence but no longer controls the
+            // zoom: the remaining events are swallowed.
+            Some(ZoomPinchRouting::Swallowing { .. }) => return,
+            None => {}
+        }
+
         let pointer = self.niri.seat.get_pointer().unwrap();
 
         if self.update_pointer_contents() {
@@ -4428,6 +4509,21 @@ impl State {
     }
 
     fn on_gesture_pinch_end<I: InputBackend>(&mut self, event: I::GesturePinchEndEvent) {
+        let device_id = event.device().id();
+
+        if self
+            .niri
+            .zoom_pinch
+            .as_ref()
+            .is_some_and(|routing| routing.device_id() == device_id)
+        {
+            // The physical sequence is over. A normal end and a cancelled end
+            // both commit the current gesture state; a swallowed sequence
+            // simply clears the routing.
+            self.commit_zoom_pinch();
+            return;
+        }
+
         let serial = SERIAL_COUNTER.next_serial();
         let pointer = self.niri.seat.get_pointer().unwrap();
 
@@ -4840,6 +4936,159 @@ impl State {
         }
     }
 
+    /// Whether a pinch begin with `fingers` fingers may be claimed for the
+    /// desktop zoom.
+    ///
+    /// The claim is decided once, at begin time: the Wayland pinch protocol
+    /// requires a `begin → update* → end` sequence, so a gesture cannot be
+    /// taken over or handed back mid-flight. When this returns `false` the
+    /// whole sequence follows the normal client path.
+    pub(crate) fn can_claim_zoom_pinch(&self, fingers: u32) -> bool {
+        if self.niri.zoom_pinch.is_some() {
+            return false;
+        }
+
+        let pinch_fingers = self.niri.config.borrow().zoom.pinch_fingers;
+        let pointer = self.niri.seat.get_pointer().unwrap();
+
+        let overview_active = self
+            .zoom_target()
+            .and_then(|(output, _)| self.niri.layout.monitor_for_output(&output))
+            .is_some_and(|mon| mon.overview_active());
+
+        zoom_pinch_claim_allowed(ZoomPinchGates {
+            pinch_fingers,
+            fingers,
+            session_locked: self.niri.is_locked(),
+            screenshot_ui_open: self.niri.screenshot_ui.is_open(),
+            mru_open: self.niri.window_mru_ui.is_open(),
+            pointer_grabbed: pointer.is_grabbed(),
+            overview_active,
+        })
+    }
+
+    /// Claims a pinch sequence for the desktop zoom.
+    ///
+    /// Starts the domain gesture on the target output and records the
+    /// routing state. The client does not receive the begin.
+    pub(crate) fn begin_zoom_pinch(&mut self, device_id: String) {
+        let Some((output, anchor)) = self.zoom_target() else {
+            return;
+        };
+        let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) else {
+            return;
+        };
+
+        trace!("claiming zoom pinch on {}", output.name());
+
+        mon.zoom_mut().begin_gesture(anchor);
+        self.niri.zoom_pinch = Some(ZoomPinchRouting::Active { output, device_id });
+    }
+
+    /// Applies a pinch update to the gesture owner output.
+    ///
+    /// `scale` is the cumulative scale relative to the gesture begin. If the
+    /// gesture can no longer control the zoom (session lock, screenshot UI,
+    /// MRU, pointer grab, Overview, owner output removal, or the zoom state
+    /// was taken over by an explicit action), the current gesture is
+    /// committed and the rest of the sequence is swallowed.
+    pub(crate) fn update_zoom_pinch(&mut self, output: &Output, scale: f64) {
+        if self.is_zoom_pinch_interrupted(output) {
+            self.interrupt_zoom_pinch();
+            return;
+        }
+
+        let max_zoom = self.niri.config.borrow().zoom.max_zoom;
+        let Some(mon) = self.niri.layout.monitor_for_output_mut(output) else {
+            return;
+        };
+
+        if mon.zoom_mut().update_gesture(scale, max_zoom) {
+            self.niri.queue_redraw(output);
+        }
+    }
+
+    /// Whether an `Active` zoom pinch on `output` lost its right to control
+    /// the zoom.
+    fn is_zoom_pinch_interrupted(&self, output: &Output) -> bool {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+
+        let (overview_active, zoom_gesturing) = self
+            .niri
+            .layout
+            .monitor_for_output(output)
+            .map(|mon| (mon.overview_active(), mon.zoom().is_gesturing()))
+            .unwrap_or((false, false));
+
+        zoom_pinch_interrupted(ZoomPinchInterruption {
+            session_locked: self.niri.is_locked(),
+            screenshot_ui_open: self.niri.screenshot_ui.is_open(),
+            mru_open: self.niri.window_mru_ui.is_open(),
+            pointer_grabbed: pointer.is_grabbed(),
+            overview_active,
+            zoom_gesturing,
+        })
+    }
+
+    /// Commits the current gesture and swallows the rest of the sequence.
+    ///
+    /// The client never saw the begin, so the remaining updates and the end
+    /// must not reach it.
+    pub(crate) fn interrupt_zoom_pinch(&mut self) {
+        // Only an Active sequence can be interrupted; a Swallowing one is
+        // already committed and must keep consuming events until the
+        // physical end.
+        if !matches!(self.niri.zoom_pinch, Some(ZoomPinchRouting::Active { .. })) {
+            return;
+        }
+
+        let Some(ZoomPinchRouting::Active { output, device_id }) = self.niri.zoom_pinch.take()
+        else {
+            unreachable!();
+        };
+
+        trace!("interrupting zoom pinch on {}", output.name());
+
+        if let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) {
+            mon.zoom_mut().end_gesture();
+        }
+
+        self.niri.zoom_pinch = Some(ZoomPinchRouting::Swallowing { device_id });
+    }
+
+    /// Commits an `Active` gesture and clears the routing state.
+    ///
+    /// Used at the physical end of the sequence (normal or cancelled) and by
+    /// lost-release cleanup paths (VT switch, suspend, device removal) where
+    /// no more events will arrive. A `Swallowing` sequence is simply
+    /// cleared.
+    pub(crate) fn commit_zoom_pinch(&mut self) {
+        let routing = self.niri.zoom_pinch.take();
+        let Some(ZoomPinchRouting::Active { output, .. }) = routing else {
+            return;
+        };
+
+        if let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) {
+            mon.zoom_mut().end_gesture();
+        }
+    }
+
+    /// [`commit_zoom_pinch`](Self::commit_zoom_pinch) limited to the sequence
+    /// owned by `device_id`.
+    ///
+    /// Used on device removal: only the removed device's gesture loses its
+    /// physical continuation.
+    pub(crate) fn commit_zoom_pinch_for_device(&mut self, device_id: &str) {
+        if self
+            .niri
+            .zoom_pinch
+            .as_ref()
+            .is_some_and(|routing| routing.device_id() == device_id)
+        {
+            self.commit_zoom_pinch();
+        }
+    }
+
     /// Computes the cursor position for the touch event.
     ///
     /// This function handles the touch output mapping, as well as coordinate transform
@@ -5104,6 +5353,66 @@ impl State {
 /// camera) and while the Overview is active.
 pub(crate) fn zoom_tracking_enabled(session_locked: bool, overview_active: bool) -> bool {
     !session_locked && !overview_active
+}
+
+/// The environment gates a pinch begin must pass to be claimed for the
+/// desktop zoom.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ZoomPinchGates {
+    /// The configured `zoom.pinch-fingers`, `None` when pinch zoom is off.
+    pub pinch_fingers: Option<u32>,
+    /// The finger count of the begin event.
+    pub fingers: u32,
+    pub session_locked: bool,
+    pub screenshot_ui_open: bool,
+    pub mru_open: bool,
+    /// Whether the pointer is in a non-default grab (move, resize, DnD,
+    /// pick, …).
+    pub pointer_grabbed: bool,
+    /// Whether the target output's Overview is active.
+    pub overview_active: bool,
+}
+
+/// Whether a pinch begin may be claimed for the desktop zoom.
+///
+/// Every gate must pass: the configured finger count must match, no
+/// replacement UI may be open, the pointer must not be grabbed, and the
+/// target output must not be in the Overview.
+pub(crate) fn zoom_pinch_claim_allowed(gates: ZoomPinchGates) -> bool {
+    gates.pinch_fingers == Some(gates.fingers)
+        && !gates.session_locked
+        && !gates.screenshot_ui_open
+        && !gates.mru_open
+        && !gates.pointer_grabbed
+        && !gates.overview_active
+}
+
+/// The environment conditions that interrupt a claimed zoom pinch.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ZoomPinchInterruption {
+    pub session_locked: bool,
+    pub screenshot_ui_open: bool,
+    pub mru_open: bool,
+    /// Whether the pointer is in a non-default grab.
+    pub pointer_grabbed: bool,
+    /// Whether the owner output's Overview is active.
+    pub overview_active: bool,
+    /// Whether the owner output's zoom state is still `Gesturing`.
+    pub zoom_gesturing: bool,
+}
+
+/// Whether a claimed zoom pinch lost its right to control the zoom.
+///
+/// The owner output being gone is reported by the caller as
+/// `zoom_gesturing: false`; every other condition is a replacement
+/// presentation or an explicit zoom action taking over the transition.
+pub(crate) fn zoom_pinch_interrupted(interruption: ZoomPinchInterruption) -> bool {
+    interruption.session_locked
+        || interruption.screenshot_ui_open
+        || interruption.mru_open
+        || interruption.pointer_grabbed
+        || interruption.overview_active
+        || !interruption.zoom_gesturing
 }
 
 /// Check whether the key should be intercepted and mark intercepted

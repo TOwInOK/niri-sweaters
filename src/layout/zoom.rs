@@ -5,6 +5,7 @@
 //! output-local logical. Rendering and input integration live elsewhere.
 
 use smithay::utils::{Logical, Point, Rectangle, Size};
+use tracing::trace;
 
 use crate::animation::{Animation, Clock};
 use crate::utils::view::ViewportTransform;
@@ -65,17 +66,26 @@ enum ZoomLevelTransition {
         clock: Clock,
         config: niri_config::Animation,
     },
+    /// Direct user manipulation of the zoom level, e.g. a touchpad pinch.
+    ///
+    /// There is no animation: each gesture event sets `current_level`
+    /// directly from the cumulative gesture scale relative to `start_level`,
+    /// and `target_level` tracks `current_level` so that the displayed state
+    /// is always the current user intent.
+    Gesturing {
+        /// The displayed level when the gesture began.
+        start_level: f64,
+        /// The level set by the latest gesture update.
+        current_level: f64,
+        /// How the focal point behaves while the level changes.
+        focal: ZoomTransitionFocal,
+    },
 }
 
-impl ZoomLevelTransition {
-    /// The animation driving this transition.
-    fn animation(&self) -> &Animation {
-        match self {
-            ZoomLevelTransition::Animation { animation, .. }
-            | ZoomLevelTransition::Restore { animation, .. } => animation,
-        }
-    }
-}
+/// Zoom-out results within this distance of 1 are snapped to exactly 1 so
+/// that repeated zoom-in/out cycles and pinch gestures do not leave a
+/// floating-point residue that keeps the zoom nominally active.
+pub(crate) const ZOOM_SNAP_TO_ONE_EPSILON: f64 = 1e-9;
 
 /// The smallest `log2` level delta that carries velocity into a restore's
 /// progress animation.
@@ -135,15 +145,15 @@ impl OutputZoomState {
             return self.level;
         };
 
-        let animation = transition.animation();
-        if animation.is_clamped_done() {
-            // Commit the exact target rather than exp2(log2(target)) so that
-            // level == 1.0 stays exact for the identity fast path.
-            return self.target_level;
-        }
-
         match transition {
-            ZoomLevelTransition::Animation { .. } => {
+            ZoomLevelTransition::Gesturing { current_level, .. } => *current_level,
+            ZoomLevelTransition::Animation { animation, .. } => {
+                if animation.is_clamped_done() {
+                    // Commit the exact target rather than exp2(log2(target))
+                    // so that level == 1.0 stays exact for the identity fast
+                    // path.
+                    return self.target_level;
+                }
                 // Clamp to the animation endpoints so that an underdamped
                 // spring can never display a level past the target or below
                 // the start.
@@ -154,10 +164,14 @@ impl OutputZoomState {
                 z.exp2()
             }
             ZoomLevelTransition::Restore {
+                animation,
                 from_level,
                 to_level,
                 ..
             } => {
+                if animation.is_clamped_done() {
+                    return self.target_level;
+                }
                 // The progress animation is clamped to 0..=1, so the level
                 // stays between the endpoints even for an underdamped spring.
                 let p = animation.clamped_value().clamp(0., 1.);
@@ -186,7 +200,8 @@ impl OutputZoomState {
         };
 
         match transition {
-            ZoomLevelTransition::Animation { focal, .. } => match focal {
+            ZoomLevelTransition::Animation { focal, .. }
+            | ZoomLevelTransition::Gesturing { focal, .. } => match focal {
                 ZoomTransitionFocal::Anchored { content, display } => {
                     self.anchored_focal(*content, *display, self.level())
                 }
@@ -217,10 +232,24 @@ impl OutputZoomState {
     }
 
     /// Whether a zoom level transition is in progress.
+    ///
+    /// A [`ZoomLevelTransition::Gesturing`] is not an animation: gesture
+    /// events drive the displayed level directly and queue their own redraws.
     pub fn is_animating(&self) -> bool {
-        self.transition
-            .as_ref()
-            .is_some_and(|t| !t.animation().is_clamped_done())
+        match &self.transition {
+            Some(ZoomLevelTransition::Animation { animation, .. })
+            | Some(ZoomLevelTransition::Restore { animation, .. }) => !animation.is_clamped_done(),
+            Some(ZoomLevelTransition::Gesturing { .. }) | None => false,
+        }
+    }
+
+    /// Whether a direct-manipulation gesture currently owns the zoom level.
+    ///
+    /// While gesturing, [`level()`](Self::level) and
+    /// [`target_level()`](Self::target_level) both report the level set by
+    /// the latest gesture update.
+    pub fn is_gesturing(&self) -> bool {
+        matches!(self.transition, Some(ZoomLevelTransition::Gesturing { .. }))
     }
 
     /// Sets whether focal tracking is locked.
@@ -241,7 +270,10 @@ impl OutputZoomState {
                 self.convert_restore_to_level_animation(ZoomTransitionFocal::Fixed {
                     focal: current,
                 });
-            } else if let Some(ZoomLevelTransition::Animation { focal, .. }) = &mut self.transition
+            } else if let Some(
+                ZoomLevelTransition::Animation { focal, .. }
+                | ZoomLevelTransition::Gesturing { focal, .. },
+            ) = &mut self.transition
             {
                 *focal = ZoomTransitionFocal::Fixed { focal: current };
             }
@@ -377,6 +409,12 @@ impl OutputZoomState {
         cursor: Point<f64, Logical>,
         deadzone_size: f64,
     ) -> bool {
+        // A gesture owns the viewport: the anchor is fixed at gesture begin
+        // and must not be re-pinned by pointer motion.
+        if self.is_gesturing() {
+            return false;
+        }
+
         let level = self.level();
         if self.locked || level == 1. {
             return false;
@@ -438,10 +476,16 @@ impl OutputZoomState {
 
         let level = self.level();
         match &mut self.transition {
-            Some(ZoomLevelTransition::Animation {
-                focal: ZoomTransitionFocal::Anchored { content, display },
-                ..
-            }) => {
+            Some(
+                ZoomLevelTransition::Animation {
+                    focal: ZoomTransitionFocal::Anchored { content, display },
+                    ..
+                }
+                | ZoomLevelTransition::Gesturing {
+                    focal: ZoomTransitionFocal::Anchored { content, display },
+                    ..
+                },
+            ) => {
                 // Solve display = level * content - focal * (level - 1) so
                 // that the anchored focal resolves to `focal` right now.
                 *display = Point::from((
@@ -449,10 +493,16 @@ impl OutputZoomState {
                     level * content.y - focal.y * (level - 1.),
                 ));
             }
-            Some(ZoomLevelTransition::Animation {
-                focal: ZoomTransitionFocal::Fixed { focal: fixed },
-                ..
-            }) => {
+            Some(
+                ZoomLevelTransition::Animation {
+                    focal: ZoomTransitionFocal::Fixed { focal: fixed },
+                    ..
+                }
+                | ZoomLevelTransition::Gesturing {
+                    focal: ZoomTransitionFocal::Fixed { focal: fixed },
+                    ..
+                },
+            ) => {
                 *fixed = focal;
             }
             Some(ZoomLevelTransition::Restore { .. }) => unreachable!(),
@@ -501,6 +551,94 @@ impl OutputZoomState {
         self.focal = Self::clamp_focal(focal, self.view_size);
     }
 
+    /// Begins a direct-manipulation gesture on the zoom level.
+    ///
+    /// `anchor` is a content position in output-local logical coordinates,
+    /// typically the cursor. The currently displayed level becomes the
+    /// gesture base: a transition in progress is abandoned at its current
+    /// displayed state, including a restore's saved destination. While
+    /// unlocked, the anchor is kept at its current displayed position like a
+    /// regular zoom transition; while locked, the focal point stays fixed.
+    ///
+    /// `target_level` is set to the displayed level: during a gesture the
+    /// displayed state is the current user intent.
+    pub fn begin_gesture(&mut self, anchor: Point<f64, Logical>) {
+        let level = self.level();
+        self.target_level = level;
+
+        let focal = if self.locked {
+            ZoomTransitionFocal::Fixed {
+                focal: self.focal(),
+            }
+        } else {
+            ZoomTransitionFocal::Anchored {
+                content: anchor,
+                display: self.viewport_transform().apply(anchor),
+            }
+        };
+
+        self.transition = Some(ZoomLevelTransition::Gesturing {
+            start_level: level,
+            current_level: level,
+            focal,
+        });
+    }
+
+    /// Applies a gesture update's cumulative scale to the zoom level.
+    ///
+    /// `scale` is relative to the gesture begin: the new level is
+    /// `start_level * scale`, clamped to `1..=max_zoom` and snapped to
+    /// exactly 1 within [`ZOOM_SNAP_TO_ONE_EPSILON`]. `target_level` tracks
+    /// the displayed level.
+    ///
+    /// Non-finite or non-positive scales are ignored without disturbing the
+    /// gesture. Does nothing unless a gesture is in progress.
+    ///
+    /// Returns `true` if the displayed state changed.
+    pub fn update_gesture(&mut self, scale: f64, max_zoom: f64) -> bool {
+        let Some(ZoomLevelTransition::Gesturing {
+            start_level,
+            current_level,
+            ..
+        }) = &mut self.transition
+        else {
+            return false;
+        };
+
+        if !scale.is_finite() || scale <= 0. {
+            trace!("ignoring invalid pinch scale {scale}");
+            return false;
+        }
+
+        let mut level = (*start_level * scale).clamp(1., max_zoom);
+        if level <= 1. + ZOOM_SNAP_TO_ONE_EPSILON {
+            level = 1.;
+        }
+
+        if *current_level == level {
+            return false;
+        }
+
+        *current_level = level;
+        self.target_level = level;
+        true
+    }
+
+    /// Commits the current gesture state and ends the gesture.
+    ///
+    /// The displayed level and focal point become the committed state; a
+    /// cancelled gesture commits the same way rather than snapping back to
+    /// the begin state. Does nothing unless a gesture is in progress.
+    pub fn end_gesture(&mut self) {
+        if !self.is_gesturing() {
+            return;
+        }
+
+        self.level = self.target_level;
+        self.focal = self.focal();
+        self.transition = None;
+    }
+
     /// Adjusts the focal point after the output size changed.
     ///
     /// The focal point is preserved if it remains valid for the new size and
@@ -530,10 +668,13 @@ impl OutputZoomState {
     /// first reaches its target, the exact `target_level` and the final
     /// clamped focal point are committed and the transition is dropped.
     pub fn advance_animations(&mut self) {
-        let done = self
-            .transition
-            .as_ref()
-            .is_some_and(|t| t.animation().is_clamped_done());
+        let done = match &self.transition {
+            Some(ZoomLevelTransition::Animation { animation, .. })
+            | Some(ZoomLevelTransition::Restore { animation, .. }) => animation.is_clamped_done(),
+            // A gesture is driven by input events, not the clock; it never
+            // completes here.
+            Some(ZoomLevelTransition::Gesturing { .. }) | None => return,
+        };
         if !done {
             return;
         }
@@ -685,7 +826,7 @@ impl OutputZoomState {
                 let dz = to_level.log2() - from_level.log2();
                 animation.velocity().unwrap_or(0.) * dz
             }
-            None => 0.,
+            Some(ZoomLevelTransition::Gesturing { .. }) | None => 0.,
         }
     }
 
@@ -1318,10 +1459,11 @@ mod tests {
 
     /// The animation inside the current transition, if any.
     fn transition_animation(state: &OutputZoomState) -> Option<&Animation> {
-        state
-            .transition
-            .as_ref()
-            .map(ZoomLevelTransition::animation)
+        match &state.transition {
+            Some(ZoomLevelTransition::Animation { animation, .. })
+            | Some(ZoomLevelTransition::Restore { animation, .. }) => Some(animation),
+            Some(ZoomLevelTransition::Gesturing { .. }) | None => None,
+        }
     }
 
     #[test]
@@ -2178,6 +2320,308 @@ mod tests {
         }
         assert_eq!(state.level(), 1.5);
         assert_point_eq(state.focal(), Point::from((800., 500.)));
+    }
+
+    #[test]
+    fn gesture_begin_identity() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+
+        state.begin_gesture(Point::from((960., 540.)));
+
+        assert!(state.is_gesturing());
+        assert!(!state.is_animating());
+        assert_eq!(state.level(), 1.);
+        assert_eq!(state.target_level(), 1.);
+    }
+
+    #[test]
+    fn gesture_begin_from_animation() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+
+        state.set_target_level(2., Point::from((960., 540.)), &clock, test_anim_config());
+        advance(&mut state, &mut clock, 50);
+        let displayed = state.level();
+        assert!(displayed > 1. && displayed < 2.);
+
+        // The gesture base is the displayed level, not the animation target.
+        state.begin_gesture(Point::from((960., 540.)));
+
+        assert!(state.is_gesturing());
+        assert!(matches!(
+            state.transition,
+            Some(ZoomLevelTransition::Gesturing { start_level, .. })
+                if start_level == displayed
+        ));
+        assert_abs_diff_eq!(state.level(), displayed, epsilon = EPS);
+        assert_abs_diff_eq!(state.target_level(), displayed, epsilon = EPS);
+    }
+
+    #[test]
+    fn gesture_begin_from_restore() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(3., Point::from((400., 300.)), view_size);
+        let mut clock = test_clock();
+
+        let mut snapshot = snapshot_of(&state);
+        snapshot.target_level = 1.5;
+        state.restore_animated(snapshot, &clock, test_anim_config());
+        advance(&mut state, &mut clock, 50);
+        let displayed = state.level();
+        assert!(displayed > 1.5 && displayed < 3.);
+
+        // The gesture base is the displayed state; the restore destination
+        // is abandoned.
+        state.begin_gesture(Point::from((960., 540.)));
+
+        assert!(state.is_gesturing());
+        assert_abs_diff_eq!(state.level(), displayed, epsilon = EPS);
+        assert_abs_diff_eq!(state.target_level(), displayed, epsilon = EPS);
+    }
+
+    #[test]
+    fn gesture_scale_up() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+
+        state.begin_gesture(Point::from((960., 540.)));
+        assert!(state.update_gesture(2., 10.));
+
+        assert_eq!(state.level(), 2.);
+        assert_eq!(state.target_level(), 2.);
+        // Updates never allocate an animation.
+        assert!(matches!(
+            state.transition,
+            Some(ZoomLevelTransition::Gesturing { .. })
+        ));
+    }
+
+    #[test]
+    fn gesture_scale_down() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((960., 540.)));
+        assert!(state.update_gesture(0.75, 10.));
+
+        assert_eq!(state.level(), 1.5);
+        assert_eq!(state.target_level(), 1.5);
+    }
+
+    #[test]
+    fn gesture_lower_exact_clamp() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((960., 540.)));
+        assert!(state.update_gesture(0.4, 10.));
+
+        // Zooming out past 1 snaps to the exact identity, no residue.
+        assert_eq!(state.level(), 1.);
+        assert_eq!(state.target_level(), 1.);
+    }
+
+    #[test]
+    fn gesture_max_clamp() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((960., 540.)));
+        assert!(state.update_gesture(3., 4.));
+
+        assert_eq!(state.level(), 4.);
+        assert_eq!(state.target_level(), 4.);
+    }
+
+    #[test]
+    fn gesture_invalid_scale() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((960., 540.)));
+        for scale in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0., -1.] {
+            assert!(!state.update_gesture(scale, 10.));
+            assert!(state.is_gesturing());
+            assert_eq!(state.level(), 2.);
+            assert_eq!(state.target_level(), 2.);
+        }
+    }
+
+    #[test]
+    fn gesture_anchor_stability() {
+        let view_size = Size::from((1920., 1080.));
+        let output = Rectangle::from_size(view_size);
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        let anchor = Point::from((700., 400.));
+        let display = state.viewport_transform().apply(anchor);
+        state.begin_gesture(anchor);
+
+        // The begin anchor keeps its displayed position while the level
+        // changes, as long as the output bounds allow it.
+        assert!(state.update_gesture(1.5, 10.));
+        assert_eq!(state.level(), 3.);
+        assert_point_eq(state.viewport_transform().apply(anchor), display);
+        assert_viewport_within(state.viewport(), output);
+    }
+
+    #[test]
+    fn gesture_boundary_clamp() {
+        let view_size = Size::from((1920., 1080.));
+        let output = Rectangle::from_size(view_size);
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        // An anchor near the output edge cannot keep its displayed position
+        // at every level; the focal point stays clamped and finite instead.
+        state.begin_gesture(Point::from((10., 10.)));
+        assert!(state.update_gesture(2., 10.));
+
+        assert_finite_point(state.focal());
+        assert_viewport_within(state.viewport(), output);
+    }
+
+    #[test]
+    fn gesture_locked_focal() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        state.set_locked(true);
+        let focal = state.focal();
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(state.update_gesture(1.5, 10.));
+
+        assert_eq!(state.level(), 3.);
+        // Locked: the camera does not move, only the level changes.
+        assert_point_eq(state.focal(), focal);
+    }
+
+    #[test]
+    fn gesture_lock_mid_gesture() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(state.update_gesture(1.5, 10.));
+        let frozen = state.focal();
+
+        // Locking freezes the focal point at its current displayed value.
+        state.set_locked(true);
+        assert!(state.update_gesture(0.75, 10.));
+
+        assert_eq!(state.level(), 1.5);
+        assert_point_eq(state.focal(), frozen);
+    }
+
+    #[test]
+    fn gesture_unlock_mid_gesture() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((700., 400.)));
+        state.set_locked(true);
+        assert!(state.update_gesture(1.5, 10.));
+        let frozen = state.focal();
+
+        // Unlocking does not jump back to the anchor: the fixed focal point
+        // remains until the gesture ends.
+        state.set_locked(false);
+        assert!(state.update_gesture(0.75, 10.));
+
+        assert_point_eq(state.focal(), frozen);
+    }
+
+    #[test]
+    fn gesture_deadzone_suppressed() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(state.update_gesture(1.25, 10.));
+        let focal = state.focal();
+
+        // Pointer motion does not re-pin the gesture anchor.
+        assert!(!state.update_focal_for_cursor(Point::from((1800., 900.)), 0.5));
+        assert_point_eq(state.focal(), focal);
+    }
+
+    #[test]
+    fn gesture_snapshot() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(state.update_gesture(1.5, 10.));
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.level, 3.);
+        assert_eq!(snapshot.target_level, 3.);
+        assert_point_eq(snapshot.focal, state.focal());
+    }
+
+    #[test]
+    fn gesture_end_commits_current() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(state.update_gesture(1.5, 10.));
+        let focal = state.focal();
+
+        state.end_gesture();
+
+        assert!(!state.is_gesturing());
+        assert!(state.transition.is_none());
+        assert_eq!(state.level(), 3.);
+        assert_eq!(state.target_level(), 3.);
+        assert_point_eq(state.focal(), focal);
+    }
+
+    #[test]
+    fn gesture_end_at_one_is_exact() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(state.update_gesture(0.4, 10.));
+        state.end_gesture();
+
+        assert_eq!(state.level(), 1.);
+        assert_eq!(state.target_level(), 1.);
+    }
+
+    #[test]
+    fn gesture_is_not_animating() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(state.update_gesture(1.5, 10.));
+
+        // A gesture queues its own redraws; it must not keep the output
+        // animation flag set between events.
+        assert!(!state.is_animating());
+        assert!(state.is_gesturing());
+    }
+
+    #[test]
+    fn gesture_update_view_size() {
+        let view_size = Size::from((1920., 1080.));
+        let smaller = Size::from((1280., 720.));
+        let output = Rectangle::from_size(smaller);
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(state.update_gesture(1.5, 10.));
+
+        // A resize does not disturb the gesture; the focal point stays
+        // clamped to the new size.
+        state.update_view_size(smaller);
+
+        assert!(state.is_gesturing());
+        assert_finite_point(state.focal());
+        assert_viewport_within(state.viewport(), output);
     }
 
     proptest! {
