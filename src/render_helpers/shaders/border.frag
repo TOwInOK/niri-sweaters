@@ -226,11 +226,14 @@ vec2 knit_filaments(vec2 p, vec2 footprint) {
     float half_length = mix(0.20, 0.46, fract(seed * 7.3));
     float radius = mix(0.055, 0.11, fract(seed * 23.1));
     vec2 aa = max(footprint, vec2(0.001));
-    float ends = 1.0 - smoothstep(half_length - aa.y * 0.5, half_length + aa.y * 0.5, abs(q.y));
-    float fibre = clamp((q.x + radius) / aa.x + 0.5, 0.0, 1.0)
-        - clamp((q.x - radius) / aa.x + 0.5, 0.0, 1.0);
-    float shadow = clamp((q.x + radius - 0.14) / aa.x + 0.5, 0.0, 1.0)
-        - clamp((q.x - radius - 0.14) / aa.x + 0.5, 0.0, 1.0);
+    float inv_aax = 1.0 / aa.x;
+    float half_aay = aa.y * 0.5;
+    float ends = 1.0 - smoothstep(half_length - half_aay, half_length + half_aay, abs(q.y));
+    float fibre = clamp((q.x + radius) * inv_aax + 0.5, 0.0, 1.0)
+        - clamp((q.x - radius) * inv_aax + 0.5, 0.0, 1.0);
+    float q_shadow = q.x - 0.14;
+    float shadow = clamp((q_shadow + radius) * inv_aax + 0.5, 0.0, 1.0)
+        - clamp((q_shadow - radius) * inv_aax + 0.5, 0.0, 1.0);
     return vec2(fibre, shadow) * ends * (1.0 - smoothstep(0.8, 2.0, aa.x));
 }
 
@@ -425,6 +428,8 @@ vec3 knit_border_frame(vec2 point) {
 
 // Motifs select a colour per whole stitch; they do not deform the yarn profile.
 float knit_accent_mix(float column, float row) {
+    if (knit_pattern == 0.0)
+        return 0.0;
     if (knit_pattern == 1.0)
         return mod(column, 3.0) < 1.0 ? 1.0 : 0.0;
     if (knit_pattern == 2.0)
