@@ -319,17 +319,18 @@ float knit_course_coordinate(vec2 point, KnitCourse course) {
 }
 
 // Convert a course coordinate to a centre and width in logical pixels plus a unit
-// tangent. Straight stitches share a side phase; bends follow the reference arc.
+// tangent. Each bend starts its motif at zero; the following edge continues it.
+// stitch_id is (local stitch index, segment): four edge/bend pairs per row.
 void knit_course_stitch(
     float coordinate, KnitCourse course, KnitCourse motif,
-    out vec2 center, out vec2 tangent, out float width, out float column
+    out vec2 center, out vec2 tangent, out float width, out float column, out vec2 stitch_id
 ) {
     float s = mod(coordinate, max(dot(course.edges + course.bends, vec4(1.0)), 1.0));
-    float motif_start = 0.0;
     center = vec2(0.0);
     tangent = vec2(1.0, 0.0);
     width = max(knit_stitch_size, 1.0);
     column = 0.0;
+    stitch_id = vec2(0.0);
     for (int side = 0; side < 4; side++) {
         vec2 start;
         if (side == 0) {
@@ -355,11 +356,11 @@ void knit_course_stitch(
             center = start + tangent * (fraction * length) + vec2(course.depth);
             width = length / edges;
             // One colour column per real stitch; resampling skips or duplicates colours.
-            column = motif_start + floor(s);
+            column = motif.bends[previous] + floor(s);
+            stitch_id = vec2(floor(s), float(side) * 2.0);
             return;
         }
         s -= edges;
-        motif_start += motif.edges[side];
         if (s < bends) {
             float fraction = s / bends;
             float angle = fraction * 1.57079633;
@@ -369,11 +370,11 @@ void knit_course_stitch(
                 + radius * (tangent * sin(angle) - inward * cos(angle)) + vec2(course.depth);
             tangent = tangent * cos(angle) + inward * sin(angle);
             width = 2.0 * radius * sin(0.78539816 / bends);
-            column = floor(motif_start + fraction * motif.bends[side]);
+            column = floor(fraction * motif.bends[side]);
+            stitch_id = vec2(floor(s), float(side) * 2.0 + 1.0);
             return;
         }
         s -= bends;
-        motif_start += motif.bends[side];
     }
 }
 
@@ -474,7 +475,8 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
             vec2 tangent;
             float width;
             float column;
-            knit_course_stitch(index + 0.5, course, motif, center, tangent, width, column);
+            vec2 stitch_id;
+            knit_course_stitch(index + 0.5, course, motif, center, tangent, width, column, stitch_id);
             // Tight inner turns decrease the stitch count, not the yarn diameter.
             width = clamp(width, stitch_width * 0.82, stitch_width * 1.18);
             vec2 inward = vec2(-tangent.y, tangent.x);
@@ -482,8 +484,8 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
             // Rotate into the stitch frame: x follows the course, y points inward.
             // Normalizing by stitch dimensions reuses one yarn profile on every side.
             vec2 point = vec2(dot(delta, tangent) / width, dot(delta, inward) / stitch_width);
-            float stitch_id = mod(index, max(dot(course.edges + course.bends, vec4(1.0)), 1.0));
-            float seed = knit_hash(vec2(stitch_id, row));
+            // Local identities keep yarn variation independent of preceding side lengths.
+            float seed = knit_hash(vec2(stitch_id.x, row * 8.0 + stitch_id.y));
             point += vec2(seed - 0.5, fract(seed * 13.73) - 0.5) * vec2(0.018, 0.024);
             float radius = mix(0.225, 0.268, relief) * mix(0.96, 1.04, seed);
             // Legs reach at most ~0.75/0.85 stitch units. Once some yarn
@@ -616,8 +618,8 @@ vec4 knit_color(vec2 geometry_coords, vec4 base_color) {
     float subpixel_grid = max(niri_scale, 0.001) * 256.0;
     geometry_coords = floor(geometry_coords * subpixel_grid + 0.5) / subpixel_grid;
     float stitch_width = max(knit_stitch_size, 1.0);
-    // Share side phases across rows without forcing a whole number of repeats.
-    // Altering only motif counts would skip or duplicate colours on real stitches.
+    // Reference bend counts align colours across rows and anchor each following side.
+    // Side lengths must not shift an unchanged corner's motif or force whole repeats.
     KnitCourse motif = knit_course(min(knit_border_width() * 0.5, min(geo_size.x, geo_size.y) * 0.49), stitch_width);
     return knit_fabric(geometry_coords, stitch_width, base_color, motif);
 }
