@@ -28,7 +28,13 @@
 //!   - `knit-zigzag`: Zigzag knit pattern (stitch size 8, fuzz 0.4).
 //!   - `knit-zigzag-fuzz`: Zigzag knit pattern with heavy fuzz (stitch size 8, fuzz 0.8).
 //!   - `knit-zigzag-detail`: Large zigzag knit pattern (stitch size 32, fuzz 0.8).
-//!   - `all`: Runs all seven scenarios in order.
+//!   - `knit-gradient-stockinette`: Stockinette knit over an sRGB gradient.
+//!   - `knit-gradient-rib`: Rib knit over an sRGB gradient.
+//!   - `knit-gradient-checker`: Checker knit over an sRGB gradient.
+//!   - `knit-gradient-zigzag`: Zigzag knit over an sRGB gradient.
+//!   - `knit-gradient-diamond`: Diamond knit over an sRGB gradient.
+//!   - `knit-gradient-dots`: Dots knit over an sRGB gradient.
+//!   - `all`: Runs all thirteen scenarios in order.
 //!
 //! - `--workload <name|all>`:
 //!   Workload to execute per scenario. Can be specified multiple times.
