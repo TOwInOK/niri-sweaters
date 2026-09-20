@@ -60,6 +60,14 @@
 //!   Number of unmeasured warmup frames per scenario (default: `30`).
 //!   Cannot be combined with `--smoke`.
 //!
+//! - `--runs <N>`:
+//!   Repetitions of the whole scenario/workload series (default: `1`).
+//!   With N > 1, reported statistics are means of per-run statistics
+//!   (min/median/mean/p95/max), `samples_us` pools all runs, and each result
+//!   carries a `runs` array with per-run raw data. A `Total / Summary` block
+//!   is printed after the table. Can be combined with `--smoke` (each smoke
+//!   run is repeated N times).
+//!
 //! - `--frames <N>`:
 //!   Number of measured frames per scenario (default: `300`).
 //!   Cannot be combined with `--smoke`.
@@ -70,7 +78,7 @@
 //!   Cannot be combined with `--warmup` or `--frames`.
 //!
 //! - `--json`:
-//!   Emits a single JSON document on stdout (`schema_version: 2`).
+//!   Emits a single JSON document on stdout (`schema_version: 3`).
 //!   All informational logs and diagnostic messages are redirected to stderr.
 //!
 //! # Common Examples
@@ -126,14 +134,14 @@
 //!   NIRI_GOLDEN_UPDATE=1 cargo test knit
 //!   ```
 //!
-//! # JSON Output Schema (`schema_version: 2`)
+//! # JSON Output Schema (`schema_version: 3`)
 //!
 //! When `--json` is specified, stdout outputs a single JSON object with the following schema:
 //!
 //! ```json
 //! {
-//!   "schema_version": 2,
-//!   "methodology_version": 2,
+//!   "schema_version": 3,
+//!   "methodology_version": 3,
 //!   "metadata": {
 //!     "gl_vendor": "string | null",
 //!     "gl_renderer": "string | null",
@@ -557,11 +565,15 @@ struct Metadata {
     /// Parameters of the resize workload; `null` when no resize run was
     /// requested.
     resize: Option<ResizeParams>,
+    /// Number of repetitions per scenario/workload pair (`--runs`).
+    runs: usize,
 }
 
 /// Per-scenario outcome for one workload: the parameters actually rendered,
 /// the observed synchronization shape, raw samples and their statistics.
-#[derive(Debug, Serialize)]
+/// With `--runs N > 1`, `statistics` is the mean of per-run statistics and
+/// `runs` carries each run's own samples and stats.
+#[derive(Debug, Clone, Serialize)]
 struct ScenarioResult {
     name: &'static str,
     workload: &'static str,
@@ -572,17 +584,29 @@ struct ScenarioResult {
     parameters: ScenarioParams,
     observed_synchronization: SyncObservations,
     /// Frame wall times in microseconds, converted from `Duration` without
-    /// truncation to whole microseconds. Empty in smoke mode.
+    /// truncation to whole microseconds. Empty in smoke mode. With multiple
+    /// runs this is the pooled concatenation of all runs' samples.
     samples_us: Vec<f64>,
-    /// `null` in smoke mode; never fabricated from zero samples.
+    /// `null` in smoke mode; never fabricated from zero samples. With
+    /// multiple runs this is the mean of per-run statistics.
     statistics: Option<FrameStats>,
     /// Per-stage breakdown for the resize workload; `null` for static.
+    stages: Option<StageMetrics>,
+    /// Per-run raw results; `null` for a single run or smoke mode.
+    runs: Option<Vec<RunResult>>,
+}
+
+/// One repetition's raw outcome inside a multi-run `ScenarioResult`.
+#[derive(Debug, Clone, Serialize)]
+struct RunResult {
+    samples_us: Vec<f64>,
+    statistics: Option<FrameStats>,
     stages: Option<StageMetrics>,
 }
 
 /// Resize workload stage timings: element recomputation and frame rendering
 /// measured separately inside the same frame.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct StageMetrics {
     /// Wall time of `FocusRing::update_render_elements` + element collection
     /// + draw-parameter computation, per frame.
@@ -599,7 +623,7 @@ struct StageMetrics {
 /// A frame without a fence is still synchronized: in the checked Smithay
 /// revision the no-fence path completes through `glFinish` inside
 /// `finish_internal()`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 struct SyncObservations {
     frames_with_fence: usize,
     frames_without_fence: usize,
@@ -608,13 +632,13 @@ struct SyncObservations {
 /// Serializable view of `ScenarioConfig`, built from the same factory output
 /// that drives render element preparation. Colors are unpremultiplied
 /// `[r, g, b, a]` floats in the 0–1 range.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ScenarioParams {
     focus_ring: FocusRingParams,
     knit: Option<KnitParams>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct FocusRingParams {
     off: bool,
     width: f64,
@@ -626,7 +650,7 @@ struct FocusRingParams {
     urgent_gradient: Option<GradientParams>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct GradientParams {
     from: [f32; 4],
     to: [f32; 4],
@@ -636,7 +660,7 @@ struct GradientParams {
     hue_interpolation: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct KnitParams {
     off: bool,
     pattern: &'static str,
@@ -802,6 +826,7 @@ fn collect_metadata(
     workloads: &[Workload],
     warmup: usize,
     frames: usize,
+    runs: usize,
     smoke: bool,
 ) -> Metadata {
     let (checkout_head, checkout_dirty) = runtime_checkout();
@@ -837,6 +862,7 @@ fn collect_metadata(
                 cycle_steps: RESIZE_CYCLE_STEPS,
                 easing: "cosine",
             }),
+        runs,
     }
 }
 
@@ -1108,7 +1134,7 @@ fn save_png(
 }
 
 /// Statistics over measured `frame_wall_time_us` samples, in microseconds.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 struct FrameStats {
     count: usize,
     min_us: f64,
@@ -1148,6 +1174,110 @@ fn frame_stats(samples: &[Duration]) -> anyhow::Result<FrameStats> {
         mean_us,
         p95_us,
         max_us,
+    })
+}
+
+/// Mean of per-run statistics: every field except `count` is averaged across
+/// runs; `count` is the total number of measured frames. Empty input is an
+/// error. This matches the aggregation used for multi-run comparisons.
+fn mean_frame_stats(stats: &[FrameStats]) -> anyhow::Result<FrameStats> {
+    ensure!(!stats.is_empty(), "no run statistics to average");
+    let n = stats.len() as f64;
+    Ok(FrameStats {
+        count: stats.iter().map(|s| s.count).sum(),
+        min_us: stats.iter().map(|s| s.min_us).sum::<f64>() / n,
+        median_us: stats.iter().map(|s| s.median_us).sum::<f64>() / n,
+        mean_us: stats.iter().map(|s| s.mean_us).sum::<f64>() / n,
+        p95_us: stats.iter().map(|s| s.p95_us).sum::<f64>() / n,
+        max_us: stats.iter().map(|s| s.max_us).sum::<f64>() / n,
+    })
+}
+
+/// Aggregates `runs` repetitions of one scenario/workload pair into the
+/// reported `ScenarioResult`: pooled samples, mean-of-run statistics, summed
+/// fence observations and per-run raw data.
+fn aggregate_runs(runs: Vec<ScenarioResult>) -> anyhow::Result<ScenarioResult> {
+    let first = runs
+        .first()
+        .context("aggregate_runs requires at least one run")?;
+
+    let run_stats: Vec<FrameStats> = runs.iter().filter_map(|r| r.statistics).collect();
+    let statistics = if run_stats.is_empty() {
+        None
+    } else {
+        Some(mean_frame_stats(&run_stats)?)
+    };
+
+    let stages = first.stages.as_ref().map(|_| {
+        let upd: Vec<FrameStats> = runs
+            .iter()
+            .filter_map(|r| r.stages.as_ref()?.update_statistics)
+            .collect();
+        let ren: Vec<FrameStats> = runs
+            .iter()
+            .filter_map(|r| r.stages.as_ref()?.render_statistics)
+            .collect();
+        StageMetrics {
+            update_us: runs
+                .iter()
+                .flat_map(|r| {
+                    r.stages
+                        .as_ref()
+                        .map(|s| s.update_us.clone())
+                        .unwrap_or_default()
+                })
+                .collect(),
+            render_us: runs
+                .iter()
+                .flat_map(|r| {
+                    r.stages
+                        .as_ref()
+                        .map(|s| s.render_us.clone())
+                        .unwrap_or_default()
+                })
+                .collect(),
+            update_statistics: if upd.is_empty() {
+                None
+            } else {
+                mean_frame_stats(&upd).ok()
+            },
+            render_statistics: if ren.is_empty() {
+                None
+            } else {
+                mean_frame_stats(&ren).ok()
+            },
+        }
+    });
+
+    let per_run: Vec<RunResult> = runs
+        .iter()
+        .map(|r| RunResult {
+            samples_us: r.samples_us.clone(),
+            statistics: r.statistics,
+            stages: r.stages.clone(),
+        })
+        .collect();
+
+    Ok(ScenarioResult {
+        name: first.name,
+        workload: first.workload,
+        metric: first.metric,
+        scope: first.scope,
+        parameters: first.parameters.clone(),
+        observed_synchronization: SyncObservations {
+            frames_with_fence: runs
+                .iter()
+                .map(|r| r.observed_synchronization.frames_with_fence)
+                .sum(),
+            frames_without_fence: runs
+                .iter()
+                .map(|r| r.observed_synchronization.frames_without_fence)
+                .sum(),
+        },
+        samples_us: runs.iter().flat_map(|r| r.samples_us.clone()).collect(),
+        statistics,
+        stages,
+        runs: (runs.len() > 1).then_some(per_run),
     })
 }
 
@@ -1392,6 +1522,7 @@ fn run_scenario(
             .collect(),
         statistics,
         stages,
+        runs: None,
     })
 }
 
@@ -1401,6 +1532,7 @@ fn run(
     workloads: &[Workload],
     warmup: usize,
     frames: usize,
+    runs: usize,
     smoke: bool,
     dump_dir: Option<&Path>,
     json: bool,
@@ -1419,7 +1551,7 @@ fn run(
         create_texture(renderer, size, TARGET_FORMAT).context("error creating texture")?;
 
     // Metadata is collected once, outside the measured series.
-    let metadata = collect_metadata(renderer, scenarios, workloads, warmup, frames, smoke);
+    let metadata = collect_metadata(renderer, scenarios, workloads, warmup, frames, runs, smoke);
 
     if !json {
         println!(
@@ -1462,6 +1594,9 @@ fn run(
         );
         println!("mode = {}", metadata.mode);
         println!("workloads = {}", metadata.workloads.join(", "));
+        if runs > 1 {
+            println!("runs = {runs} (statistics are means of per-run statistics)");
+        }
         if !smoke {
             println!("metric = frame_wall_time_us");
             println!(
@@ -1474,53 +1609,110 @@ fn run(
         }
     }
 
+    // Outer loop over repetitions: each run re-prepares every scenario so
+    // allocator and driver state see the same cold path each time.
+    let mut all_runs: Vec<Vec<ScenarioResult>> = Vec::with_capacity(runs);
+    for i in 0..runs {
+        if runs > 1 {
+            eprintln!("run {}/{}...", i + 1, runs);
+        }
+        let mut run_results = Vec::with_capacity(scenarios.len() * workloads.len());
+        for &scenario in scenarios {
+            for &workload in workloads {
+                run_results.push(run_scenario(
+                    renderer,
+                    &mut texture,
+                    scenario,
+                    workload,
+                    warmup,
+                    frames,
+                    smoke,
+                    dump_dir,
+                    json,
+                )?);
+            }
+        }
+        all_runs.push(run_results);
+    }
+
+    // Aggregate per scenario/workload pair across runs.
     let mut results = Vec::with_capacity(scenarios.len() * workloads.len());
-    for &scenario in scenarios {
-        for &workload in workloads {
-            let result = run_scenario(
-                renderer,
-                &mut texture,
-                scenario,
-                workload,
-                warmup,
-                frames,
-                smoke,
-                dump_dir,
-                json,
-            )?;
-            if !json {
-                if let Some(stats) = &result.statistics {
-                    println!(
-                        "{} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2}",
-                        result.name,
-                        result.workload,
-                        stats.count,
-                        stats.min_us,
-                        stats.median_us,
-                        stats.mean_us,
-                        stats.p95_us,
-                        stats.max_us,
-                    );
-                    if let Some(stages) = &result.stages {
-                        if let (Some(upd), Some(ren)) =
-                            (&stages.update_statistics, &stages.render_statistics)
-                        {
-                            println!(
-                                "  update: median {:.2} mean {:.2} | render: median {:.2} mean {:.2}",
-                                upd.median_us, upd.mean_us, ren.median_us, ren.mean_us,
-                            );
-                        }
+    for pair_idx in 0..scenarios.len() * workloads.len() {
+        let pair_runs: Vec<ScenarioResult> = all_runs.iter().map(|r| r[pair_idx].clone()).collect();
+        results.push(aggregate_runs(pair_runs)?);
+    }
+
+    if !json {
+        for result in &results {
+            if let Some(stats) = &result.statistics {
+                println!(
+                    "{} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2}",
+                    result.name,
+                    result.workload,
+                    stats.count,
+                    stats.min_us,
+                    stats.median_us,
+                    stats.mean_us,
+                    stats.p95_us,
+                    stats.max_us,
+                );
+                if let Some(stages) = &result.stages {
+                    if let (Some(upd), Some(ren)) =
+                        (&stages.update_statistics, &stages.render_statistics)
+                    {
+                        println!(
+                            "  update: median {:.2} mean {:.2} | render: median {:.2} mean {:.2}",
+                            upd.median_us, upd.mean_us, ren.median_us, ren.mean_us,
+                        );
                     }
                 }
             }
-            results.push(result);
+        }
+
+        // Total / Summary across all scenario/workload pairs, matching the
+        // multi-run comparison format.
+        if results.len() > 1 {
+            let measured: Vec<&ScenarioResult> =
+                results.iter().filter(|r| r.statistics.is_some()).collect();
+            if !measured.is_empty() {
+                let n = measured.len() as f64;
+                let avg = |f: fn(&FrameStats) -> f64| {
+                    measured
+                        .iter()
+                        .map(|r| f(r.statistics.as_ref().unwrap()))
+                        .sum::<f64>()
+                        / n
+                };
+                // Total render time: mean over runs of the sum of
+                // mean_us * count across all pairs in that run.
+                let render_ms: f64 = all_runs
+                    .iter()
+                    .map(|run| {
+                        run.iter()
+                            .filter_map(|r| r.statistics.map(|s| s.mean_us * s.count as f64))
+                            .sum::<f64>()
+                            / 1000.
+                    })
+                    .sum::<f64>()
+                    / all_runs.len() as f64;
+                println!(
+                    "Total / Summary ({} pairs, {} runs, {} frames each):",
+                    measured.len(),
+                    runs,
+                    frames
+                );
+                println!("  min:    {:.1} us", avg(|s| s.min_us));
+                println!("  med:    {:.1} us", avg(|s| s.median_us));
+                println!("  p95:    {:.1} us", avg(|s| s.p95_us));
+                println!("  render: {:.1} ms", render_ms);
+            }
         }
     }
 
     if json {
         let report = Report {
-            schema_version: 2,
-            methodology_version: 2,
+            schema_version: 3,
+            methodology_version: 3,
             metadata,
             results,
         };
@@ -1539,6 +1731,7 @@ fn main() -> anyhow::Result<()> {
     let mut dump_dir = None;
     let mut warmup = 30usize;
     let mut frames = 300usize;
+    let mut runs = 1usize;
     let mut smoke = false;
     let mut json = false;
     let mut warmup_set = false;
@@ -1591,6 +1784,12 @@ fn main() -> anyhow::Result<()> {
                     .with_context(|| format!("invalid --frames value: {value}"))?;
                 frames_set = true;
             }
+            "--runs" => {
+                let value = args.next().context("--runs requires a number")?;
+                runs = value
+                    .parse()
+                    .with_context(|| format!("invalid --runs value: {value}"))?;
+            }
             "--smoke" => smoke = true,
             "--json" => json = true,
             // Cargo passes `--bench` to the benchmark executable when it is
@@ -1611,6 +1810,7 @@ fn main() -> anyhow::Result<()> {
         "--smoke cannot be combined with --warmup or --frames"
     );
     ensure!(frames > 0, "--frames must be greater than 0");
+    ensure!(runs > 0, "--runs must be greater than 0");
     ensure!(
         smoke || !workloads.contains(&Workload::Resize) || frames % RESIZE_CYCLE_STEPS == 0,
         "--frames must be a multiple of {RESIZE_CYCLE_STEPS} (the resize cycle length) \
@@ -1631,6 +1831,7 @@ fn main() -> anyhow::Result<()> {
                 &workloads,
                 warmup,
                 frames,
+                runs,
                 smoke,
                 dump_dir.as_deref(),
                 json,
@@ -1923,6 +2124,89 @@ mod tests {
         assert_close(stats.max_us, 0.5);
     }
 
+    // --- Multi-run aggregation (CPU-only) ---
+
+    #[test]
+    fn mean_frame_stats_averages_fields_and_sums_count() {
+        let a = FrameStats {
+            count: 60,
+            min_us: 100.,
+            median_us: 200.,
+            mean_us: 210.,
+            p95_us: 300.,
+            max_us: 400.,
+        };
+        let b = FrameStats {
+            count: 60,
+            min_us: 110.,
+            median_us: 220.,
+            mean_us: 230.,
+            p95_us: 320.,
+            max_us: 420.,
+        };
+        let m = mean_frame_stats(&[a, b]).unwrap();
+        assert_eq!(m.count, 120);
+        assert_close(m.min_us, 105.);
+        assert_close(m.median_us, 210.);
+        assert_close(m.mean_us, 220.);
+        assert_close(m.p95_us, 310.);
+        assert_close(m.max_us, 410.);
+    }
+
+    #[test]
+    fn mean_frame_stats_empty_is_error() {
+        assert!(mean_frame_stats(&[]).is_err());
+    }
+
+    #[test]
+    fn aggregate_runs_pools_samples_and_averages_stats() {
+        let run_a = test_result(Scenario::Solid, Workload::Static, vec![100., 110.], None);
+        let run_b = test_result(Scenario::Solid, Workload::Static, vec![120., 130.], None);
+        let agg = aggregate_runs(vec![run_a, run_b]).unwrap();
+
+        // Pooled samples preserve all runs' data.
+        assert_eq!(agg.samples_us, vec![100., 110., 120., 130.]);
+        // No statistics because inputs had none.
+        assert!(agg.statistics.is_none());
+        // Per-run data is kept for >1 runs.
+        let runs = agg.runs.expect("multi-run result must carry runs");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].samples_us, vec![100., 110.]);
+        assert_eq!(runs[1].samples_us, vec![120., 130.]);
+        // Fence observations are summed.
+        assert_eq!(agg.observed_synchronization.frames_with_fence, 4);
+    }
+
+    #[test]
+    fn aggregate_runs_single_run_has_no_runs_field() {
+        let run = test_result(Scenario::Solid, Workload::Static, vec![100.], None);
+        let agg = aggregate_runs(vec![run]).unwrap();
+        assert!(agg.runs.is_none());
+    }
+
+    #[test]
+    fn aggregate_runs_averages_statistics_across_runs() {
+        let stats_a = frame_stats(&[us(100.), us(200.)]).unwrap();
+        let stats_b = frame_stats(&[us(300.), us(400.)]).unwrap();
+        let run_a = test_result(
+            Scenario::Solid,
+            Workload::Static,
+            vec![100., 200.],
+            Some(stats_a),
+        );
+        let run_b = test_result(
+            Scenario::Solid,
+            Workload::Static,
+            vec![300., 400.],
+            Some(stats_b),
+        );
+        let agg = aggregate_runs(vec![run_a, run_b]).unwrap();
+        let s = agg.statistics.unwrap();
+        assert_eq!(s.count, 4);
+        assert_close(s.min_us, (100. + 300.) / 2.);
+        assert_close(s.max_us, (200. + 400.) / 2.);
+    }
+
     // --- Report serialization (CPU-only; no EGL, GPU or real git) ---
 
     fn test_metadata() -> Metadata {
@@ -1951,6 +2235,7 @@ mod tests {
             checkout_dirty: Some(false),
             workloads: vec!["static"],
             resize: None,
+            runs: 1,
         }
     }
 
@@ -1985,6 +2270,7 @@ mod tests {
             samples_us: samples,
             statistics: stats,
             stages: None,
+            runs: None,
         }
     }
 
@@ -1994,8 +2280,8 @@ mod tests {
         let durations: Vec<Duration> = samples.iter().map(|&s| us(s)).collect();
         let stats = frame_stats(&durations).unwrap();
         let report = Report {
-            schema_version: 2,
-            methodology_version: 2,
+            schema_version: 3,
+            methodology_version: 3,
             metadata: test_metadata(),
             results: vec![test_result(
                 Scenario::Solid,
@@ -2008,8 +2294,8 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(value["schema_version"], 2);
-        assert_eq!(value["methodology_version"], 2);
+        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["methodology_version"], 3);
         assert_eq!(value["metadata"]["mode"], "benchmark");
         assert_eq!(value["metadata"]["workloads"][0], "static");
         assert_eq!(value["results"].as_array().unwrap().len(), 1);
