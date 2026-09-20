@@ -19,7 +19,7 @@
 
 ## In action
 
-[![A desktop with app-specific knitted borders](docs/assets/knit-desktop.webp)](docs/assets/knit-desktop.webp)
+[![A desktop with app-specific knitted borders](docs/assets/knit-desktop.png)](docs/assets/knit-desktop.png)
 
 [Example configuration](resources/knit-preview.kdl)
 

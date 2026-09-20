@@ -941,7 +941,7 @@ fn compose_hero(renderer: &mut GlesRenderer, output: &Path) -> anyhow::Result<()
             win.loc,
             win.size,
             CornerRadius::from(INNER_RADIUS),
-            2.,
+            0.,
             win.interior,
         ));
         elements.extend(
