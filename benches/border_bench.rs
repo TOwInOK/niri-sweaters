@@ -1,13 +1,176 @@
-//! Renders six focus rings per fixed scenario into an offscreen texture,
-//! measures per-frame wall time and optionally dumps the last frame of each
-//! scenario as `<scenario>.png`.
+//! Benchmark for focus ring and knit/gradient border rendering in a headless GlesRenderer.
 //!
-//! Usage: cargo bench --locked -p niri --bench border_bench -- \
-//!            [--scenario <name|all>] [--dump-dir <directory>]
-//!            [--warmup <N>] [--frames <N>] [--smoke] [--json]
+//! Renders six focus rings (48 draw elements per frame) into an offscreen texture
+//! (3288x1424, Fourcc::Abgr8888), measures per-frame wall time with confirmed GPU
+//! synchronization (EGL fences or `glFinish`), and optionally dumps the last frame
+//! of each scenario as `<scenario>.png`.
 //!
-//! With `--json`, stdout carries exactly one JSON document (schema_version 1)
-//! and all diagnostics go to stderr.
+//! # CLI Usage
+//!
+//! ```text
+//! cargo bench --locked -p niri --bench border_bench [-- <args>]
+//! ```
+//!
+//! Note: Arguments intended for the benchmark binary must follow `--`.
+//!
+//! ## Options
+//!
+//! - `--scenario <name|all>`:
+//!   Scenario to execute. Can be specified multiple times to run a subset.
+//!   Defaults to `all`.
+//!   Available scenarios:
+//!   - `solid`: Solid color border without gradients or knit patterns.
+//!   - `gradient-srgb`: sRGB color space window-relative gradient.
+//!   - `gradient-oklch`: Oklch color space gradient with longer hue interpolation.
+//!   - `knit-stockinette`: Stockinette knit pattern (stitch size 8, fuzz 0.4).
+//!   - `knit-zigzag`: Zigzag knit pattern (stitch size 8, fuzz 0.4).
+//!   - `knit-zigzag-fuzz`: Zigzag knit pattern with heavy fuzz (stitch size 8, fuzz 0.8).
+//!   - `knit-zigzag-detail`: Large zigzag knit pattern (stitch size 32, fuzz 0.8).
+//!   - `all`: Runs all seven scenarios in order.
+//!
+//! - `--dump-dir`:
+//!   Saves the final rendered frame of each scenario as `<scenario>.png`
+//!   into `target/border_bench/`.
+//!
+//! - `--warmup <N>`:
+//!   Number of unmeasured warmup frames per scenario (default: `30`).
+//!   Cannot be combined with `--smoke`.
+//!
+//! - `--frames <N>`:
+//!   Number of measured frames per scenario (default: `300`).
+//!   Cannot be combined with `--smoke`.
+//!
+//! - `--smoke`:
+//!   Runs exactly 1 unmeasured frame per scenario to verify shader compilation,
+//!   geometry bounds, and GPU synchronization without collecting statistics.
+//!   Cannot be combined with `--warmup` or `--frames`.
+//!
+//! - `--json`:
+//!   Emits a single JSON document on stdout (`schema_version: 1`).
+//!   All informational logs and diagnostic messages are redirected to stderr.
+//!
+//! # Common Examples
+//!
+//! - Run the standard benchmark suite:
+//!   ```bash
+//!   cargo bench --locked -p niri --bench border_bench
+//!   ```
+//!
+//! - Fast smoke check (verify rendering pipelines and shaders):
+//!   ```bash
+//!   cargo bench --locked -p niri --bench border_bench -- --smoke
+//!   ```
+//!
+//! - Dump rendered scenario images for visual inspection:
+//!   ```bash
+//!   cargo bench --locked -p niri --bench border_bench -- --smoke --dump-dir
+//!   ```
+//!
+//! - Benchmark a specific scenario with custom frame counts:
+//!   ```bash
+//!   cargo bench --locked -p niri --bench border_bench -- --scenario knit-zigzag --warmup 20 --frames 200
+//!   ```
+//!
+//! - Export machine-readable JSON results to a file:
+//!   ```bash
+//!   cargo bench --locked -p niri --bench border_bench -- --json > report.json
+//!   ```
+//!
+//! # Visual Regression Testing (Golden Images)
+//!
+//! When performing optimizations on borders, shaders, or knit patterns, always verify
+//! that the visual output matches the golden reference images:
+//!
+//! ```bash
+//! cargo test knit
+//! ```
+//!
+//! If your system defaults to a hardware EGL vendor (such as NVIDIA) and the test
+//! requires Mesa's deterministic `llvmpipe` software renderer, force Mesa EGL:
+//! ```bash
+//! __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json cargo test knit
+//! ```
+//!
+//! ## Mismatch Detection and `.new.png` Artifacts
+//!
+//! If any golden test fails (pixel difference exceeds 1%):
+//! - The test writes the newly rendered frame to `src/tests/golden/<test_name>.new.png`.
+//! - Compare `src/tests/golden/<test_name>.png` (golden reference) against
+//!   `src/tests/golden/<test_name>.new.png` to inspect the visual discrepancy.
+//! - If the change is intentional across patterns, regenerate the golden images:
+//!   ```bash
+//!   NIRI_GOLDEN_UPDATE=1 cargo test knit
+//!   ```
+//!
+//! # JSON Output Schema (`schema_version: 1`)
+//!
+//! When `--json` is specified, stdout outputs a single JSON object with the following schema:
+//!
+//! ```json
+//! {
+//!   "schema_version": 1,
+//!   "methodology_version": 1,
+//!   "metric": "frame_wall_time_us",
+//!   "scope": "renderer.render() + clear + element_draws_per_frame RenderElement::draw calls + finish + completion wait",
+//!   "metadata": {
+//!     "gl_vendor": "string | null",
+//!     "gl_renderer": "string | null",
+//!     "gl_version": "string | null",
+//!     "package_version": "string",
+//!     "build_version": "string",
+//!     "debug_assertions": false,
+//!     "target_size": [3288, 1424],
+//!     "target_format": "Abgr8888",
+//!     "window_count": 6,
+//!     "window_content_size": [420.0, 1296.0],
+//!     "border_width": 64.0,
+//!     "outer_corner_radius": 84.0,
+//!     "scale": 1.0,
+//!     "alpha": 1.0,
+//!     "element_draws_per_frame": 48,
+//!     "mode": "benchmark | smoke",
+//!     "warmup_frames": 30,
+//!     "measured_frames": 300,
+//!     "scenarios": ["solid", "gradient-srgb", ...],
+//!     "revision_source": "runtime_checkout",
+//!     "checkout_head": "string | null",
+//!     "checkout_dirty": "boolean | null"
+//!   },
+//!   "results": [
+//!     {
+//!       "name": "solid",
+//!       "parameters": {
+//!         "focus_ring": {
+//!           "off": false,
+//!           "width": 64.0,
+//!           "active_color": [0.66, 0.28, 0.16, 1.0],
+//!           "inactive_color": [0.66, 0.28, 0.16, 1.0],
+//!           "urgent_color": [0.61, 0.0, 0.0, 1.0],
+//!           "active_gradient": null,
+//!           "inactive_gradient": null,
+//!           "urgent_gradient": null
+//!         },
+//!         "knit": null
+//!       },
+//!       "observed_synchronization": {
+//!         "frames_with_fence": 300,
+//!         "frames_without_fence": 0
+//!       },
+//!       "samples_us": [123.45, 118.2, ...],
+//!       "statistics": {
+//!         "count": 300,
+//!         "min_us": 110.5,
+//!         "median_us": 121.3,
+//!         "mean_us": 122.1,
+//!         "p95_us": 135.0,
+//!         "max_us": 150.2
+//!       }
+//!     }
+//!   ]
+//! }
+//! ```
+//!
+//! In `--smoke` mode, `samples_us` is empty `[]` and `statistics` is `null`.
 
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
@@ -945,8 +1108,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             "--dump-dir" => {
-                let dir = args.next().context("--dump-dir requires a directory")?;
-                dump_dir = Some(PathBuf::from(dir));
+                dump_dir = Some(PathBuf::from("target/border_bench"));
             }
             "--warmup" => {
                 let value = args.next().context("--warmup requires a number")?;

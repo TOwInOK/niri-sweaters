@@ -39,11 +39,11 @@ Smoke test — one real frame per scenario, no timing:
 cargo bench --locked -p niri --bench border_bench -- --smoke --scenario all
 ```
 
-Smoke test with PNG dumps of the rendered frames:
+Smoke test with PNG dumps of the rendered frames (saved to `target/border_bench/`):
 
 ```bash
 cargo bench --locked -p niri --bench border_bench -- \
-  --smoke --scenario all --dump-dir /tmp/border_bench_smoke
+  --smoke --scenario all --dump-dir
 ```
 
 A single scenario:
@@ -78,6 +78,25 @@ CPU-only tests (no GPU, no EGL, no git access needed):
 ```bash
 cargo test --locked -p niri --test border_bench_tests
 ```
+
+### Visual regression testing (golden images)
+
+When optimizing knit shaders or border rendering paths, always verify that the rendering results match the golden reference images:
+
+```bash
+cargo test knit
+```
+
+Golden tests require deterministic rendering via Mesa's software `llvmpipe` renderer. If running on a system where hardware EGL is the default:
+
+```bash
+__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json cargo test knit
+```
+
+If a test fails due to pixel differences exceeding 1%:
+- A newly rendered image `<test_name>.new.png` is generated directly in `src/tests/golden/`.
+- Compare `src/tests/golden/<test_name>.png` with `src/tests/golden/<test_name>.new.png` to review the visual discrepancy.
+- If the visual change is intentional, update the reference images with `NIRI_GOLDEN_UPDATE=1 cargo test knit`.
 
 Warmup frames run before the measured series so that one-time costs — shader warm-up, allocator caches, driver state — do not pollute the samples. They are drawn but never timed. Single runs are noisy: repeat the benchmark several times and compare medians, not individual runs.
 
