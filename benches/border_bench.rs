@@ -235,10 +235,16 @@ enum Scenario {
     KnitZigzag,
     KnitZigzagFuzz,
     KnitZigzagDetail,
+    KnitGradientStockinette,
+    KnitGradientRib,
+    KnitGradientChecker,
+    KnitGradientZigzag,
+    KnitGradientDiamond,
+    KnitGradientDots,
 }
 
 impl Scenario {
-    const ALL: [Scenario; 7] = [
+    const ALL: [Scenario; 13] = [
         Scenario::Solid,
         Scenario::GradientSrgb,
         Scenario::GradientOklch,
@@ -246,6 +252,12 @@ impl Scenario {
         Scenario::KnitZigzag,
         Scenario::KnitZigzagFuzz,
         Scenario::KnitZigzagDetail,
+        Scenario::KnitGradientStockinette,
+        Scenario::KnitGradientRib,
+        Scenario::KnitGradientChecker,
+        Scenario::KnitGradientZigzag,
+        Scenario::KnitGradientDiamond,
+        Scenario::KnitGradientDots,
     ];
 
     fn name(self) -> &'static str {
@@ -257,9 +269,14 @@ impl Scenario {
             Scenario::KnitZigzag => "knit-zigzag",
             Scenario::KnitZigzagFuzz => "knit-zigzag-fuzz",
             Scenario::KnitZigzagDetail => "knit-zigzag-detail",
+            Scenario::KnitGradientStockinette => "knit-gradient-stockinette",
+            Scenario::KnitGradientRib => "knit-gradient-rib",
+            Scenario::KnitGradientChecker => "knit-gradient-checker",
+            Scenario::KnitGradientZigzag => "knit-gradient-zigzag",
+            Scenario::KnitGradientDiamond => "knit-gradient-diamond",
+            Scenario::KnitGradientDots => "knit-gradient-dots",
         }
     }
-
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|s| s.name() == name)
     }
@@ -326,6 +343,48 @@ fn scenario_config(scenario: Scenario) -> ScenarioConfig {
         Scenario::KnitZigzag => Some(knit(KnitPattern::Zigzag, 8., 0.4)),
         Scenario::KnitZigzagFuzz => Some(knit(KnitPattern::Zigzag, 8., 0.8)),
         Scenario::KnitZigzagDetail => Some(knit(KnitPattern::Zigzag, 32., 0.8)),
+        Scenario::KnitGradientStockinette => {
+            focus_ring.active_gradient = Some(gradient(
+                GradientColorSpace::Srgb,
+                HueInterpolation::Shorter,
+            ));
+            Some(knit(KnitPattern::Stockinette, 8., 0.4))
+        }
+        Scenario::KnitGradientRib => {
+            focus_ring.active_gradient = Some(gradient(
+                GradientColorSpace::Srgb,
+                HueInterpolation::Shorter,
+            ));
+            Some(knit(KnitPattern::Rib, 8., 0.4))
+        }
+        Scenario::KnitGradientChecker => {
+            focus_ring.active_gradient = Some(gradient(
+                GradientColorSpace::Srgb,
+                HueInterpolation::Shorter,
+            ));
+            Some(knit(KnitPattern::Checker, 8., 0.4))
+        }
+        Scenario::KnitGradientZigzag => {
+            focus_ring.active_gradient = Some(gradient(
+                GradientColorSpace::Srgb,
+                HueInterpolation::Shorter,
+            ));
+            Some(knit(KnitPattern::Zigzag, 8., 0.4))
+        }
+        Scenario::KnitGradientDiamond => {
+            focus_ring.active_gradient = Some(gradient(
+                GradientColorSpace::Srgb,
+                HueInterpolation::Shorter,
+            ));
+            Some(knit(KnitPattern::Diamond, 8., 0.4))
+        }
+        Scenario::KnitGradientDots => {
+            focus_ring.active_gradient = Some(gradient(
+                GradientColorSpace::Srgb,
+                HueInterpolation::Shorter,
+            ));
+            Some(knit(KnitPattern::Dots, 8., 0.4))
+        }
     };
 
     ScenarioConfig { focus_ring, knit }
@@ -1349,6 +1408,29 @@ mod tests {
             assert!(
                 config.focus_ring.active_gradient.is_none(),
                 "{}: knit scenarios must not set a gradient",
+                scenario.name()
+            );
+        }
+    }
+
+    #[test]
+    fn knit_gradient_scenarios_enable_knit_with_gradient() {
+        for scenario in [
+            Scenario::KnitGradientStockinette,
+            Scenario::KnitGradientRib,
+            Scenario::KnitGradientChecker,
+            Scenario::KnitGradientZigzag,
+            Scenario::KnitGradientDiamond,
+            Scenario::KnitGradientDots,
+        ] {
+            let config = config(scenario);
+            let knit = config
+                .knit
+                .unwrap_or_else(|| panic!("{}: knit must be enabled", scenario.name()));
+            assert!(!knit.off, "{}: knit must not be off", scenario.name());
+            assert!(
+                config.focus_ring.active_gradient.is_some(),
+                "{}: knit gradient scenarios must set a gradient",
                 scenario.name()
             );
         }
