@@ -1,6 +1,6 @@
 # Border Benchmark
 
-`border_bench` is a standalone benchmark that renders a fixed border scene into an offscreen texture and measures per-frame wall time. It exists to compare border rendering changes on the same machine, not to produce absolute GPU numbers.
+`border_bench` is a standalone benchmark that renders a border scene into an offscreen texture and measures per-frame wall time. It exists to compare border rendering changes on the same machine, not to produce absolute GPU numbers. Two workloads are available: `static` redraws identical geometry every frame, `resize` recomputes ring geometry each frame along a window resize animation cycle.
 
 Run it from the repository root:
 
@@ -10,7 +10,11 @@ cargo bench --locked -p niri --bench border_bench -- --scenario all
 
 ## What is measured
 
-The metric is `frame_wall_time_us`: the wall-clock time of one complete frame, measured on the CPU around the draw call sequence. Each frame covers:
+The metric is `frame_wall_time_us`: the wall-clock time of one complete frame, measured on the CPU around the draw call sequence. What a frame covers depends on the workload.
+
+### `static` workload (default)
+
+Elements are prepared once; every frame covers:
 
 - `renderer.render()` — starting the frame;
 - `clear` of the whole target;
@@ -18,22 +22,34 @@ The metric is `frame_wall_time_us`: the wall-clock time of one complete frame, m
 - `finish` — submitting the frame;
 - completion wait — blocking until the GPU confirms the frame is done.
 
+### `resize` workload
+
+Each frame advances one step of a 60-step resize cycle: window contents grow from 210×648 to 420×1296 and shrink back (cosine easing, sizes rounded to physical pixels). Every frame covers:
+
+- `FocusRing::update_render_elements` for all 6 rings — recomputing the 8 border segments' geometry;
+- element collection and draw-parameter computation (src, dst, damage);
+- the full render path listed for `static` above.
+
+The resize result additionally carries a `stages` breakdown: `update_us` (element recomputation) and `render_us` (render + clear + finish + wait) measured separately inside the same frame, each with its own statistics. `samples_us`/`statistics` remain the total frame time.
+
+`--frames` must be a multiple of 60 for the resize workload so the series covers whole cycles. `--warmup` counts cycle steps and needs no alignment. In `--smoke` mode the resize workload draws one full cycle (60 frames) unmeasured.
+
 The measurement does **not** include:
 
 - renderer and shader creation;
-- geometry, config and uniform preparation;
+- config preparation;
 - binding the render target for the series;
 - framebuffer readback;
 - PNG encoding;
 - JSON serialization and result output.
 
-This is not pure GPU time, not the cost of a single border segment, and not the time of a full compositor frame. The scene is prepared once and stays static, so the benchmark does not measure resize, config updates, geometry recomputation, CPU precomputation on parameter changes, or full desktop compositing.
+This is not pure GPU time, not the cost of a single border segment, and not the time of a full compositor frame (no layout, client surfaces, window-content resize shader, presentation or frame pacing). The static workload does not measure resize or geometry recomputation; the resize workload measures border update + rendering on a synthetic trajectory, not the real spring animation of niri.
 
 Frame completion is guaranteed by Smithay: `finish()` returns a `SyncPoint` backed by an `EGLFence` when the driver supports it, and falls back to `glFinish` internally otherwise. The report records how many measured frames returned a fence (`frames_with_fence` / `frames_without_fence`); a frame without a fence is still synchronized.
 
 ## How to run
 
-Smoke test — one real frame per scenario, no timing:
+Smoke test — one real frame per scenario (one full resize cycle for the resize workload), no timing:
 
 ```bash
 cargo bench --locked -p niri --bench border_bench -- --smoke --scenario all
@@ -44,6 +60,20 @@ Smoke test with PNG dumps of the rendered frames (saved to `target/border_bench/
 ```bash
 cargo bench --locked -p niri --bench border_bench -- \
   --smoke --scenario all --dump-dir
+```
+
+Both workloads for one scenario:
+
+```bash
+cargo bench --locked -p niri --bench border_bench -- \
+  --workload all --scenario knit-zigzag
+```
+
+Resize workload only (frame count must be a multiple of 60):
+
+```bash
+cargo bench --locked -p niri --bench border_bench -- \
+  --workload resize --scenario knit-zigzag --warmup 60 --frames 300
 ```
 
 A single scenario:
@@ -100,7 +130,9 @@ If a test fails due to pixel differences exceeding 1%:
 
 Warmup frames run before the measured series so that one-time costs — shader warm-up, allocator caches, driver state — do not pollute the samples. They are drawn but never timed. Single runs are noisy: repeat the benchmark several times and compare medians, not individual runs.
 
-Scenario names: `solid`, `gradient-srgb`, `gradient-oklch`, `knit-stockinette`, `knit-zigzag`, `knit-zigzag-fuzz`, `knit-zigzag-detail`.
+Scenario names: `solid`, `gradient-srgb`, `gradient-oklch`, `knit-stockinette`, `knit-zigzag`, `knit-zigzag-fuzz`, `knit-zigzag-detail`, `knit-gradient-stockinette`, `knit-gradient-rib`, `knit-gradient-checker`, `knit-gradient-zigzag`, `knit-gradient-diamond`, `knit-gradient-dots`. The `knit-gradient-*` scenarios draw the knit pattern over an sRGB window-relative gradient.
+
+Workload names: `static`, `resize`. `--workload` may be repeated; `all` runs both workloads per scenario. Results are reported per scenario/workload pair.
 
 ## Reading results
 
@@ -112,7 +144,7 @@ All times are in microseconds. The table and the JSON report show `min`, `median
 
 A short trial run does not prove a small improvement. If the change you are testing is within a few percent, run more frames and repeat the comparison.
 
-The JSON report also records run metadata: GL vendor/renderer/version strings, package and build versions, the `debug_assertions` flag, target size and format, workload parameters, and the runtime checkout state. `GL_RENDERER` is the driver-reported renderer string, not proof of a specific physical GPU. `debug_assertions = false` reports the flag itself, not a specific Cargo profile. `element_draws_per_frame` counts `RenderElement::draw` calls, not low-level GL draw calls.
+The JSON report (`schema_version: 2`) also records run metadata: GL vendor/renderer/version strings, package and build versions, the `debug_assertions` flag, target size and format, workload parameters, executed workloads, resize cycle parameters, and the runtime checkout state. Each result carries its own `workload`, `metric` and `scope` fields; resize results add the `stages` breakdown described above. `GL_RENDERER` is the driver-reported renderer string, not proof of a specific physical GPU. `debug_assertions = false` reports the flag itself, not a specific Cargo profile. `element_draws_per_frame` counts `RenderElement::draw` calls, not low-level GL draw calls.
 
 The checkout fields come from `revision_source = "runtime_checkout"`: they describe the working tree at run time and do not guarantee that the binary was built from that HEAD. The build-time revision is reported separately in `build_version`.
 
