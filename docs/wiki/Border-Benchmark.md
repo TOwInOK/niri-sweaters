@@ -103,6 +103,13 @@ cargo bench --locked -p niri --bench border_bench -- \
   --scenario all --json > /tmp/border_bench.json
 ```
 
+Multiple repetitions with aggregated statistics (`--runs N`): each run re-prepares every scenario, reported statistics are means of per-run statistics, `samples_us` pools all runs, and each result carries a `runs` array with per-run raw data. A `Total / Summary` block (mean min/med/p95 across all pairs plus total render time) is printed after the table:
+
+```bash
+cargo bench --locked -p niri --bench border_bench -- \
+  --scenario all --runs 3
+```
+
 CPU-only tests (no GPU, no EGL, no git access needed):
 
 ```bash
@@ -128,7 +135,7 @@ If a test fails due to pixel differences exceeding 1%:
 - Compare `src/tests/golden/<test_name>.png` with `src/tests/golden/<test_name>.new.png` to review the visual discrepancy.
 - If the visual change is intentional, update the reference images with `NIRI_GOLDEN_UPDATE=1 cargo test knit`.
 
-Warmup frames run before the measured series so that one-time costs — shader warm-up, allocator caches, driver state — do not pollute the samples. They are drawn but never timed. Single runs are noisy: repeat the benchmark several times and compare medians, not individual runs.
+Warmup frames run before the measured series so that one-time costs — shader warm-up, allocator caches, driver state — do not pollute the samples. They are drawn but never timed. Single runs are noisy: use `--runs N` to average statistics across repetitions and compare medians, not individual runs.
 
 Scenario names: `solid`, `gradient-srgb`, `gradient-oklch`, `knit-stockinette`, `knit-zigzag`, `knit-zigzag-fuzz`, `knit-zigzag-detail`, `knit-gradient-stockinette`, `knit-gradient-rib`, `knit-gradient-checker`, `knit-gradient-zigzag`, `knit-gradient-diamond`, `knit-gradient-dots`. The `knit-gradient-*` scenarios draw the knit pattern over an sRGB window-relative gradient.
 
@@ -144,7 +151,7 @@ All times are in microseconds. The table and the JSON report show `min`, `median
 
 A short trial run does not prove a small improvement. If the change you are testing is within a few percent, run more frames and repeat the comparison.
 
-The JSON report (`schema_version: 2`) also records run metadata: GL vendor/renderer/version strings, package and build versions, the `debug_assertions` flag, target size and format, workload parameters, executed workloads, resize cycle parameters, and the runtime checkout state. Each result carries its own `workload`, `metric` and `scope` fields; resize results add the `stages` breakdown described above. `GL_RENDERER` is the driver-reported renderer string, not proof of a specific physical GPU. `debug_assertions = false` reports the flag itself, not a specific Cargo profile. `element_draws_per_frame` counts `RenderElement::draw` calls, not low-level GL draw calls.
+The JSON report (`schema_version: 3`) also records run metadata: GL vendor/renderer/version strings, package and build versions, the `debug_assertions` flag, target size and format, workload parameters, executed workloads, resize cycle parameters, the `runs` repetition count, and the runtime checkout state. Each result carries its own `workload`, `metric` and `scope` fields; resize results add the `stages` breakdown described above; multi-run results add a `runs` array with per-run samples and statistics. `GL_RENDERER` is the driver-reported renderer string, not proof of a specific physical GPU. `debug_assertions = false` reports the flag itself, not a specific Cargo profile. `element_draws_per_frame` counts `RenderElement::draw` calls, not low-level GL draw calls.
 
 The checkout fields come from `revision_source = "runtime_checkout"`: they describe the working tree at run time and do not guarantee that the binary was built from that HEAD. The build-time revision is reported separately in `build_version`.
 
