@@ -44,13 +44,12 @@ impl PickColorGrab {
 
         // The picker is WYSIWYG: sample the pixel actually displayed under the
         // visible cursor, i.e. the canonical content position mapped through
-        // the output's effective presentation transform.
+        // the pointer presentation transform (identity while the session is
+        // locked, the effective zoom transform otherwise).
         let pos_within_output = data
             .niri
-            .layout
-            .monitor_for_output(&output)
-            .map(|mon| mon.effective_zoom_transform().apply(pos_within_output))
-            .unwrap_or(pos_within_output);
+            .pointer_presentation_transform(&output)
+            .apply(pos_within_output);
 
         data.backend
             .with_primary_renderer(|renderer| {

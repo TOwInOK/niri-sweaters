@@ -496,7 +496,7 @@ fn zoom_window_pixels_2x() {
     }
 }
 
-use niri_config::{Action, FloatOrInt, Bind, Key, Modifiers, Trigger, ZoomLevelPreset};
+use niri_config::{Action, FloatOrInt, Bind, Key, Modifiers, MruDirection, Trigger, ZoomLevelPreset};
 use smithay::backend::renderer::element::Kind;
 use smithay::wayland::seat::WaylandFocus;
 use smithay::backend::input::Keycode;
@@ -4497,4 +4497,675 @@ fn zoom_window_cast_pointer_remains_canonical() {
         niri.pointer_pos_for_window_cast(mapped).map(|(pos, _)| pos),
         Some(canonical)
     );
+}
+
+#[test]
+fn zoom_pointer_presentation_transform_unlocked_identity() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+
+    // At level 1 the stored transform keeps the output-center focal but is
+    // semantically the identity; the pointer transform must equal the
+    // effective transform and map every point to itself.
+    assert!(!f.niri().is_locked());
+    let transform = f.niri().pointer_presentation_transform(&output);
+    assert_eq!(transform, effective_zoom_transform(&mut f, &output));
+    assert_eq!(transform.factor(), 1.);
+    assert_eq!(
+        transform.apply(Point::from((150., 100.))),
+        Point::from((150., 100.))
+    );
+}
+
+#[test]
+fn zoom_pointer_presentation_transform_unlocked_zoom() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+
+    set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
+
+    assert_eq!(
+        f.niri().pointer_presentation_transform(&output),
+        effective_zoom_transform(&mut f, &output)
+    );
+}
+
+#[test]
+fn zoom_pointer_presentation_transform_locked_is_identity() {
+    // A real LockState needs live session-lock objects, so the locked branch is
+    // covered through the pure policy helper that every presentation path
+    // delegates to.
+    let effective = crate::utils::view::ViewportTransform::new(Point::from((960., 360.)), 3.);
+    assert_eq!(
+        crate::niri::Niri::pointer_transform_for_presentation(true, effective),
+        crate::utils::view::ViewportTransform::identity()
+    );
+}
+
+#[test]
+fn zoom_pointer_presentation_transform_locked_ignores_zoom_animation() {
+    // A stored zoom transition may keep running under the lock; the pointer
+    // presentation must stay identity at every animated level.
+    for factor in [1.2, 1.8, 2.5] {
+        let effective =
+            crate::utils::view::ViewportTransform::new(Point::from((960., 360.)), factor);
+        assert_eq!(
+            crate::niri::Niri::pointer_transform_for_presentation(true, effective),
+            crate::utils::view::ViewportTransform::identity()
+        );
+    }
+}
+
+#[test]
+fn zoom_pointer_presentation_lock_entry_and_exit() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    let canonical = Point::from((150., 100.));
+    set_zoom(&mut f, &output, 3., Point::from((960., 360.)));
+
+    // Unlocked: the pointer is displayed through the effective zoom transform.
+    let effective = effective_zoom_transform(&mut f, &output);
+    let zoomed_display = f.niri().display_position_for_content(canonical);
+    assert_eq!(zoomed_display, effective.apply(canonical));
+    assert_ne!(zoomed_display, canonical);
+
+    // Locked: the lock surface is the authoritative presentation, so the
+    // pointer is displayed at its canonical position.
+    let locked = crate::niri::Niri::pointer_transform_for_presentation(true, effective);
+    assert_eq!(locked.apply(canonical), canonical);
+
+    // Unlock restores the desktop presentation; the stored zoom never changed.
+    assert_eq!(zoom_transform(&mut f, &output), effective);
+    assert_eq!(
+        f.niri().display_position_for_content(canonical),
+        zoomed_display
+    );
+}
+
+#[test]
+fn zoom_pointer_presentation_transform_overview_partial() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
+    set_overview_progress(&mut f, &output, Some(0.5));
+
+    // Unlocked, the pointer follows the effective (Overview-suppressed) transform.
+    let effective = effective_zoom_transform(&mut f, &output);
+    assert!(effective.factor() < 4.);
+    assert_eq!(f.niri().pointer_presentation_transform(&output), effective);
+}
+
+#[test]
+fn zoom_pointer_presentation_transform_overview_open() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
+    set_overview_open(&mut f, &output, true);
+
+    assert_eq!(
+        f.niri().pointer_presentation_transform(&output),
+        crate::utils::view::ViewportTransform::identity()
+    );
+}
+
+#[test]
+fn zoom_pointer_presentation_transform_uses_owner_output() {
+    let mut f = set_up();
+    f.add_output(2, (1920, 720));
+    let output_a = f.niri_output(1);
+    let output_b = f.niri_output(2);
+
+    set_zoom(&mut f, &output_a, 2., Point::from((960., 360.)));
+    set_zoom(&mut f, &output_b, 4., Point::from((960., 360.)));
+
+    assert_eq!(
+        f.niri().pointer_presentation_transform(&output_a).factor(),
+        2.
+    );
+    assert_eq!(
+        f.niri().pointer_presentation_transform(&output_b).factor(),
+        4.
+    );
+}
+
+#[test]
+fn zoom_session_lock_relative_factor_is_identity() {
+    // Relative pointer deltas are scaled by the pointer presentation factor.
+    // While the session is locked the presentation is the identity, so a
+    // stored zoom level must not scale the deltas.
+    let effective = crate::utils::view::ViewportTransform::new(Point::from((960., 360.)), 4.);
+    let locked = crate::niri::Niri::pointer_transform_for_presentation(true, effective);
+    assert_eq!(locked.factor(), 1.);
+
+    let unlocked = crate::niri::Niri::pointer_transform_for_presentation(false, effective);
+    assert_eq!(unlocked.factor(), 4.);
+}
+
+#[test]
+fn zoom_session_lock_absolute_inverse_is_identity() {
+    // Absolute pointer, touch and output-mapped tablet positions are converted
+    // through the inverse of the pointer presentation transform. While the
+    // session is locked the inverse is the identity: a display position maps
+    // to the raw lock coordinate.
+    let effective = crate::utils::view::ViewportTransform::new(Point::from((960., 360.)), 4.);
+    let locked = crate::niri::Niri::pointer_transform_for_presentation(true, effective);
+
+    let display = Point::from((1234., 567.));
+    assert_eq!(locked.apply_inverse(display), display);
+
+    // Unlocked regression: the inverse still maps through the stored zoom.
+    let unlocked = crate::niri::Niri::pointer_transform_for_presentation(false, effective);
+    assert_eq!(
+        unlocked.apply_inverse(display),
+        Point::from((960. + (1234. - 960.) / 4., 360. + (567. - 360.) / 4.))
+    );
+}
+
+#[test]
+fn zoom_session_lock_presentation_viewport_is_full_output() {
+    // The zoom-lock pointer clamp derives its viewport from the pointer
+    // presentation transform. While the session is locked the transform is
+    // the identity, so the presented viewport is the entire output and the
+    // pointer is not confined to the hidden zoomed viewport.
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
+
+    let view_size = f
+        .niri()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .view_size();
+    let output_rect = Rectangle::from_size(view_size);
+
+    let effective = effective_zoom_transform(&mut f, &output);
+    let locked = crate::niri::Niri::pointer_transform_for_presentation(true, effective);
+    assert_eq!(locked.apply_inverse_rect(output_rect), output_rect);
+
+    // Unlocked regression: the presented viewport stays the zoomed viewport.
+    let unlocked = crate::niri::Niri::pointer_transform_for_presentation(false, effective);
+    let zoomed_viewport = unlocked.apply_inverse_rect(output_rect);
+    assert_eq!(zoomed_viewport.size, view_size.downscale(4.));
+    assert_ne!(zoomed_viewport, output_rect);
+}
+
+#[test]
+fn zoom_session_lock_deadzone_tracking_suspended() {
+    // Pointer motion over the lock surface must not move the hidden zoom
+    // camera: focal tracking is suspended while the session is locked.
+    assert!(!crate::input::zoom_tracking_enabled(true, false));
+    assert!(!crate::input::zoom_tracking_enabled(true, true));
+
+    // Regressions: the Overview still suspends tracking, and normal desktop
+    // tracking stays enabled.
+    assert!(!crate::input::zoom_tracking_enabled(false, true));
+    assert!(crate::input::zoom_tracking_enabled(false, false));
+}
+
+#[test]
+fn zoom_session_lock_warp_policy_uses_presentation() {
+    // Programmatic warps share the zoom-lock clamp and the deadzone tracking
+    // helpers. Under the locked presentation the clamp viewport is the entire
+    // output and tracking is suspended, so a warp neither clamps to the
+    // hidden zoomed viewport nor mutates the stored focal.
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
+
+    let view_size = f
+        .niri()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .view_size();
+    let effective = effective_zoom_transform(&mut f, &output);
+    let locked = crate::niri::Niri::pointer_transform_for_presentation(true, effective);
+    let viewport = locked.apply_inverse_rect(Rectangle::from_size(view_size));
+
+    let candidate = Point::from((1900., 700.));
+    assert!(viewport.contains(candidate));
+    assert!(!crate::input::zoom_tracking_enabled(true, false));
+}
+
+#[test]
+fn zoom_session_lock_multi_output_presentation_is_identity() {
+    // Under a session lock every output presents at the identity regardless of
+    // its stored zoom level.
+    let effective_a = crate::utils::view::ViewportTransform::new(Point::from((960., 360.)), 2.);
+    let effective_b = crate::utils::view::ViewportTransform::new(Point::from((960., 360.)), 4.);
+    assert_eq!(
+        crate::niri::Niri::pointer_transform_for_presentation(true, effective_a),
+        crate::utils::view::ViewportTransform::identity()
+    );
+    assert_eq!(
+        crate::niri::Niri::pointer_transform_for_presentation(true, effective_b),
+        crate::utils::view::ViewportTransform::identity()
+    );
+}
+
+#[test]
+fn zoom_session_lock_unlock_restores_effective_transform() {
+    // Locking and unlocking only switches the presentation policy; the stored
+    // zoom state is untouched.
+    let effective = crate::utils::view::ViewportTransform::new(Point::from((960., 360.)), 4.);
+    assert_eq!(
+        crate::niri::Niri::pointer_transform_for_presentation(true, effective),
+        crate::utils::view::ViewportTransform::identity()
+    );
+    assert_eq!(
+        crate::niri::Niri::pointer_transform_for_presentation(false, effective),
+        effective
+    );
+}
+
+#[test]
+fn zoom_color_picker_uses_presentation_transform() {
+    // The color picker samples the displayed framebuffer at the position the
+    // pointer presentation transform maps to. While the session is locked
+    // that transform is the identity, so the sample lands on the lock
+    // framebuffer pixel under the visible cursor.
+    let local = Point::from((1234., 567.));
+    let effective = crate::utils::view::ViewportTransform::new(Point::from((960., 360.)), 4.);
+
+    let locked = crate::niri::Niri::pointer_transform_for_presentation(true, effective);
+    assert_eq!(locked.apply(local), local);
+
+    // Unlocked regression: sampling still follows the effective zoom.
+    let unlocked = crate::niri::Niri::pointer_transform_for_presentation(false, effective);
+    assert_eq!(unlocked.apply(local), effective.apply(local));
+    assert_ne!(unlocked.apply(local), local);
+}
+
+const MRU_CONFIG: &str = r#"
+animations {
+    off
+}
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+recent-windows {
+    open-delay-ms 0
+}
+
+layout {
+    gaps 0
+}
+"#;
+
+/// Opens the MRU UI on the active output and lets its view settle.
+fn open_mru(f: &mut Fixture) {
+    f.niri_state().do_action(
+        Action::MruAdvance {
+            direction: MruDirection::Forward,
+            scope: None,
+            filter: None,
+        },
+        false,
+    );
+    assert!(f.niri().window_mru_ui.is_open());
+    // With animations off the view position still needs a couple of advance
+    // steps to reach its target.
+    for _ in 0..3 {
+        f.niri().advance_animations();
+    }
+}
+
+const MRU_ANIMATED_CONFIG: &str = r#"
+hotkey-overlay {
+    skip-at-startup
+}
+
+recent-windows {
+    open-delay-ms 0
+}
+
+layout {
+    gaps 0
+}
+"#;
+
+/// The MRU thumbnail under an output-local displayed position.
+fn mru_thumbnail_at(
+    f: &mut Fixture,
+    pos_within_output: Point<f64, Logical>,
+) -> Option<crate::window::mapped::MappedId> {
+    f.niri().window_mru_ui.pointer_motion(pos_within_output)
+}
+
+/// Sends a left mouse button press through the virtual pointer protocol.
+fn click_left(f: &mut Fixture, id: ClientId) {
+    const BTN_LEFT: u32 = 0x110;
+    let client = f.client(id);
+    let manager = client.state.virtual_pointer_manager.as_ref().unwrap();
+    let pointer = manager.create_virtual_pointer(None, &client.qh, ());
+    pointer.button(0, BTN_LEFT, wl_pointer::ButtonState::Pressed.into());
+    f.roundtrip(id);
+}
+
+/// Sends a left mouse button release through the virtual pointer protocol.
+fn release_left(f: &mut Fixture, id: ClientId) {
+    const BTN_LEFT: u32 = 0x110;
+    let client = f.client(id);
+    let manager = client.state.virtual_pointer_manager.as_ref().unwrap();
+    let pointer = manager.create_virtual_pointer(None, &client.qh, ());
+    pointer.button(0, BTN_LEFT, wl_pointer::ButtonState::Released.into());
+    f.roundtrip(id);
+}
+
+/// Finds a displayed position over an MRU thumbnail whose canonical pre-image
+/// under `transform` hit-tests differently, so that a canonical-coordinate
+/// click would produce an observably different result.
+///
+/// Returns `(displayed, thumbnail_id)` or `None` when no distinguishing
+/// position exists.
+fn mru_distinguishing_position(
+    f: &mut Fixture,
+    origin: Point<f64, Logical>,
+    transform: crate::utils::view::ViewportTransform,
+    width: f64,
+) -> Option<(Point<f64, Logical>, crate::window::mapped::MappedId)> {
+    // The clicked thumbnail must not be the already-focused window, otherwise
+    // a buggy canonical-coordinate click that cancels the MRU would leave the
+    // same focus and the test could not tell the two paths apart.
+    let focus_before = f.niri().layout.focus().map(|m| m.id());
+    let mut x = 0.;
+    while x < width {
+        let d = Point::from((x, 360.));
+        if let Some(id_d) = mru_thumbnail_at(f, d) {
+            let c = origin + transform.apply_inverse(d - origin);
+            if mru_thumbnail_at(f, c) != Some(id_d) && Some(id_d) != focus_before {
+                return Some((d, id_d));
+            }
+        }
+        x += 4.;
+    }
+    None
+}
+
+#[test]
+fn zoom_mru_button_1x() {
+    let mut f = set_up_with_config(MRU_CONFIG);
+    let id = f.add_client();
+    open_window(&mut f, id, "one", 100, 100, [255, 0, 0, 255]);
+    open_window(&mut f, id, "two", 100, 100, [0, 255, 0, 255]);
+    open_mru(&mut f);
+    // At 1x canonical == displayed; clicking a thumbnail confirms it. Pick a
+    // thumbnail that is not the already-focused window so that a cancel would
+    // leave observably different focus.
+    let focus_before = f.niri().layout.focus().map(|m| m.id());
+    let mut target = None;
+    let mut x = 0.;
+    while x < 1920. {
+        let d = Point::from((x, 360.));
+        if let Some(id_d) = mru_thumbnail_at(&mut f, d) {
+            if Some(id_d) != focus_before {
+                target = Some((d, id_d));
+                break;
+            }
+        }
+        x += 4.;
+    }
+    let (d, id_d) = target.expect("no MRU thumbnail found");
+
+    f.niri_state().move_cursor(d);
+    click_left(&mut f, id);
+
+    assert!(!f.niri().window_mru_ui.is_open());
+    assert_eq!(f.niri().layout.focus().map(|m| m.id()), Some(id_d));
+}
+
+#[test]
+fn zoom_mru_button_2x() {
+    let mut f = set_up_with_config(MRU_CONFIG);
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    open_window(&mut f, id, "one", 100, 100, [255, 0, 0, 255]);
+    open_window(&mut f, id, "two", 100, 100, [0, 255, 0, 255]);
+    open_mru(&mut f);
+
+    // The canonical pointer C maps to the displayed position D over a
+    // thumbnail. The click must hit-test at D, not at C.
+    let focal = Point::from((480., 360.));
+    let transform = crate::utils::view::ViewportTransform::new(focal, 2.);
+    let (d, id_d) = mru_distinguishing_position(&mut f, Point::from((0., 0.)), transform, 1920.)
+        .expect("no distinguishing MRU position found");
+
+    let c = transform.apply_inverse(d);
+    f.niri_state().move_cursor(c);
+    set_zoom(&mut f, &output, 2., focal);
+    let displayed = f.niri().display_position_for_content(c);
+    assert_abs_diff_eq!(displayed.x, d.x, epsilon = EPS);
+    assert_abs_diff_eq!(displayed.y, d.y, epsilon = EPS);
+
+    click_left(&mut f, id);
+
+    assert!(!f.niri().window_mru_ui.is_open());
+    assert_eq!(f.niri().layout.focus().map(|m| m.id()), Some(id_d));
+}
+
+#[test]
+fn zoom_mru_button_matches_motion_position() {
+    let mut f = set_up_with_config(MRU_CONFIG);
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    open_window(&mut f, id, "one", 100, 100, [255, 0, 0, 255]);
+    open_window(&mut f, id, "two", 100, 100, [0, 255, 0, 255]);
+    open_mru(&mut f);
+
+    let focal = Point::from((480., 360.));
+    let transform = crate::utils::view::ViewportTransform::new(focal, 2.);
+    let (d, id_d) = mru_distinguishing_position(&mut f, Point::from((0., 0.)), transform, 1920.)
+        .expect("no distinguishing MRU position found");
+
+    set_zoom(&mut f, &output, 2., focal);
+
+    // Pointer motion selects the thumbnail under the displayed position.
+    let extent = f.niri().global_space.output_geometry(&output).unwrap().size;
+    move_pointer_absolute(&mut f, id, d, extent, None);
+    assert_eq!(f.niri().window_mru_ui.current_window_id(), Some(id_d));
+
+    // The button must hit-test at the same displayed position.
+    click_left(&mut f, id);
+
+    assert!(!f.niri().window_mru_ui.is_open());
+    assert_eq!(f.niri().layout.focus().map(|m| m.id()), Some(id_d));
+}
+
+#[test]
+fn zoom_mru_button_animated_zoom() {
+    let mut f = set_up_with_config(MRU_ANIMATED_CONFIG);
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    open_window(&mut f, id, "one", 100, 100, [255, 0, 0, 255]);
+    open_window(&mut f, id, "two", 100, 100, [0, 255, 0, 255]);
+
+    f.niri_state().move_cursor(Point::from((960., 360.)));
+    open_mru(&mut f);
+
+    // Start a zoom transition and freeze it mid-flight.
+    freeze_clock(&mut f);
+    f.niri_state()
+        .do_action(Action::SetZoomLevel(FloatOrInt(4.)), false);
+    advance_clock(&mut f, 100);
+    assert!(zoom_is_animating(&mut f, &output));
+
+    // The displayed position is derived from the current transition-aware
+    // presentation transform, not the resting or target level.
+    let origin = f
+        .niri()
+        .global_space
+        .output_geometry(&output)
+        .unwrap()
+        .loc
+        .to_f64();
+    let transform = f.niri().pointer_presentation_transform(&output);
+    assert_ne!(transform.factor(), 1.);
+    assert_ne!(transform.factor(), 4.);
+
+    let (d, id_d) = mru_distinguishing_position(&mut f, origin, transform, 1920.)
+        .expect("no distinguishing MRU position found");
+
+    // Place the canonical pointer so that its displayed position is D. Use
+    // set_location to avoid perturbing the in-flight transition's focal.
+    let c = origin + transform.apply_inverse(d - origin);
+    f.niri().seat.get_pointer().unwrap().set_location(c);
+    let displayed = f.niri().display_position_for_content(c);
+    assert_abs_diff_eq!(displayed.x, d.x, epsilon = EPS);
+    assert_abs_diff_eq!(displayed.y, d.y, epsilon = EPS);
+
+    click_left(&mut f, id);
+
+    assert!(!f.niri().window_mru_ui.is_open());
+    assert_eq!(f.niri().layout.focus().map(|m| m.id()), Some(id_d));
+}
+
+#[test]
+fn zoom_mru_button_overview_uses_effective_transform() {
+    let mut f = set_up_with_config(MRU_CONFIG);
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    open_window(&mut f, id, "one", 100, 100, [255, 0, 0, 255]);
+    open_window(&mut f, id, "two", 100, 100, [0, 255, 0, 255]);
+    open_mru(&mut f);
+
+    // The MRU UI can coexist with the Overview; the pointer presentation
+    // follows the effective (Overview-suppressed) transform.
+    let focal = Point::from((960., 360.));
+    set_zoom(&mut f, &output, 4., focal);
+    set_overview_progress(&mut f, &output, Some(0.5));
+
+    let effective = f.niri().pointer_presentation_transform(&output);
+    assert_abs_diff_eq!(effective.factor(), 2., epsilon = EPS);
+    let stored = zoom_transform(&mut f, &output);
+    assert_abs_diff_eq!(stored.factor(), 4., epsilon = EPS);
+
+    let origin = f
+        .niri()
+        .global_space
+        .output_geometry(&output)
+        .unwrap()
+        .loc
+        .to_f64();
+    let (d, id_d) = mru_distinguishing_position(&mut f, origin, effective, 1920.)
+        .expect("no distinguishing MRU position found");
+
+    let c = origin + effective.apply_inverse(d - origin);
+    f.niri().seat.get_pointer().unwrap().set_location(c);
+    let displayed = f.niri().display_position_for_content(c);
+    assert_abs_diff_eq!(displayed.x, d.x, epsilon = EPS);
+    assert_abs_diff_eq!(displayed.y, d.y, epsilon = EPS);
+
+    click_left(&mut f, id);
+
+    assert!(!f.niri().window_mru_ui.is_open());
+    assert_eq!(f.niri().layout.focus().map(|m| m.id()), Some(id_d));
+}
+
+#[test]
+fn zoom_mru_button_multi_output_displayed_target() {
+    let mut f = set_up_with_config(MRU_CONFIG);
+    f.add_output(2, (1920, 720));
+    let output_a = f.niri_output(1);
+    let output_b = f.niri_output(2);
+    let id = f.add_client();
+    open_window(&mut f, id, "one", 100, 100, [255, 0, 0, 255]);
+    open_window(&mut f, id, "two", 100, 100, [0, 255, 0, 255]);
+
+    // The MRU opens on the active output B.
+    f.niri().layout.focus_output(&output_b);
+    open_mru(&mut f);
+    assert_eq!(f.niri().window_mru_ui.output(), Some(&output_b));
+
+    // Zoom output A so that a canonical position on A displays on B.
+    let origin_a = f
+        .niri()
+        .global_space
+        .output_geometry(&output_a)
+        .unwrap()
+        .loc
+        .to_f64();
+    let origin_b = f
+        .niri()
+        .global_space
+        .output_geometry(&output_b)
+        .unwrap()
+        .loc
+        .to_f64();
+    let focal_a = Point::from((1200., 360.));
+    set_zoom(&mut f, &output_a, 4., focal_a);
+
+    // Find a thumbnail on B whose canonical pre-image stays on A.
+    let transform = crate::utils::view::ViewportTransform::new(focal_a, 4.);
+    let mut target = None;
+    let mut x = 0.;
+    while x < 1920. {
+        let d_local = Point::from((x, 360.));
+        if let Some(id_d) = mru_thumbnail_at(&mut f, d_local) {
+            let d_global = origin_b + d_local;
+            let c = origin_a + transform.apply_inverse(d_global - origin_a);
+            if let Some((owner, _)) = f.niri().output_under(c) {
+                if owner == &output_a {
+                    target = Some((d_global, c, id_d));
+                    break;
+                }
+            }
+        }
+        x += 4.;
+    }
+    let (d_global, c, id_d) = target.expect("no cross-output MRU position found");
+
+    f.niri().seat.get_pointer().unwrap().set_location(c);
+    let displayed = f.niri().display_position_for_content(c);
+    assert_abs_diff_eq!(displayed.x, d_global.x, epsilon = EPS);
+    assert_abs_diff_eq!(displayed.y, d_global.y, epsilon = EPS);
+
+    click_left(&mut f, id);
+
+    assert!(!f.niri().window_mru_ui.is_open());
+    assert_eq!(f.niri().layout.focus().map(|m| m.id()), Some(id_d));
+}
+
+#[test]
+fn zoom_mru_button_displayed_off_output_cancels() {
+    let mut f = set_up_with_config(MRU_CONFIG);
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    open_window(&mut f, id, "one", 100, 100, [255, 0, 0, 255]);
+    open_window(&mut f, id, "two", 100, 100, [0, 255, 0, 255]);
+    open_mru(&mut f);
+
+    let focus_before = f.niri().layout.focus().map(|m| m.id());
+
+    // A canonical position near the right edge displays past the output at
+    // 2x. The click must cancel the MRU, not panic or hit-test at C.
+    let focal = Point::from((960., 360.));
+    set_zoom(&mut f, &output, 2., focal);
+    let c = Point::from((1900., 360.));
+    let d = f.niri().display_position_for_content(c);
+    assert!(d.x > 1920.);
+    assert!(f.niri().output_under(d).is_none());
+
+    f.niri().seat.get_pointer().unwrap().set_location(c);
+    click_left(&mut f, id);
+
+    assert!(!f.niri().window_mru_ui.is_open());
+    assert_eq!(f.niri().layout.focus().map(|m| m.id()), focus_before);
+
+    release_left(&mut f, id);
+    // A canonical position off every output displays unchanged, also off
+    // every output. The click must cancel the MRU rather than unwrap-panic.
+    open_mru(&mut f);
+    let c = Point::from((2000., 360.));
+    let d = f.niri().display_position_for_content(c);
+    assert_eq!(d, c);
+    assert!(f.niri().output_under(d).is_none());
+
+    f.niri().seat.get_pointer().unwrap().set_location(c);
+    click_left(&mut f, id);
+
+    assert!(!f.niri().window_mru_ui.is_open());
+    assert_eq!(f.niri().layout.focus().map(|m| m.id()), focus_before);
 }

@@ -3237,12 +3237,48 @@ impl Niri {
         Some((output, pos_within_output))
     }
 
+    /// The transform describing the pointer/interactive desktop presentation
+    /// on `output`.
+    ///
+    /// It is used by both pointer rendering and input coordinate conversion,
+    /// so the visible pointer and the input mapping always agree.
+    ///
+    /// While the session is locked the lock surface is the authoritative
+    /// presentation: it is drawn in raw screen space, so the pointer must be
+    /// presented at its canonical position with the identity transform.
+    /// Otherwise the pointer follows the desktop zoom presentation, i.e. the
+    /// monitor's effective zoom transform (which already accounts for the
+    /// Overview). When the output has no monitor the transform is identity.
+    pub(crate) fn pointer_presentation_transform(&self, output: &Output) -> ViewportTransform {
+        let effective = self
+            .layout
+            .monitor_for_output(output)
+            .map(|mon| mon.effective_zoom_transform())
+            .unwrap_or_else(ViewportTransform::identity);
+        Self::pointer_transform_for_presentation(self.is_locked(), effective)
+    }
+
+    /// Pointer presentation policy: identity while the session is locked,
+    /// otherwise the effective desktop zoom transform.
+    pub(crate) fn pointer_transform_for_presentation(
+        locked: bool,
+        effective: ViewportTransform,
+    ) -> ViewportTransform {
+        if locked {
+            ViewportTransform::identity()
+        } else {
+            effective
+        }
+    }
+
     /// Maps a canonical global content position to its current global displayed
-    /// desktop position.
+    /// position.
     ///
     /// The transform is taken from the output that owns the canonical position,
-    /// never from a candidate output the displayed position may overlap. When
-    /// the position is not on any output it is returned unchanged.
+    /// never from a candidate output the displayed position may overlap, and
+    /// follows the pointer presentation policy: identity while the session is
+    /// locked, the effective desktop zoom transform otherwise. When the
+    /// position is not on any output it is returned unchanged.
     pub(crate) fn display_position_for_content(
         &self,
         content: Point<f64, Logical>,
@@ -3252,10 +3288,8 @@ impl Niri {
         };
         let origin = self.global_space.output_geometry(output).unwrap().loc;
         let display_local = self
-            .layout
-            .monitor_for_output(output)
-            .map(|mon| mon.effective_zoom_transform().apply(content_local))
-            .unwrap_or(content_local);
+            .pointer_presentation_transform(output)
+            .apply(content_local);
         origin.to_f64() + display_local
     }
 
@@ -3270,11 +3304,7 @@ impl Niri {
     fn is_inside_hot_corner(&self, output: &Output, pos: Point<f64, Logical>) -> bool {
         // Hot corners are a display-space concept: the corner is where the pointer is
         // displayed, not where it is in content coordinates.
-        let pos = self
-            .layout
-            .monitor_for_output(output)
-            .map(|mon| mon.effective_zoom_transform().apply(pos))
-            .unwrap_or(pos);
+        let pos = self.pointer_presentation_transform(output).apply(pos);
 
         let config = self.config.borrow();
         let hot_corners = output
@@ -3963,10 +3993,11 @@ impl Niri {
         self.render_pointer_with_transform(renderer, output, ViewportTransform::identity(), push);
     }
 
-    /// Renders the pointer with the desktop zoom transform applied to its position.
+    /// Renders the pointer with a presentation transform applied to its position.
     ///
-    /// `transform` maps output-local content coordinates to displayed coordinates. The cursor
-    /// sprite itself is not scaled; only its position is transformed.
+    /// `transform` maps output-local content coordinates to displayed coordinates; callers
+    /// pass [`Self::pointer_presentation_transform`]. The cursor sprite itself is not
+    /// scaled; only its position is transformed.
     pub fn render_pointer_with_transform<R: NiriRenderer>(
         &self,
         renderer: &mut R,
@@ -3984,7 +4015,7 @@ impl Niri {
         let pointer_pos = pointer_pos - output_pos.to_f64();
 
         // The canonical pointer position is in content coordinates; the visual hotspot is the
-        // displayed position under the desktop zoom transform.
+        // displayed position under the pointer presentation transform.
         let pointer_pos = transform.apply(pointer_pos);
 
         self.render_pointer_at_position(renderer, output, pointer_pos, push);
@@ -4538,19 +4569,23 @@ impl Niri {
             push
         };
 
-        // Desktop zoom transform for the pointer and the desktop scene below.
-        // At effective level 1 it is the identity.
+        // Desktop zoom transform for the desktop scene below. At effective level 1 it is
+        // the identity.
         let desktop_zoom = self
             .layout
             .monitor_for_output(output)
             .map(|mon| mon.effective_zoom_transform())
             .unwrap_or_else(ViewportTransform::identity);
 
-        // The pointer goes on the top.
+        // The pointer goes on the top. Its presentation follows the pointer transform:
         if include_pointer && self.pointer_visibility.is_visible() {
-            self.render_pointer_with_transform(ctx.renderer, output, desktop_zoom, &mut |elem| {
-                push(elem.into())
-            });
+            let pointer_transform = self.pointer_presentation_transform(output);
+            self.render_pointer_with_transform(
+                ctx.renderer,
+                output,
+                pointer_transform,
+                &mut |elem| push(elem.into()),
+            );
         }
 
         // Next, the screen transition texture.
@@ -6281,10 +6316,7 @@ impl Niri {
                     self.render_pointer_with_transform(
                         renderer,
                         &output,
-                        self.layout
-                            .monitor_for_output(&output)
-                            .map(|mon| mon.effective_zoom_transform())
-                            .unwrap_or_else(ViewportTransform::identity),
+                        self.pointer_presentation_transform(&output),
                         &mut |elem| pointer.push(elem),
                     );
                 }

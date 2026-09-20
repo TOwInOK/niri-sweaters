@@ -2601,15 +2601,15 @@ impl State {
         let pointer = self.niri.seat.get_pointer().unwrap();
         let pos = pointer.current_location();
 
-        // Relative motion is scaled by the effective zoom presentation of the output under the
-        // current pointer position.
+        // Relative motion is scaled by the pointer presentation transform of the output under
+        // the current pointer position. This matches the visible pointer presentation: the
+        // effective desktop zoom normally, the identity while the session is locked.
         let zoom_level = self
             .niri
             .global_space
             .output_under(pos)
             .next()
-            .and_then(|output| self.niri.layout.monitor_for_output(output))
-            .map(|mon| mon.effective_zoom_transform().factor())
+            .map(|output| self.niri.pointer_presentation_transform(output).factor())
             .unwrap_or(1.);
         let delta = event.delta().downscale(zoom_level);
         let delta_unaccel = event.delta_unaccel().downscale(zoom_level);
@@ -2991,15 +2991,18 @@ impl State {
             if let Some(mru_output) = self.niri.window_mru_ui.output() {
                 is_mru_open = true;
                 if let Some(MouseButton::Left) = button {
-                    let location = pointer.current_location();
-                    let (output, pos_within_output) = self.niri.output_under(location).unwrap();
-                    if mru_output == output {
-                        let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
-                        if id.is_some() {
-                            self.confirm_mru();
-                        } else {
-                            self.niri.cancel_mru();
-                        }
+                    // The MRU UI works in displayed coordinates, same as
+                    // pointer motion and tablet/touch pointer_motion.
+                    let pos = pointer.current_location();
+                    let display_pos = self.niri.display_position_for_content(pos);
+
+                    let id = self
+                        .niri
+                        .output_under(display_pos)
+                        .and_then(|(output, pos)| (mru_output == output).then_some(pos))
+                        .and_then(|pos| self.niri.window_mru_ui.pointer_motion(pos));
+                    if id.is_some() {
+                        self.confirm_mru();
                     } else {
                         self.niri.cancel_mru();
                     }
@@ -4530,12 +4533,7 @@ impl State {
                     .unwrap()
                     .loc
                     .to_f64();
-                let transform = self
-                    .niri
-                    .layout
-                    .monitor_for_output(output)
-                    .map(|mon| mon.effective_zoom_transform())
-                    .unwrap_or_else(ViewportTransform::identity);
+                let transform = self.niri.pointer_presentation_transform(output);
                 Self::display_to_content(origin, display, transform)
             })
             .unwrap_or(display);
@@ -4567,6 +4565,13 @@ impl State {
         output_origin + transform.apply_inverse(display - output_origin)
     }
 
+    /// Clamps the pointer to the viewport currently presented on `output` while
+    /// the desktop zoom is locked.
+    ///
+    /// The viewport is derived from the pointer presentation transform, so it
+    /// matches what is actually displayed: the zoomed viewport normally, the
+    /// effective (Overview-suppressed) viewport during the Overview, and the
+    /// entire output while the session is locked.
     fn clamp_pointer_to_locked_viewport(
         &self,
         pos: Point<f64, Logical>,
@@ -4575,14 +4580,13 @@ impl State {
         let Some(mon) = self.niri.layout.monitor_for_output(output) else {
             return pos;
         };
-        let zoom = mon.zoom();
-        let effective = mon.effective_zoom_transform();
-        if !zoom.is_locked() || effective.factor() <= 1. {
+        let transform = self.niri.pointer_presentation_transform(output);
+        if !mon.zoom().is_locked() || transform.factor() <= 1. {
             return pos;
         }
 
         let geom = self.niri.global_space.output_geometry(output).unwrap();
-        let viewport = mon.effective_viewport();
+        let viewport = transform.apply_inverse_rect(Rectangle::from_size(mon.view_size()));
         let origin = geom.loc.to_f64();
         let local = pos - origin;
         origin
@@ -4613,9 +4617,10 @@ impl State {
             (output.clone(), cursor_local)
         };
 
+        let session_locked = self.niri.is_locked();
         let deadzone_size = self.niri.config.borrow().zoom.deadzone_size;
         if let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) {
-            if mon.overview_active() {
+            if !zoom_tracking_enabled(session_locked, mon.overview_active()) {
                 return;
             }
             if mon
@@ -5090,6 +5095,15 @@ impl State {
 
         grab.is::<PickWindowGrab>() || grab.is::<PickColorGrab>() || Self::is_dnd_grab(grab)
     }
+}
+
+/// Whether cursor movement may drive the desktop zoom focal point.
+///
+/// Tracking is suspended while the session is locked (the lock surface is a
+/// replacement presentation, so pointer motion must not move the hidden zoom
+/// camera) and while the Overview is active.
+pub(crate) fn zoom_tracking_enabled(session_locked: bool, overview_active: bool) -> bool {
+    !session_locked && !overview_active
 }
 
 /// Check whether the key should be intercepted and mark intercepted
