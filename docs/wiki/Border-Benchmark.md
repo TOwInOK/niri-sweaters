@@ -182,3 +182,40 @@ Conditions for a fair comparison:
 If the old commit has no `border_bench` benchmark, port only the harness — do not backport production changes. If the old API is incompatible with the current harness, do not patch production code just to make the comparison work; record the required harness adaptation separately and verify it.
 
 The older C benchmark used a different rendering path and an RGB565 target. Its absolute numbers are not acceptance criteria for the current Abgr8888 harness.
+
+## Commit message format for performance changes
+
+Commits that change border rendering performance should carry the benchmark
+numbers in the message, in the established format:
+
+```text
+Benchmark comparison against <base-ref> (<N> runs, <F> frames each, before -> after):
+
+<scenario>:
+  min:    <before> -> <after> us (<signed %>)
+  med:    <before> -> <after> us (<signed %>)
+  p95:    <before> -> <after> us (<signed %>)
+
+...one block per scenario...
+
+Total / Summary (<M> pairs vs <base-ref>, before -> after):
+  min:    <before> -> <after> us (<signed %>)
+  med:    <before> -> <after> us (<signed %>)
+  p95:    <before> -> <after> us (<signed %>)
+  render: <before> -> <after> ms (<signed %>)
+
+Golden tests: <passed>/<total> passed (<regressions> regressions)
+```
+
+Rules:
+
+- numbers come from `--runs N` aggregated output (mean of per-run statistics),
+  not from single runs;
+- `render` is the mean total render time across all scenario/workload pairs
+  in milliseconds;
+- percentages are signed (`+`/`-`), computed as `(after - before) / before`;
+- new scenarios without a baseline are listed separately with absolute
+  numbers, no `before -> after`;
+- resize-workload results may add `update med` / `render med` stage lines
+  under each scenario;
+- golden test status closes the report.
