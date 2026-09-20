@@ -446,10 +446,17 @@ float knit_border_width() {
     return max(border_width - 0.5, 0.0);
 }
 
+const vec3 knit_light = normalize(vec3(-0.45, -0.65, 1.1));
+
 vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, KnitCourse motif) {
     float band_width = knit_border_width();
     float relief = clamp(knit_relief, 0.0, 1.0);
     float fuzz = clamp(knit_fuzz, 0.0, 1.0);
+    float pile = 0.18 + fuzz * 0.82;
+    float edge_depth = min(stitch_width * mix(0.10, 0.20, pile), band_width * 0.20);
+    float edge_aa = min(1.0 / max(niri_scale, 0.001), max(band_width * 0.25, 0.001));
+    float resolved = smoothstep(1.0, 3.5, stitch_width * niri_scale);
+    vec4 premul_accent = premul_rect(knit_accent_color);
     float stitch_height = stitch_width * 0.94;
     vec3 frame = knit_border_frame(geometry_coords);
     // Broad curvature shades the whole band like a soft rounded strip. The
@@ -548,7 +555,6 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
     vec3 nap = nap_filter > 0.0
         ? knit_noise(vec2(u * 13.0 - t * 4.0, t * 9.0) + yarn_seed * vec2(11.0, 53.0))
         : vec3(0.0);
-    float pile = 0.18 + fuzz * 0.82;
     // knit_filaments fades out by aa.x = 2.0; skip the call entirely past it.
     vec2 filaments = 13.6 * pixel < 2.0
         ? knit_filaments(vec2(u * 3.4 + t * 1.6 + bundles.x * 0.3, t * 5.0)
@@ -570,9 +576,9 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
     ));
     // The normal is now in border coordinates, so one upper-left light stays
     // consistent as stitches rotate around the corners.
-    vec3 light = normalize(vec3(-0.45, -0.65, 1.1));
-    float diffuse = max((dot(normal, light) + 0.20) / 1.20, 0.0);
-    float shoulder = (1.0 - normal.z) * (1.0 - normal.z);
+    float diffuse = max((dot(normal, knit_light) + 0.20) * (1.0 / 1.20), 0.0);
+    float one_minus_nz = 1.0 - normal.z;
+    float shoulder = one_minus_nz * one_minus_nz;
     float lighting = 0.48 + diffuse * 0.52 + shoulder * (0.10 + pile * 0.05);
     float tuck = mix(0.74, 1.0, smoothstep(0.02, 0.34, t));
     float edge_occlusion = mix(0.86, 1.0, smoothstep(0.0, 0.13, strand.y));
@@ -582,7 +588,7 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
             + (filaments.x - filaments.y) * (0.27 + pile * 0.16));
     float shade = mix(1.0, lighting * tuck * edge_occlusion, relief) * tone;
     float accent_mix = knit_accent_mix(yarn_column, yarn_row);
-    vec4 yarn = mix(base_color, premul_rect(knit_accent_color), accent_mix);
+    vec4 yarn = mix(base_color, premul_accent, accent_mix);
     // Spaces below the raised yarn contain shaded fabric, not transparent holes.
     // Coverage blends that backing with the visible strand; edge cuts come later.
     vec4 ground = mix(base_color, yarn, 0.75);
@@ -600,25 +606,25 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
     fibre_color.rgb = min(fibre_color.rgb * (1.06 + shoulder * 0.10), vec3(fibre_color.a));
     fabric = mix(fabric, fibre_color, halo);
 
-    // Subpixel stitches converge to the material average instead of a moire grid.
-    float resolved = smoothstep(1.0, 3.5, stitch_width * niri_scale);
-    vec4 average = mix(base_color, premul_rect(knit_accent_color),
-        knit_accent_mix(yarn_column, base_row));
-    average.rgb *= mix(0.85, 0.72, relief);
-
     // Cut the outer edge and expose backing under the inner yarn edge.
     // Noise follows the visible yarn, not screen pixels; unresolved yarn uses its mean.
     // Limit both the notches and their AA to preserve the centre of thin bands.
-    float edge_depth = min(stitch_width * mix(0.10, 0.20, pile), band_width * 0.20);
     float edge_noise = mix(0.5, bundles.x, resolved);
     float edge_inset = edge_depth * mix(0.2, 1.0, edge_noise);
-    float edge_aa = min(1.0 / max(niri_scale, 0.001), max(band_width * 0.25, 0.001));
     float outer_coverage = smoothstep(edge_inset, edge_inset + edge_aa, frame.z);
     float inner_coverage = smoothstep(edge_inset, edge_inset + edge_aa, band_width - frame.z);
     // The backing reaches the window; inner notches change material, not coverage.
     fabric = mix(ground, fabric, inner_coverage);
+
+    // Subpixel stitches converge to the material average instead of a moire grid.
     // Filter inner detail with the yarn, but keep the outer cuts at every LOD.
-    return mix(average, fabric, resolved) * outer_coverage;
+    if (resolved < 1.0) {
+        vec4 average = mix(base_color, premul_accent,
+            knit_accent_mix(yarn_column, base_row));
+        average.rgb *= mix(0.85, 0.72, relief);
+        fabric = mix(average, fabric, resolved);
+    }
+    return fabric * outer_coverage;
 }
 
 vec4 knit_color(vec2 geometry_coords, vec4 base_color) {
