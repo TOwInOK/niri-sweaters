@@ -319,7 +319,7 @@ float knit_course_coordinate(vec2 point, KnitCourse course) {
 }
 
 // Convert a course coordinate to a centre and width in logical pixels plus a unit
-// tangent. column maps it to the shared motif, not the course's own stitch count.
+// tangent. Straight stitches share a side phase; bends follow the reference arc.
 void knit_course_stitch(
     float coordinate, KnitCourse course, KnitCourse motif,
     out vec2 center, out vec2 tangent, out float width, out float column
@@ -354,7 +354,8 @@ void knit_course_stitch(
             float fraction = s / edges;
             center = start + tangent * (fraction * length) + vec2(course.depth);
             width = length / edges;
-            column = floor(motif_start + fraction * motif.edges[side]);
+            // One colour column per real stitch; resampling skips or duplicates colours.
+            column = motif_start + floor(s);
             return;
         }
         s -= edges;
@@ -615,24 +616,9 @@ vec4 knit_color(vec2 geometry_coords, vec4 base_color) {
     float subpixel_grid = max(niri_scale, 0.001) * 256.0;
     geometry_coords = floor(geometry_coords * subpixel_grid + 0.5) / subpixel_grid;
     float stitch_width = max(knit_stitch_size, 1.0);
-    // A mid-band reference course supplies colour columns for every row. Its
-    // count is adjusted below towards whole motif repeats to hide the closing seam.
+    // Share side phases across rows without forcing a whole number of repeats.
+    // Altering only motif counts would skip or duplicate colours on real stitches.
     KnitCourse motif = knit_course(min(knit_border_width() * 0.5, min(geo_size.x, geo_size.y) * 0.49), stitch_width);
-    float period = 1.0;
-    if (knit_pattern == 1.0)
-        period = 3.0;
-    else if (knit_pattern == 2.0)
-        period = 4.0;
-    else if (knit_pattern == 3.0 || knit_pattern == 4.0)
-        period = 8.0;
-    else if (knit_pattern == 5.0)
-        period = 6.0;
-    float count = dot(motif.edges + motif.bends, vec4(1.0));
-    float closure = floor(count / period + 0.5) * period - count;
-    if (motif.edges.x >= motif.edges.y)
-        motif.edges.x = max(1.0, motif.edges.x + closure);
-    else
-        motif.edges.y = max(1.0, motif.edges.y + closure);
     return knit_fabric(geometry_coords, stitch_width, base_color, motif);
 }
 void main() {
