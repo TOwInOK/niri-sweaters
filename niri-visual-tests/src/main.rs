@@ -23,13 +23,13 @@ use crate::cases::gradient_srgb::GradientSrgb;
 use crate::cases::gradient_srgb_alpha::GradientSrgbAlpha;
 use crate::cases::gradient_srgblinear::GradientSrgbLinear;
 use crate::cases::gradient_srgblinear_alpha::GradientSrgbLinearAlpha;
-use crate::cases::knit::Knit;
 use crate::cases::layout::Layout;
 use crate::cases::tile::Tile;
 use crate::cases::window::Window;
 use crate::cases::TestCase;
 
 mod cases;
+mod knit_controls;
 mod smithay_view;
 mod test_window;
 
@@ -117,9 +117,8 @@ fn build_ui(app: &adw::Application) {
         "Layout - Open To The Left - Big",
     );
 
-    s.add(Knit::patterns, "Knit - Patterns");
-    s.add(Knit::rounded_corners, "Knit - Rounded Corners");
-    s.add(Knit::resize_rounded, "Knit - Resize Rounded");
+    let knit = knit_controls::build(&anim_adjustment);
+    stack.add_titled(&knit, Some("knit"), "Knit Playground");
 
     s.add(GradientAngle::new, "Gradient - Angle");
     s.add(GradientArea::new, "Gradient - Area");

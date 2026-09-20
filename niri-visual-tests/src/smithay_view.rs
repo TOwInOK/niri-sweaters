@@ -33,7 +33,7 @@ mod imp {
 
     #[derive(Default)]
     pub struct SmithayView {
-        gl_area: gtk::GLArea,
+        pub gl_area: gtk::GLArea,
         size: Cell<(i32, i32)>,
         renderer: RefCell<Option<Result<RendererData, ()>>>,
         pub make_test_case: OnceCell<DynMakeTestCase>,
@@ -87,7 +87,7 @@ mod imp {
 
                 if let Some(case) = &mut *imp.test_case.borrow_mut() {
                     if case.are_animations_ongoing() {
-                        imp.gl_area.queue_draw();
+                        imp.gl_area.queue_render();
                     }
                 }
 
@@ -267,6 +267,10 @@ glib::wrapper! {
 }
 
 impl SmithayView {
+    pub fn queue_render(&self) {
+        self.imp().gl_area.queue_render();
+    }
+
     pub fn new<T: TestCase + 'static>(
         make_test_case: impl Fn(Args) -> T + 'static,
         anim_adjustment: &gtk::Adjustment,
