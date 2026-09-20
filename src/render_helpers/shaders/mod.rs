@@ -61,6 +61,7 @@ impl Shaders {
                 UniformName::new("knit_stitch_size", UniformType::_1f),
                 UniformName::new("knit_relief", UniformType::_1f),
                 UniformName::new("knit_fuzz", UniformType::_1f),
+                UniformName::new("knit_motif_bends", UniformType::_4f),
             ],
             &[],
         )
