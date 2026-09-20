@@ -2,8 +2,10 @@
 //!
 //! Renders six focus rings (48 draw elements per frame) into an offscreen texture
 //! (3288x1424, Fourcc::Abgr8888), measures per-frame wall time with confirmed GPU
-//! synchronization (EGL fences or `glFinish`), and optionally dumps the last frame
-//! of each scenario as `<scenario>.png`.
+//! synchronization (EGL fences or `glFinish`), and optionally dumps frames as PNG.
+//! Two workloads are available: `static` redraws identical geometry every frame,
+//! `resize` recomputes ring geometry each frame along a min → max → min window
+//! resize cycle.
 //!
 //! # CLI Usage
 //!
@@ -28,9 +30,25 @@
 //!   - `knit-zigzag-detail`: Large zigzag knit pattern (stitch size 32, fuzz 0.8).
 //!   - `all`: Runs all seven scenarios in order.
 //!
+//! - `--workload <name|all>`:
+//!   Workload to execute per scenario. Can be specified multiple times.
+//!   Defaults to `static`.
+//!   Available workloads:
+//!   - `static`: Elements are prepared once; every frame redraws identical
+//!     geometry. Measures render + clear + finish + completion wait.
+//!   - `resize`: Each frame advances one step of a 60-step resize cycle
+//!     (window contents 210x648 → 420x1296 → 210x648, cosine easing, sizes
+//!     rounded to physical pixels). Measures `FocusRing::update_render_elements`
+//!     + element collection + the full render path. `--frames` must be a
+//!     multiple of 60 so the series covers whole cycles. `--warmup` counts
+//!     cycle steps and needs no alignment. In `--smoke` mode one full cycle
+//!     (60 frames) is drawn unmeasured.
+//!   - `all`: Runs both workloads per scenario.
+//!
 //! - `--dump-dir`:
 //!   Saves the final rendered frame of each scenario as `<scenario>.png`
-//!   into `target/border_bench/`.
+//!   into `target/border_bench/`. For the resize workload, saves the cycle
+//!   extremes as `<scenario>-resize-min.png` and `<scenario>-resize-max.png`.
 //!
 //! - `--warmup <N>`:
 //!   Number of unmeasured warmup frames per scenario (default: `30`).
@@ -46,7 +64,7 @@
 //!   Cannot be combined with `--warmup` or `--frames`.
 //!
 //! - `--json`:
-//!   Emits a single JSON document on stdout (`schema_version: 1`).
+//!   Emits a single JSON document on stdout (`schema_version: 2`).
 //!   All informational logs and diagnostic messages are redirected to stderr.
 //!
 //! # Common Examples
@@ -102,16 +120,14 @@
 //!   NIRI_GOLDEN_UPDATE=1 cargo test knit
 //!   ```
 //!
-//! # JSON Output Schema (`schema_version: 1`)
+//! # JSON Output Schema (`schema_version: 2`)
 //!
 //! When `--json` is specified, stdout outputs a single JSON object with the following schema:
 //!
 //! ```json
 //! {
-//!   "schema_version": 1,
-//!   "methodology_version": 1,
-//!   "metric": "frame_wall_time_us",
-//!   "scope": "renderer.render() + clear + element_draws_per_frame RenderElement::draw calls + finish + completion wait",
+//!   "schema_version": 2,
+//!   "methodology_version": 2,
 //!   "metadata": {
 //!     "gl_vendor": "string | null",
 //!     "gl_renderer": "string | null",
@@ -134,11 +150,21 @@
 //!     "scenarios": ["solid", "gradient-srgb", ...],
 //!     "revision_source": "runtime_checkout",
 //!     "checkout_head": "string | null",
-//!     "checkout_dirty": "boolean | null"
+//!     "checkout_dirty": "boolean | null",
+//!     "workloads": ["static", "resize"],
+//!     "resize": {
+//!       "min_window_size": [210.0, 648.0],
+//!       "max_window_size": [420.0, 1296.0],
+//!       "cycle_steps": 60,
+//!       "easing": "cosine"
+//!     }
 //!   },
 //!   "results": [
 //!     {
 //!       "name": "solid",
+//!       "workload": "static",
+//!       "metric": "frame_wall_time_us",
+//!       "scope": "renderer.render() + clear + element_draws_per_frame RenderElement::draw calls + finish + completion wait",
 //!       "parameters": {
 //!         "focus_ring": {
 //!           "off": false,
@@ -164,9 +190,23 @@
 //!         "mean_us": 122.1,
 //!         "p95_us": 135.0,
 //!         "max_us": 150.2
-//!       }
+//!       },
+//!       "stages": null
 //!     }
 //!   ]
+//! }
+//! ```
+//!
+//! For `workload: "resize"`, `scope` additionally covers
+//! `FocusRing::update_render_elements` + element collection, and `stages`
+//! carries the per-stage breakdown:
+//!
+//! ```json
+//! "stages": {
+//!   "update_us": [12.3, ...],
+//!   "render_us": [110.2, ...],
+//!   "update_statistics": {"count": 300, ...},
+//!   "render_statistics": {"count": 300, ...}
 //! }
 //! ```
 //!
@@ -193,7 +233,7 @@ use smithay::backend::renderer::element::{Element as _, RenderElement};
 use smithay::backend::renderer::gles::{ffi, GlesRenderer, GlesTarget, GlesTexture};
 use smithay::backend::renderer::{Bind as _, ExportMem as _, Frame as _, Renderer};
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 /// Render target size in physical pixels.
 const TARGET_SIZE: (i32, i32) = (3288, 1424);
@@ -212,6 +252,57 @@ const ALPHA: f32 = 1.;
 const ELEMENTS_PER_RING: usize = 8;
 /// Render target pixel format.
 const TARGET_FORMAT: Fourcc = Fourcc::Abgr8888;
+/// Window contents size at the smallest point of the resize cycle. The
+/// largest point is `WIN_SIZE`, so the ring always stays inside its slot.
+const RESIZE_MIN_SIZE: (f64, f64) = (210., 648.);
+/// Number of size transitions in one full resize cycle: min → max → min.
+/// Even, so the maximum lands exactly on step `RESIZE_CYCLE_STEPS / 2`.
+const RESIZE_CYCLE_STEPS: usize = 60;
+
+/// Frame workload: a fixed-size scene or a window resize animation cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Workload {
+    /// Elements are prepared once; every frame redraws identical geometry.
+    Static,
+    /// Every frame recomputes ring geometry for the next size in the cycle.
+    Resize,
+}
+
+impl Workload {
+    const ALL: [Workload; 2] = [Workload::Static, Workload::Resize];
+
+    fn name(self) -> &'static str {
+        match self {
+            Workload::Static => "static",
+            Workload::Resize => "resize",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|w| w.name() == name)
+    }
+}
+
+/// Progress of the resize cycle at `step` transitions from the minimum:
+/// cosine easing 0 → 1 → 0 over `RESIZE_CYCLE_STEPS` steps. Step 0 and step
+/// `RESIZE_CYCLE_STEPS` both return exactly 0 (minimum size), step
+/// `RESIZE_CYCLE_STEPS / 2` returns exactly 1 (maximum size).
+fn resize_progress(step: usize) -> f64 {
+    let phase = (step % RESIZE_CYCLE_STEPS) as f64 / RESIZE_CYCLE_STEPS as f64;
+    (1. - (2. * std::f64::consts::PI * phase).cos()) / 2.
+}
+
+/// Window contents size at `step` transitions into the resize cycle,
+/// interpolated between `RESIZE_MIN_SIZE` and `WIN_SIZE` and rounded to
+/// physical pixels like `Tile::animated_window_size` does.
+fn resize_win_size(step: usize) -> Size<f64, Logical> {
+    let p = resize_progress(step);
+    let w = RESIZE_MIN_SIZE.0 + (WIN_SIZE.0 - RESIZE_MIN_SIZE.0) * p;
+    let h = RESIZE_MIN_SIZE.1 + (WIN_SIZE.1 - RESIZE_MIN_SIZE.1) * p;
+    Size::from((w, h))
+        .to_physical_precise_round(SCALE)
+        .to_logical(SCALE)
+}
 
 fn base_color() -> Color {
     Color::from_rgba8_unpremul(0xa9, 0x47, 0x28, 0xff)
@@ -340,10 +431,22 @@ fn scenario_config(scenario: Scenario) -> ScenarioConfig {
 struct Report {
     schema_version: u32,
     methodology_version: u32,
-    metric: &'static str,
-    scope: &'static str,
     metadata: Metadata,
     results: Vec<ScenarioResult>,
+}
+
+/// Fixed parameters of the resize workload, reported so results can be
+/// interpreted without reading the benchmark source.
+#[derive(Debug, Serialize)]
+struct ResizeParams {
+    /// Window contents size at the cycle minimum, logical pixels.
+    min_window_size: [f64; 2],
+    /// Window contents size at the cycle maximum, logical pixels.
+    max_window_size: [f64; 2],
+    /// Size transitions per full cycle (min → max → min).
+    cycle_steps: usize,
+    /// Easing curve name; progress is `(1 - cos(2π·t)) / 2`.
+    easing: &'static str,
 }
 
 /// Environment and workload description collected once per run, outside the
@@ -384,13 +487,23 @@ struct Metadata {
     /// Whether the working tree had tracked or untracked changes at run time;
     /// `null` when the status could not be determined.
     checkout_dirty: Option<bool>,
+    /// Workloads executed per scenario, in run order.
+    workloads: Vec<&'static str>,
+    /// Parameters of the resize workload; `null` when no resize run was
+    /// requested.
+    resize: Option<ResizeParams>,
 }
 
-/// Per-scenario outcome: the parameters actually rendered, the observed
-/// synchronization shape, raw samples and their statistics.
+/// Per-scenario outcome for one workload: the parameters actually rendered,
+/// the observed synchronization shape, raw samples and their statistics.
 #[derive(Debug, Serialize)]
 struct ScenarioResult {
     name: &'static str,
+    workload: &'static str,
+    /// Name of the primary measured quantity in `samples_us`/`statistics`.
+    metric: &'static str,
+    /// What the primary metric covers for this workload.
+    scope: &'static str,
     parameters: ScenarioParams,
     observed_synchronization: SyncObservations,
     /// Frame wall times in microseconds, converted from `Duration` without
@@ -398,6 +511,23 @@ struct ScenarioResult {
     samples_us: Vec<f64>,
     /// `null` in smoke mode; never fabricated from zero samples.
     statistics: Option<FrameStats>,
+    /// Per-stage breakdown for the resize workload; `null` for static.
+    stages: Option<StageMetrics>,
+}
+
+/// Resize workload stage timings: element recomputation and frame rendering
+/// measured separately inside the same frame.
+#[derive(Debug, Serialize)]
+struct StageMetrics {
+    /// Wall time of `FocusRing::update_render_elements` + element collection
+    /// + draw-parameter computation, per frame.
+    update_us: Vec<f64>,
+    /// Wall time of `draw_frame` (render + clear + finish + wait), per frame.
+    render_us: Vec<f64>,
+    /// `null` in smoke mode.
+    update_statistics: Option<FrameStats>,
+    /// `null` in smoke mode.
+    render_statistics: Option<FrameStats>,
 }
 
 /// How many measured frames returned a `SyncPoint` that contained a fence.
@@ -604,6 +734,7 @@ fn runtime_checkout() -> (Option<String>, Option<bool>) {
 fn collect_metadata(
     renderer: &mut GlesRenderer,
     scenarios: &[Scenario],
+    workloads: &[Workload],
     warmup: usize,
     frames: usize,
     smoke: bool,
@@ -632,6 +763,15 @@ fn collect_metadata(
         revision_source: "runtime_checkout",
         checkout_head,
         checkout_dirty,
+        workloads: workloads.iter().map(|w| w.name()).collect(),
+        resize: workloads
+            .contains(&Workload::Resize)
+            .then_some(ResizeParams {
+                min_window_size: [RESIZE_MIN_SIZE.0, RESIZE_MIN_SIZE.1],
+                max_window_size: [WIN_SIZE.0, WIN_SIZE.1],
+                cycle_steps: RESIZE_CYCLE_STEPS,
+                easing: "cosine",
+            }),
     }
 }
 
@@ -647,9 +787,11 @@ struct PreparedElement {
     cache: UserDataMap,
 }
 
-/// Everything needed to draw one frame of a scenario: the prepared elements
-/// and the texture target bound once for the whole frame series.
+/// Everything needed to draw frames of a scenario: the `FocusRing`s that
+/// produce the elements, the prepared elements for the current frame and
+/// the texture target bound once for the whole frame series.
 struct PreparedScenario<'a> {
+    rings: Vec<FocusRing>,
     elements: Vec<PreparedElement>,
     target: GlesTarget<'a>,
 }
@@ -662,14 +804,14 @@ fn dst_fits_in_target(dst: Rectangle<i32, Physical>, target: Rectangle<i32, Phys
     dst.size.w > 0 && dst.size.h > 0 && target.contains_rect(dst)
 }
 
-/// Runs scenario preparation once: checks the shader path, creates fresh
-/// `FocusRing`s, collects their render elements, validates that every
-/// element fits the render target, precomputes draw parameters and binds
-/// the shared texture target.
+/// Runs scenario preparation once: checks the shader path, creates the
+/// `FocusRing`s, builds the initial frame's elements and binds the shared
+/// texture target.
 fn prepare_scenario<'a>(
     renderer: &mut GlesRenderer,
     texture: &'a mut GlesTexture,
     scenario: Scenario,
+    workload: Workload,
 ) -> anyhow::Result<PreparedScenario<'a>> {
     ensure!(
         BorderRenderElement::has_shader(renderer),
@@ -677,45 +819,121 @@ fn prepare_scenario<'a>(
         scenario.name()
     );
 
-    let elements = prepare_elements(renderer, scenario)?;
+    let rings = create_rings(scenario);
+    let target = renderer.bind(texture).context("error binding texture")?;
 
-    let size = Size::<i32, Physical>::from(TARGET_SIZE);
+    let mut prepared = PreparedScenario {
+        rings,
+        elements: Vec::new(),
+        target,
+    };
+
+    // The initial frame state: full size for static, cycle minimum for
+    // resize. Both workloads then reuse `rebuild_elements` per frame.
+    let win_size = match workload {
+        Workload::Static => Size::from(WIN_SIZE),
+        Workload::Resize => resize_win_size(0),
+    };
+    rebuild_elements(renderer, &mut prepared, scenario, win_size)
+        .context("error preparing initial frame")?;
+
+    Ok(prepared)
+}
+
+/// Creates the six `FocusRing`s for a scenario. Rings persist across frames
+/// so `update_render_elements` reuses their internal storage instead of
+/// reallocating it every frame.
+fn create_rings(scenario: Scenario) -> Vec<FocusRing> {
+    let config = scenario_config(scenario);
+    (0..RING_COUNT)
+        .map(|_| {
+            let mut ring = FocusRing::new(config.focus_ring);
+            ring.update_knit(config.knit);
+            ring
+        })
+        .collect()
+}
+
+/// Recomputes ring geometry for `win_size`, collects the render elements and
+/// precomputes their draw parameters. This is the per-frame update stage of
+/// the resize workload; for static it runs once during preparation.
+fn rebuild_elements(
+    renderer: &mut GlesRenderer,
+    prepared: &mut PreparedScenario,
+    scenario: Scenario,
+    win_size: Size<f64, Logical>,
+) -> anyhow::Result<()> {
+    // Only used for workspace-relative gradients, which are disabled here.
+    let view_rect = Rectangle::new(
+        Point::from((-BORDER_WIDTH, -BORDER_WIDTH)),
+        win_size + Size::from((BORDER_WIDTH * 2., BORDER_WIDTH * 2.)),
+    );
+
     let scale = Scale::from(SCALE);
-    let output_rect = Rectangle::from_size(size);
+    let output_rect = Rectangle::from_size(Size::<i32, Physical>::from(TARGET_SIZE));
 
-    let elements = elements
-        .into_iter()
-        .enumerate()
-        .map(|(i, element)| {
+    prepared.elements.clear();
+    for (i, ring) in prepared.rings.iter_mut().enumerate() {
+        ring.update_render_elements(
+            win_size,
+            true,
+            true,
+            false,
+            view_rect,
+            CornerRadius::from(OUTER_RADIUS),
+            SCALE,
+            ALPHA,
+        );
+
+        // `location` is the window contents origin; the ring extends
+        // BORDER_WIDTH outward on every side.
+        let location = Point::from((BORDER_WIDTH + i as f64 * RING_STEP, BORDER_WIDTH));
+        ring.render(renderer, location, &mut |element| {
             let src = element.src();
             let dst = element.geometry(scale);
-            // The workload is fixed at 48 draws per frame: an element that
-            // does not fit the target is a preparation error, not a skippable
-            // draw.
-            ensure!(
-                dst_fits_in_target(dst, output_rect),
-                "scenario {}: element {} dst {:?} does not fit target {:?}",
-                scenario.name(),
-                i,
-                dst,
-                output_rect
-            );
             // Damage is relative to the element's dst origin; cover it fully
-            // so damage tracking cannot skip the static scene.
+            // so damage tracking cannot skip the scene.
             let damage = Rectangle::new(Point::default(), dst.size);
-            Ok(PreparedElement {
+            prepared.elements.push(PreparedElement {
                 element,
                 src,
                 dst,
                 damage,
                 cache: UserDataMap::new(),
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+            });
+        });
+    }
 
-    let target = renderer.bind(texture).context("error binding texture")?;
+    // The workload is fixed at 48 draws per frame: an element that does not
+    // fit the target is a preparation error, not a skippable draw.
+    for (i, elem) in prepared.elements.iter().enumerate() {
+        ensure!(
+            dst_fits_in_target(elem.dst, output_rect),
+            "scenario {}: element {} dst {:?} does not fit target {:?}",
+            scenario.name(),
+            i,
+            elem.dst,
+            output_rect
+        );
+    }
 
-    Ok(PreparedScenario { elements, target })
+    ensure!(
+        prepared.elements.len() == RING_COUNT * ELEMENTS_PER_RING,
+        "scenario {}: expected {} render elements, got {}",
+        scenario.name(),
+        RING_COUNT * ELEMENTS_PER_RING,
+        prepared.elements.len()
+    );
+    ensure!(
+        prepared
+            .elements
+            .iter()
+            .all(|elem| matches!(elem.element, FocusRingRenderElement::Gradient(_))),
+        "scenario {}: some elements fell back to SolidColorRenderElement",
+        scenario.name()
+    );
+
+    Ok(())
 }
 
 /// Draws one complete frame: clear, all prepared elements with full damage,
@@ -789,14 +1007,14 @@ fn finish_pending_work(
     Ok(())
 }
 
-/// Reads the finished frame back and writes it as `<scenario>.png`. Only runs
+/// Reads the finished frame back and writes it as `<name>.png`. Only runs
 /// when `--dump-dir` is given, after the whole frame series is complete. The
 /// "saved" message goes to stderr in JSON mode so stdout stays a single
 /// JSON document.
 fn save_png(
     renderer: &mut GlesRenderer,
     target: &GlesTarget,
-    scenario: Scenario,
+    name: &str,
     dir: &Path,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -806,7 +1024,7 @@ fn save_png(
         .map_texture(&mapping)
         .context("error mapping texture")?;
 
-    let path = dir.join(format!("{}.png", scenario.name()));
+    let path = dir.join(format!("{name}.png"));
     let file = std::fs::File::create(&path)
         .with_context(|| format!("error creating {}", path.display()))?;
     write_png_rgba8(
@@ -868,84 +1086,236 @@ fn frame_stats(samples: &[Duration]) -> anyhow::Result<FrameStats> {
     })
 }
 
-/// Runs one scenario: prepare once, drain setup work, optional warmup frames,
-/// measured frames, statistics, optional PNG dump of the last frame. Returns
-/// the report entry for the scenario.
+/// Runs one scenario under one workload: prepare once, drain setup work,
+/// optional warmup frames, measured frames, statistics, optional PNG dump.
+/// Returns the report entry for the scenario/workload pair.
 fn run_scenario(
     renderer: &mut GlesRenderer,
     texture: &mut GlesTexture,
     scenario: Scenario,
+    workload: Workload,
     warmup: usize,
     frames: usize,
     smoke: bool,
     dump_dir: Option<&Path>,
     json: bool,
 ) -> anyhow::Result<ScenarioResult> {
-    let mut prepared = prepare_scenario(renderer, texture, scenario)
-        .with_context(|| format!("scenario {}: error preparing", scenario.name()))?;
+    let mut prepared =
+        prepare_scenario(renderer, texture, scenario, workload).with_context(|| {
+            format!(
+                "scenario {} [{}]: error preparing",
+                scenario.name(),
+                workload.name()
+            )
+        })?;
 
     // Synchronize pending setup commands before the series; not timed.
-    finish_pending_work(renderer, &mut prepared)
-        .with_context(|| format!("scenario {}: error in setup barrier", scenario.name()))?;
+    finish_pending_work(renderer, &mut prepared).with_context(|| {
+        format!(
+            "scenario {} [{}]: error in setup barrier",
+            scenario.name(),
+            workload.name()
+        )
+    })?;
 
-    let mut samples = Vec::new();
+    let mut samples: Vec<Duration> = Vec::new();
+    let mut update_samples: Vec<Duration> = Vec::new();
+    let mut render_samples: Vec<Duration> = Vec::new();
     let mut frames_with_fence = 0usize;
     let mut frames_without_fence = 0usize;
+    // Frames whose fence observation is counted: measured frames plus smoke
+    // frames. Warmup fences are ignored, matching the static path.
+    let mut counted_frames = 0usize;
 
-    if smoke {
-        // One real frame per scenario; its fence observation is counted but
-        // no samples or statistics are produced.
-        let had_fence = draw_frame(renderer, &mut prepared)
-            .with_context(|| format!("scenario {}: error in smoke frame", scenario.name()))?;
-        if had_fence {
-            frames_with_fence += 1;
-        } else {
-            frames_without_fence += 1;
-        }
-    } else {
-        samples.reserve(frames);
-        for _ in 0..warmup {
-            draw_frame(renderer, &mut prepared)
-                .with_context(|| format!("scenario {}: error in warmup frame", scenario.name()))?;
-        }
-
-        for _ in 0..frames {
-            let start = Instant::now();
+    match (workload, smoke) {
+        (Workload::Static, true) => {
+            // One real frame per scenario; its fence observation is counted
+            // but no samples or statistics are produced.
             let had_fence = draw_frame(renderer, &mut prepared).with_context(|| {
-                format!("scenario {}: error in measured frame", scenario.name())
+                format!(
+                    "scenario {} [static]: error in smoke frame",
+                    scenario.name()
+                )
             })?;
-            // Timing ends here; bookkeeping happens after elapsed is fixed.
-            samples.push(start.elapsed());
+            counted_frames += 1;
             if had_fence {
                 frames_with_fence += 1;
             } else {
                 frames_without_fence += 1;
             }
         }
+        (Workload::Static, false) => {
+            samples.reserve(frames);
+            for _ in 0..warmup {
+                draw_frame(renderer, &mut prepared).with_context(|| {
+                    format!(
+                        "scenario {} [static]: error in warmup frame",
+                        scenario.name()
+                    )
+                })?;
+            }
+
+            for _ in 0..frames {
+                let start = Instant::now();
+                let had_fence = draw_frame(renderer, &mut prepared).with_context(|| {
+                    format!(
+                        "scenario {} [static]: error in measured frame",
+                        scenario.name()
+                    )
+                })?;
+                // Timing ends here; bookkeeping happens after elapsed is fixed.
+                samples.push(start.elapsed());
+                counted_frames += 1;
+                if had_fence {
+                    frames_with_fence += 1;
+                } else {
+                    frames_without_fence += 1;
+                }
+            }
+        }
+        (Workload::Resize, smoke_mode) => {
+            // One resize step per frame. Smoke runs exactly one full cycle
+            // unmeasured so every intermediate size is validated.
+            let smoke_steps = if smoke_mode { RESIZE_CYCLE_STEPS } else { 0 };
+            let warmup_steps = if smoke_mode { 0 } else { warmup };
+            let measured = if smoke_mode { 0 } else { frames };
+            let total_steps = warmup_steps + measured + smoke_steps;
+
+            samples.reserve(measured);
+            update_samples.reserve(measured);
+            render_samples.reserve(measured);
+
+            for i in 0..total_steps {
+                // Step 0 is the prepared minimum; measured steps are 1..=60
+                // so the cycle ends exactly back at the minimum.
+                let step = i % RESIZE_CYCLE_STEPS + 1;
+                let is_measured = !smoke_mode && i >= warmup_steps;
+
+                let frame_start = Instant::now();
+                let update_start = Instant::now();
+                rebuild_elements(renderer, &mut prepared, scenario, resize_win_size(step))
+                    .with_context(|| {
+                        format!(
+                            "scenario {} [resize]: error in resize update",
+                            scenario.name()
+                        )
+                    })?;
+                let update_elapsed = update_start.elapsed();
+                let had_fence = draw_frame(renderer, &mut prepared).with_context(|| {
+                    format!("scenario {} [resize]: error in frame", scenario.name())
+                })?;
+                let total_elapsed = frame_start.elapsed();
+
+                if is_measured || smoke_mode {
+                    counted_frames += 1;
+                    if had_fence {
+                        frames_with_fence += 1;
+                    } else {
+                        frames_without_fence += 1;
+                    }
+                }
+                if is_measured {
+                    update_samples.push(update_elapsed);
+                    render_samples.push(total_elapsed - update_elapsed);
+                    samples.push(total_elapsed);
+                }
+            }
+        }
     }
 
     ensure!(
-        frames_with_fence + frames_without_fence == samples.len().max(usize::from(smoke)),
-        "scenario {}: sync observations do not match counted frames",
-        scenario.name()
+        frames_with_fence + frames_without_fence == counted_frames,
+        "scenario {} [{}]: sync observations do not match counted frames",
+        scenario.name(),
+        workload.name()
     );
 
     if let Some(dir) = dump_dir {
-        save_png(renderer, &prepared.target, scenario, dir, json)
-            .with_context(|| format!("scenario {}: error saving png", scenario.name()))?;
+        match workload {
+            Workload::Static => {
+                save_png(renderer, &prepared.target, scenario.name(), dir, json).with_context(
+                    || format!("scenario {} [static]: error saving png", scenario.name()),
+                )?;
+            }
+            Workload::Resize => {
+                // Re-render the two cycle extremes for visual inspection.
+                for (step, label) in [(0, "min"), (RESIZE_CYCLE_STEPS / 2, "max")] {
+                    rebuild_elements(renderer, &mut prepared, scenario, resize_win_size(step))
+                        .with_context(|| {
+                            format!(
+                                "scenario {} [resize]: error rebuilding {label} frame",
+                                scenario.name()
+                            )
+                        })?;
+                    draw_frame(renderer, &mut prepared).with_context(|| {
+                        format!(
+                            "scenario {} [resize]: error drawing {label} frame",
+                            scenario.name()
+                        )
+                    })?;
+                    let name = format!("{}-resize-{label}", scenario.name());
+                    save_png(renderer, &prepared.target, &name, dir, json).with_context(|| {
+                        format!("scenario {} [resize]: error saving png", scenario.name())
+                    })?;
+                }
+            }
+        }
     }
 
     let statistics = if samples.is_empty() {
         None
     } else {
-        Some(
-            frame_stats(&samples)
-                .with_context(|| format!("scenario {}: error computing stats", scenario.name()))?,
-        )
+        Some(frame_stats(&samples).with_context(|| {
+            format!(
+                "scenario {} [{}]: error computing stats",
+                scenario.name(),
+                workload.name()
+            )
+        })?)
+    };
+
+    let stages = match workload {
+        Workload::Static => None,
+        Workload::Resize => Some(StageMetrics {
+            update_us: update_samples
+                .iter()
+                .map(|d| d.as_nanos() as f64 / 1000.)
+                .collect(),
+            render_us: render_samples
+                .iter()
+                .map(|d| d.as_nanos() as f64 / 1000.)
+                .collect(),
+            update_statistics: if update_samples.is_empty() {
+                None
+            } else {
+                Some(frame_stats(&update_samples).with_context(|| {
+                    format!(
+                        "scenario {} [resize]: error computing update stats",
+                        scenario.name()
+                    )
+                })?)
+            },
+            render_statistics: if render_samples.is_empty() {
+                None
+            } else {
+                Some(frame_stats(&render_samples).with_context(|| {
+                    format!(
+                        "scenario {} [resize]: error computing render stats",
+                        scenario.name()
+                    )
+                })?)
+            },
+        }),
     };
 
     Ok(ScenarioResult {
         name: scenario.name(),
+        workload: workload.name(),
+        metric: "frame_wall_time_us",
+        scope: match workload {
+            Workload::Static => "renderer.render() + clear + element_draws_per_frame RenderElement::draw calls + finish + completion wait",
+            Workload::Resize => "FocusRing::update_render_elements + element collection + renderer.render() + clear + element_draws_per_frame RenderElement::draw calls + finish + completion wait",
+        },
         parameters: scenario_params(&scenario_config(scenario)),
         observed_synchronization: SyncObservations {
             frames_with_fence,
@@ -956,12 +1326,14 @@ fn run_scenario(
             .map(|d| d.as_nanos() as f64 / 1000.)
             .collect(),
         statistics,
+        stages,
     })
 }
 
 fn run(
     renderer: &mut GlesRenderer,
     scenarios: &[Scenario],
+    workloads: &[Workload],
     warmup: usize,
     frames: usize,
     smoke: bool,
@@ -982,7 +1354,7 @@ fn run(
         create_texture(renderer, size, TARGET_FORMAT).context("error creating texture")?;
 
     // Metadata is collected once, outside the measured series.
-    let metadata = collect_metadata(renderer, scenarios, warmup, frames, smoke);
+    let metadata = collect_metadata(renderer, scenarios, workloads, warmup, frames, smoke);
 
     if !json {
         println!(
@@ -1024,51 +1396,66 @@ fn run(
             metadata.alpha
         );
         println!("mode = {}", metadata.mode);
+        println!("workloads = {}", metadata.workloads.join(", "));
         if !smoke {
             println!("metric = frame_wall_time_us");
             println!(
                 "scope = clear + {} element draws + finish + completion wait",
                 metadata.element_draws_per_frame
             );
-            println!("scenario | frames | min_us | median_us | mean_us | p95_us | max_us");
+            println!(
+                "scenario | workload | frames | min_us | median_us | mean_us | p95_us | max_us"
+            );
         }
     }
 
-    let mut results = Vec::with_capacity(scenarios.len());
+    let mut results = Vec::with_capacity(scenarios.len() * workloads.len());
     for &scenario in scenarios {
-        let result = run_scenario(
-            renderer,
-            &mut texture,
-            scenario,
-            warmup,
-            frames,
-            smoke,
-            dump_dir,
-            json,
-        )?;
-        if !json {
-            if let Some(stats) = &result.statistics {
-                println!(
-                    "{} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2}",
-                    result.name,
-                    stats.count,
-                    stats.min_us,
-                    stats.median_us,
-                    stats.mean_us,
-                    stats.p95_us,
-                    stats.max_us,
-                );
+        for &workload in workloads {
+            let result = run_scenario(
+                renderer,
+                &mut texture,
+                scenario,
+                workload,
+                warmup,
+                frames,
+                smoke,
+                dump_dir,
+                json,
+            )?;
+            if !json {
+                if let Some(stats) = &result.statistics {
+                    println!(
+                        "{} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2}",
+                        result.name,
+                        result.workload,
+                        stats.count,
+                        stats.min_us,
+                        stats.median_us,
+                        stats.mean_us,
+                        stats.p95_us,
+                        stats.max_us,
+                    );
+                    if let Some(stages) = &result.stages {
+                        if let (Some(upd), Some(ren)) =
+                            (&stages.update_statistics, &stages.render_statistics)
+                        {
+                            println!(
+                                "  update: median {:.2} mean {:.2} | render: median {:.2} mean {:.2}",
+                                upd.median_us, upd.mean_us, ren.median_us, ren.mean_us,
+                            );
+                        }
+                    }
+                }
             }
+            results.push(result);
         }
-        results.push(result);
     }
 
     if json {
         let report = Report {
-            schema_version: 1,
-            methodology_version: 1,
-            metric: "frame_wall_time_us",
-            scope: "renderer.render() + clear + element_draws_per_frame RenderElement::draw calls + finish + completion wait",
+            schema_version: 2,
+            methodology_version: 2,
             metadata,
             results,
         };
@@ -1083,6 +1470,7 @@ fn run(
 
 fn main() -> anyhow::Result<()> {
     let mut scenarios = Vec::new();
+    let mut workloads = Vec::new();
     let mut dump_dir = None;
     let mut warmup = 30usize;
     let mut frames = 300usize;
@@ -1105,6 +1493,20 @@ fn main() -> anyhow::Result<()> {
                         )
                     })?;
                     scenarios.push(scenario);
+                }
+            }
+            "--workload" => {
+                let name = args.next().context("--workload requires a name")?;
+                if name == "all" {
+                    workloads = Workload::ALL.to_vec();
+                } else {
+                    let workload = Workload::from_name(&name).with_context(|| {
+                        format!(
+                            "unknown workload: {name} (expected one of: all, {})",
+                            Workload::ALL.map(Workload::name).join(", ")
+                        )
+                    })?;
+                    workloads.push(workload);
                 }
             }
             "--dump-dir" => {
@@ -1135,12 +1537,20 @@ fn main() -> anyhow::Result<()> {
     if scenarios.is_empty() {
         scenarios = Scenario::ALL.to_vec();
     }
+    if workloads.is_empty() {
+        workloads = vec![Workload::Static];
+    }
 
     ensure!(
         !(smoke && (warmup_set || frames_set)),
         "--smoke cannot be combined with --warmup or --frames"
     );
     ensure!(frames > 0, "--frames must be greater than 0");
+    ensure!(
+        smoke || !workloads.contains(&Workload::Resize) || frames % RESIZE_CYCLE_STEPS == 0,
+        "--frames must be a multiple of {RESIZE_CYCLE_STEPS} (the resize cycle length) \
+         for the resize workload"
+    );
 
     let mut headless = Headless::new();
     // Initializes resources and shaders internally; do not init them again.
@@ -1153,6 +1563,7 @@ fn main() -> anyhow::Result<()> {
             run(
                 renderer,
                 &scenarios,
+                &workloads,
                 warmup,
                 frames,
                 smoke,
@@ -1164,60 +1575,6 @@ fn main() -> anyhow::Result<()> {
         .context("error running benchmark")?;
 
     Ok(())
-}
-
-/// Creates six fresh `FocusRing`s for the scenario and collects their render
-/// elements. Every element must use the shader-backed `Gradient` variant.
-fn prepare_elements(
-    renderer: &mut GlesRenderer,
-    scenario: Scenario,
-) -> anyhow::Result<Vec<FocusRingRenderElement>> {
-    let config = scenario_config(scenario);
-
-    let win_size = Size::from(WIN_SIZE);
-    // Only used for workspace-relative gradients, which are disabled here.
-    let view_rect = Rectangle::new(
-        Point::from((-BORDER_WIDTH, -BORDER_WIDTH)),
-        win_size + Size::from((BORDER_WIDTH * 2., BORDER_WIDTH * 2.)),
-    );
-
-    let mut elements: Vec<FocusRingRenderElement> = Vec::new();
-    for i in 0..RING_COUNT {
-        let mut ring = FocusRing::new(config.focus_ring);
-        ring.update_knit(config.knit);
-        ring.update_render_elements(
-            win_size,
-            true,
-            true,
-            false,
-            view_rect,
-            CornerRadius::from(OUTER_RADIUS),
-            SCALE,
-            ALPHA,
-        );
-
-        // `location` is the window contents origin; the ring extends
-        // BORDER_WIDTH outward on every side.
-        let location = Point::from((BORDER_WIDTH + i as f64 * RING_STEP, BORDER_WIDTH));
-        ring.render(renderer, location, &mut |elem| elements.push(elem));
-    }
-
-    ensure!(
-        elements.len() == RING_COUNT * ELEMENTS_PER_RING,
-        "scenario {}: expected {} render elements, got {}",
-        scenario.name(),
-        RING_COUNT * ELEMENTS_PER_RING,
-        elements.len()
-    );
-    ensure!(
-        elements
-            .iter()
-            .all(|elem| matches!(elem, FocusRingRenderElement::Gradient(_))),
-        "scenario {}: some elements fell back to SolidColorRenderElement",
-        scenario.name()
-    );
-
-    Ok(elements)
 }
 
 // Cargo compiles bench targets with `--cfg test` even with `harness = false`,
@@ -1504,16 +1861,34 @@ mod tests {
             revision_source: "runtime_checkout",
             checkout_head: Some("0123456789abcdef".to_owned()),
             checkout_dirty: Some(false),
+            workloads: vec!["static"],
+            resize: None,
         }
+    }
+
+    fn test_metadata_resize() -> Metadata {
+        let mut metadata = test_metadata();
+        metadata.workloads = vec!["static", "resize"];
+        metadata.resize = Some(ResizeParams {
+            min_window_size: [RESIZE_MIN_SIZE.0, RESIZE_MIN_SIZE.1],
+            max_window_size: [WIN_SIZE.0, WIN_SIZE.1],
+            cycle_steps: RESIZE_CYCLE_STEPS,
+            easing: "cosine",
+        });
+        metadata
     }
 
     fn test_result(
         scenario: Scenario,
+        workload: Workload,
         samples: Vec<f64>,
         stats: Option<FrameStats>,
     ) -> ScenarioResult {
         ScenarioResult {
             name: scenario.name(),
+            workload: workload.name(),
+            metric: "frame_wall_time_us",
+            scope: "test scope",
             parameters: scenario_params(&scenario_config(scenario)),
             observed_synchronization: SyncObservations {
                 frames_with_fence: samples.len(),
@@ -1521,6 +1896,7 @@ mod tests {
             },
             samples_us: samples,
             statistics: stats,
+            stages: None,
         }
     }
 
@@ -1530,23 +1906,28 @@ mod tests {
         let durations: Vec<Duration> = samples.iter().map(|&s| us(s)).collect();
         let stats = frame_stats(&durations).unwrap();
         let report = Report {
-            schema_version: 1,
-            methodology_version: 1,
-            metric: "frame_wall_time_us",
-            scope: "test scope",
+            schema_version: 2,
+            methodology_version: 2,
             metadata: test_metadata(),
-            results: vec![test_result(Scenario::Solid, samples, Some(stats))],
+            results: vec![test_result(
+                Scenario::Solid,
+                Workload::Static,
+                samples,
+                Some(stats),
+            )],
         };
 
         let json = serde_json::to_string(&report).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(value["schema_version"], 1);
-        assert_eq!(value["methodology_version"], 1);
-        assert_eq!(value["metric"], "frame_wall_time_us");
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["methodology_version"], 2);
         assert_eq!(value["metadata"]["mode"], "benchmark");
+        assert_eq!(value["metadata"]["workloads"][0], "static");
         assert_eq!(value["results"].as_array().unwrap().len(), 1);
         assert_eq!(value["results"][0]["name"], "solid");
+        assert_eq!(value["results"][0]["workload"], "static");
+        assert_eq!(value["results"][0]["metric"], "frame_wall_time_us");
     }
 
     #[test]
@@ -1555,6 +1936,7 @@ mod tests {
         let stats = frame_stats(&durations).unwrap();
         let result = test_result(
             Scenario::Solid,
+            Workload::Static,
             durations
                 .iter()
                 .map(|d| d.as_nanos() as f64 / 1000.)
@@ -1576,14 +1958,14 @@ mod tests {
 
     #[test]
     fn report_preserves_fractional_microseconds() {
-        let result = test_result(Scenario::Solid, vec![100.5], None);
+        let result = test_result(Scenario::Solid, Workload::Static, vec![100.5], None);
         let json = serde_json::to_value(&result).unwrap();
         assert_close(json["samples_us"][0].as_f64().unwrap(), 100.5);
     }
 
     #[test]
     fn smoke_result_has_empty_samples_and_null_statistics() {
-        let mut result = test_result(Scenario::Solid, vec![], None);
+        let mut result = test_result(Scenario::Solid, Workload::Static, vec![], None);
         result.observed_synchronization = SyncObservations {
             frames_with_fence: 1,
             frames_without_fence: 0,
@@ -1612,6 +1994,116 @@ mod tests {
         // Unknown dirty status must not become a false "clean" claim.
         assert!(json["checkout_dirty"].is_null());
         assert_eq!(json["revision_source"], "runtime_checkout");
+    }
+
+    // --- Resize cycle (CPU-only; no EGL or GPU) ---
+
+    #[test]
+    fn resize_progress_hits_exact_cycle_extremes() {
+        // The cycle must render the exact minimum at both ends and the exact
+        // maximum in the middle — a drift here would silently skip geometry.
+        assert_eq!(resize_progress(0), 0.);
+        assert_eq!(resize_progress(RESIZE_CYCLE_STEPS / 2), 1.);
+        assert_eq!(resize_progress(RESIZE_CYCLE_STEPS), 0.);
+        // The cycle repeats identically.
+        assert_eq!(
+            resize_progress(RESIZE_CYCLE_STEPS + RESIZE_CYCLE_STEPS / 2),
+            1.
+        );
+    }
+
+    #[test]
+    fn resize_progress_is_monotonic_within_half_cycles() {
+        let mut prev = resize_progress(0);
+        for step in 1..=RESIZE_CYCLE_STEPS / 2 {
+            let p = resize_progress(step);
+            assert!(p > prev, "step {step}: progress must grow to the max");
+            prev = p;
+        }
+        for step in RESIZE_CYCLE_STEPS / 2 + 1..=RESIZE_CYCLE_STEPS {
+            let p = resize_progress(step);
+            assert!(p < prev, "step {step}: progress must shrink to the min");
+            prev = p;
+        }
+    }
+
+    #[test]
+    fn resize_win_size_stays_inside_ring_slots() {
+        // Every ring must fit its 548x1424 slot at every cycle step, or the
+        // dst_fits_in_target check would fail mid-run.
+        for step in 0..=RESIZE_CYCLE_STEPS {
+            let size = resize_win_size(step);
+            assert!(
+                size.w + BORDER_WIDTH * 2. <= RING_STEP,
+                "step {step}: width {} + borders exceeds slot {}",
+                size.w,
+                RING_STEP
+            );
+            assert!(
+                size.h + BORDER_WIDTH * 2. <= TARGET_SIZE.1 as f64,
+                "step {step}: height {} + borders exceeds target {}",
+                size.h,
+                TARGET_SIZE.1
+            );
+            // Corner segments need positive straight edges: win + 2*border
+            // must exceed 2*outer_radius.
+            assert!(
+                size.w + BORDER_WIDTH * 2. > f64::from(OUTER_RADIUS) * 2.,
+                "step {step}: width too small for corner radius"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_win_size_endpoints_match_min_and_max() {
+        let min = resize_win_size(0);
+        assert_close(min.w, RESIZE_MIN_SIZE.0);
+        assert_close(min.h, RESIZE_MIN_SIZE.1);
+        let max = resize_win_size(RESIZE_CYCLE_STEPS / 2);
+        assert_close(max.w, WIN_SIZE.0);
+        assert_close(max.h, WIN_SIZE.1);
+        // Full cycle returns to the minimum.
+        let end = resize_win_size(RESIZE_CYCLE_STEPS);
+        assert_close(end.w, RESIZE_MIN_SIZE.0);
+        assert_close(end.h, RESIZE_MIN_SIZE.1);
+    }
+
+    #[test]
+    fn resize_metadata_reports_cycle_params() {
+        let metadata = test_metadata_resize();
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(json["workloads"][1], "resize");
+        let resize = &json["resize"];
+        assert_eq!(resize["cycle_steps"], RESIZE_CYCLE_STEPS as u64);
+        assert_eq!(resize["easing"], "cosine");
+        assert_close(
+            resize["min_window_size"][0].as_f64().unwrap(),
+            RESIZE_MIN_SIZE.0,
+        );
+        assert_close(resize["max_window_size"][1].as_f64().unwrap(), WIN_SIZE.1);
+    }
+
+    #[test]
+    fn resize_result_carries_stage_metrics() {
+        let mut result = test_result(Scenario::Solid, Workload::Resize, vec![10.], None);
+        result.stages = Some(StageMetrics {
+            update_us: vec![3.],
+            render_us: vec![7.],
+            update_statistics: Some(frame_stats(&[us(3.)]).unwrap()),
+            render_statistics: Some(frame_stats(&[us(7.)]).unwrap()),
+        });
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["workload"], "resize");
+        assert_close(json["stages"]["update_us"][0].as_f64().unwrap(), 3.);
+        assert_close(json["stages"]["render_us"][0].as_f64().unwrap(), 7.);
+        assert_eq!(json["stages"]["update_statistics"]["count"], 1);
+    }
+
+    #[test]
+    fn static_result_has_null_stages() {
+        let result = test_result(Scenario::Solid, Workload::Static, vec![10.], None);
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json["stages"].is_null());
     }
 
     #[test]
