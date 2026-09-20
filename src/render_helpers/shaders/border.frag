@@ -587,17 +587,19 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
         knit_accent_mix(yarn_column, base_row));
     average.rgb *= mix(0.85, 0.72, relief);
 
-    // Cut a yarn-correlated edge inward without enlarging the border geometry.
+    // Cut the outer edge and expose backing under the inner yarn edge.
     // Noise follows the visible yarn, not screen pixels; unresolved yarn uses its mean.
     // Limit both the notches and their AA to preserve the centre of thin bands.
-    float edge = min(frame.z, border_width - frame.z);
     float edge_depth = min(stitch_width * mix(0.10, 0.20, pile), border_width * 0.20);
     float edge_noise = mix(0.5, bundles.x, resolved);
     float edge_inset = edge_depth * mix(0.2, 1.0, edge_noise);
     float edge_aa = min(1.0 / max(niri_scale, 0.001), max(border_width * 0.25, 0.001));
-    float silhouette = smoothstep(edge_inset, edge_inset + edge_aa, edge);
-    // Mask premultiplied RGBA after the LOD mix so its average cannot fill the cuts.
-    return mix(average, fabric, resolved) * silhouette;
+    float outer_coverage = smoothstep(edge_inset, edge_inset + edge_aa, frame.z);
+    float inner_coverage = smoothstep(edge_inset, edge_inset + edge_aa, border_width - frame.z);
+    // The backing reaches the window; inner notches change material, not coverage.
+    fabric = mix(ground, fabric, inner_coverage);
+    // Filter inner detail with the yarn, but keep the outer cuts at every LOD.
+    return mix(average, fabric, resolved) * outer_coverage;
 }
 
 vec4 knit_color(vec2 geometry_coords, vec4 base_color) {
