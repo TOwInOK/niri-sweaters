@@ -66,6 +66,27 @@ Move the view horizontally with three-finger horizontal swipes.
 
 Open and close the overview with a four-finger vertical swipe.
 
+#### Desktop Zoom
+
+<sup>Since: next release</sup>
+
+You can control the desktop zoom with a touchpad pinch gesture by setting [`pinch-fingers`](./Configuration:-Miscellaneous.md#pinch-fingers) in the `zoom` config section:
+
+```kdl
+zoom {
+    pinch-fingers 3
+}
+```
+
+This is an opt-in: while unset, the compositor does not claim pinch gestures and applications receive all of them.
+Only pinch gestures with exactly the configured number of fingers control the zoom.
+Moving the fingers apart zooms in, and moving them together zooms out.
+
+> [!WARNING]
+> `pinch-fingers 2` claims two-finger pinch gestures for the compositor, so applications will no longer receive those matching pinch gestures.
+
+See the [`zoom` config section](./Configuration:-Miscellaneous.md#zoom_1) for the rest of the desktop zoom settings.
+
 ### Touchscreen
 
 #### Interactive Move

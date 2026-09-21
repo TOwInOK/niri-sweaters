@@ -171,7 +171,8 @@ binds {
 
 ### Actions
 
-Every action that you can bind is also available for programmatic invocation via `niri msg action`.
+Almost every action that you can bind is also available for programmatic invocation via `niri msg action`.
+The exception is actions whose semantics depend on the physical bind lifecycle, such as [`hold-zoom`](#zoom).
 Run `niri msg action` to get a full list of actions along with their short descriptions.
 
 Here are a few actions that benefit from more explanation.
@@ -416,3 +417,29 @@ binds {
     Super+Alt+L allow-inhibiting=false { spawn "swaylock"; }
 }
 ```
+
+#### `zoom`
+
+<sup>Since: next release</sup>
+
+Actions for desktop zoom, which magnifies the rendered desktop without changing the output scale.
+See the [Accessibility](./Accessibility.md#desktop-zoom) page for an overview and the [`zoom` config section](./Configuration:-Miscellaneous.md#zoom_1) for the settings.
+
+```kdl
+binds {
+    Mod+Z { toggle-zoom 2.0; }
+    Mod+X { hold-zoom 2.0; }
+    Mod+0 { reset-zoom; }
+}
+```
+
+- `zoom-in`: multiplies the target zoom level by [`increment-factor`](./Configuration:-Miscellaneous.md#increment-factor), clamped between 1× and `max-zoom`.
+- `zoom-out`: divides the target zoom level by `increment-factor`, ending at exactly 1×.
+- `set-zoom-level <LEVEL>`: sets the target zoom level to `LEVEL`, which must be at least `1`. Values above `max-zoom` are clamped to it.
+- `reset-zoom`: returns the target zoom level to 1×.
+- `toggle-zoom-lock`: toggles the zoom lock. While locked, the zoomed viewport no longer follows the pointer.
+- `toggle-zoom <LEVEL>`: if the current target zoom level is above 1×, returns it to 1×; otherwise zooms to `LEVEL`. `LEVEL` must be greater than `1` and is clamped to `max-zoom`. It is the preset used when entering zoom, not a permanent fixed target.
+- `hold-zoom <LEVEL>`: pressing the trigger remembers the current zoom view and temporarily zooms to `LEVEL`; releasing the same trigger restores the previous view, not simply 1×. `LEVEL` must be greater than `1` and is clamped to `max-zoom`.
+
+`hold-zoom` is bind-only: it is not available through `niri msg action`, since its semantics depend on the physical press and release.
+The trigger must have a release event, so scroll binds cannot be used for `hold-zoom`.

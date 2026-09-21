@@ -446,6 +446,8 @@ animations {
 
 #### `zoom`
 
+<sup>Since: next release</sup>
+
 The transition animation of the desktop zoom level for actions like `zoom-in`, `zoom-out`, `set-zoom-level`, `reset-zoom` and `toggle-zoom`.
 
 ```kdl

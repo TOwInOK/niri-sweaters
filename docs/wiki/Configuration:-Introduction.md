@@ -8,6 +8,7 @@ You can find documentation for various sections of the config on these wiki page
 * [`switch-events {}`](./Configuration:-Switch-Events.md)
 * [`layout {}`](./Configuration:-Layout.md)
 * [top-level options](./Configuration:-Miscellaneous.md)
+* [`zoom {}`](./Configuration:-Miscellaneous.md#zoom_1)
 * [`window-rule {}`](./Configuration:-Window-Rules.md)
 * [`layer-rule {}`](./Configuration:-Layer-Rules.md)
 * [`animations {}`](./Configuration:-Animations.md)

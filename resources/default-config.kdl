@@ -314,6 +314,14 @@ animations {
     // slowdown 3.0
 }
 
+// Desktop zoom magnifies the rendered desktop without changing the output scale.
+// Find more information on the wiki:
+// https://niri-wm.github.io/niri/Configuration:-Miscellaneous
+// zoom {
+//     // Enable three-finger pinch for desktop zoom.
+//     // pinch-fingers 3
+// }
+
 // Window rules let you adjust behavior for individual windows.
 // Find more information on the wiki:
 // https://niri-wm.github.io/niri/Configuration:-Window-Rules
@@ -408,6 +416,11 @@ binds {
     // You can also move the mouse into the top-left hot corner,
     // or do a four-finger swipe up on a touchpad.
     Mod+O repeat=false { toggle-overview; }
+
+    // Desktop zoom examples. No zoom binds are enabled by default.
+    // Mod+Z { toggle-zoom 2.0; }
+    // Mod+X { hold-zoom 2.0; }
+    // Mod+0 { reset-zoom; }
 
     Mod+Q repeat=false { close-window; }
 

@@ -42,4 +42,34 @@ If you're shipping niri and would like to make it work better for screen readers
 
 ## Desktop zoom
 
-There's no built-in zoom yet, but you can use third-party utilities like [wooz](https://github.com/negrel/wooz).
+<sup>Since: next release</sup>
+
+Niri has a built-in desktop zoom that magnifies the rendered desktop without changing the output scale.
+Clients are not asked to re-render at a higher scale, so high or fractional zoom levels may look softer.
+
+Desktop zoom is controlled through [bind actions](./Configuration:-Key-Bindings.md#zoom), for example:
+
+```kdl
+binds {
+    Mod+Z { toggle-zoom 2.0; }
+    Mod+X { hold-zoom 2.0; }
+}
+```
+
+Each output keeps its own zoom state.
+Zoom actions apply to the output under the pointer, or to the focused output when the pointer is not on any output.
+
+While zoomed, the viewport follows the pointer.
+The [`deadzone-size` setting](./Configuration:-Miscellaneous.md#deadzone-size) controls how far the pointer can move before the viewport follows.
+The `toggle-zoom-lock` action fixes the viewport and disables this pointer tracking.
+
+You can also zoom with a touchpad pinch gesture by setting [`pinch-fingers`](./Configuration:-Miscellaneous.md#pinch-fingers) in the `zoom` config section.
+This is an opt-in: for example, `pinch-fingers 2` claims two-finger pinch gestures for the compositor, so applications will no longer receive those matching pinch gestures.
+
+Opening the [Overview](./Overview.md) temporarily returns the desktop to normal scale; the zoom level is restored when the Overview closes.
+Desktop zoom does not affect the lock screen.
+
+Monitor screenshots and monitor screencasts include desktop zoom.
+Window-only screenshots and window casts capture the window unzoomed.
+
+As an alternative, you can use third-party utilities like [wooz](https://github.com/negrel/wooz).

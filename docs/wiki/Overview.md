@@ -18,6 +18,8 @@ While in the overview, all keyboard shortcuts keep working, while pointing devic
 - Touchpad: two-finger scrolling that matches the normal three-finger gestures.
 - Touchscreen: one-finger scrolling, or one-finger long press to move a window.
 
+Desktop zoom is temporarily suppressed while the Overview is open, and restored when it closes.
+
 > [!TIP]
 > The overview needs to draw a background under every workspace.
 > So, layer-shell surfaces work this way: the *background* and *bottom* layers zoom out together with the workspaces, while the *top* and *overlay* layers remain on top of the overview.

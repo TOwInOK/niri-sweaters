@@ -62,6 +62,13 @@ blur {
     noise 0.02
     saturation 1.5
 }
+
+zoom {
+    max-zoom 10.0
+    increment-factor 1.2
+    deadzone-size 0.5
+    // pinch-fingers 3
+}
 ```
 
 ### `spawn-at-startup`
@@ -407,3 +414,82 @@ blur {
     saturation 1.5
 }
 ```
+
+### `zoom`
+
+<sup>Since: next release</sup>
+
+Settings for desktop zoom, which magnifies the rendered desktop without changing the output scale.
+See the [Accessibility](./Accessibility.md#desktop-zoom) page for an overview and the [Key Bindings](./Configuration:-Key-Bindings.md#zoom) page for the zoom actions.
+
+```kdl
+// These are the default values:
+zoom {
+    max-zoom 10.0
+    increment-factor 1.2
+    deadzone-size 0.5
+    // pinch-fingers 3
+}
+```
+
+#### `max-zoom`
+
+The upper limit for the desktop zoom level.
+Zoom actions and pinch gestures are clamped to it.
+Must be at least `1`; defaults to `10.0`.
+
+```kdl
+zoom {
+    max-zoom 4.0
+}
+```
+
+#### `increment-factor`
+
+The multiplier used by the `zoom-in` and `zoom-out` actions.
+`zoom-in` multiplies the target zoom level by `increment-factor`, and `zoom-out` divides it by the same factor.
+It does not affect pinch gesture scaling.
+Must be greater than `1`; defaults to `1.2`.
+
+```kdl
+zoom {
+    increment-factor 1.5
+}
+```
+
+#### `deadzone-size`
+
+While zoomed, the viewport follows the pointer.
+`deadzone-size` is the fraction of the output size, centered on the output, in which the pointer can move without moving the zoomed viewport.
+Ranges from `0` to `1`; defaults to `0.5`.
+
+- `0`: the viewport follows the pointer immediately, keeping it centered.
+- `1`: the viewport moves only when the pointer reaches the edges of the output.
+
+```kdl
+zoom {
+    deadzone-size 0.25
+}
+```
+
+#### `pinch-fingers`
+
+The number of fingers of a touchpad pinch gesture that controls the desktop zoom.
+Unset by default: the compositor does not claim pinch gestures, so applications receive all of them.
+Set it to an integer of at least `2` to opt in; only pinch gestures with exactly that many fingers control the zoom.
+Moving the fingers apart zooms in, and moving them together zooms out.
+
+> [!WARNING]
+> `pinch-fingers 2` claims two-finger pinch gestures for the compositor, so applications will no longer receive those matching pinch gestures.
+
+```kdl
+zoom {
+    pinch-fingers 3
+}
+```
+
+Each output keeps its own zoom state.
+Zoom actions apply to the output under the pointer, or to the focused output when the pointer is not on any output.
+Opening the [Overview](./Overview.md) temporarily suppresses the zoom, and the zoom level is restored when the Overview closes.
+Desktop zoom does not affect the lock screen.
+Monitor screenshots and monitor screencasts include desktop zoom; window-only screenshots and window casts do not.
