@@ -4951,10 +4951,17 @@ impl State {
         let pinch_fingers = self.niri.config.borrow().zoom.pinch_fingers;
         let pointer = self.niri.seat.get_pointer().unwrap();
 
-        let overview_active = self
+        // The claim is only allowed when the gesture can actually begin:
+        // without a target output and its monitor (e.g. no outputs connected)
+        // the begin would be swallowed and the client would receive update/end
+        // events for a begin it never saw.
+        let Some(mon) = self
             .zoom_target()
             .and_then(|(output, _)| self.niri.layout.monitor_for_output(&output))
-            .is_some_and(|mon| mon.overview_active());
+        else {
+            return false;
+        };
+        let overview_active = mon.overview_active();
 
         zoom_pinch_claim_allowed(ZoomPinchGates {
             pinch_fingers,

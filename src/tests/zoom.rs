@@ -5298,6 +5298,20 @@ fn zoom_pinch_claim_blocked_by_overview() {
 }
 
 #[test]
+fn zoom_pinch_claim_requires_target_output() {
+    // With no outputs there is no zoom target, so a matching pinch cannot be
+    // claimed: the begin must stay client-owned, or the client would receive
+    // update/end events for a begin it never saw.
+    let mut f = set_up_with_pinch();
+    let output = f.niri_output(1);
+    f.niri().remove_output(&output);
+    assert!(f.niri().layout.active_output().is_none());
+
+    assert!(!f.niri_state().can_claim_zoom_pinch(3));
+    assert!(zoom_pinch(&mut f).is_none());
+}
+
+#[test]
 fn zoom_pinch_begin_claims() {
     let mut f = set_up_with_pinch();
     let output = f.niri_output(1);
