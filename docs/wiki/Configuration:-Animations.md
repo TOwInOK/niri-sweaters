@@ -449,6 +449,10 @@ animations {
 <sup>Since: next release</sup>
 
 The transition animation of the desktop zoom level for actions like `zoom-in`, `zoom-out`, `set-zoom-level`, `reset-zoom` and `toggle-zoom`.
+It also drives the animated viewport restore when a `hold-zoom` bind is released.
+Pinch gestures set the zoom level directly and are not affected by this animation.
+
+Disabling this animation makes zoom level changes immediate, and also makes deadzone viewport adjustments immediate.
 
 ```kdl
 animations {

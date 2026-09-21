@@ -80,7 +80,10 @@ zoom {
 
 This is an opt-in: while unset, the compositor does not claim pinch gestures and applications receive all of them.
 Only pinch gestures with exactly the configured number of fingers control the zoom.
+The gesture is claimed when it begins, so a matching pinch belongs to the desktop zoom rather than the application.
 Moving the fingers apart zooms in, and moving them together zooms out.
+
+Three fingers are a good choice, since two-finger pinch gestures commonly belong to applications.
 
 > [!WARNING]
 > `pinch-fingers 2` claims two-finger pinch gestures for the compositor, so applications will no longer receive those matching pinch gestures.

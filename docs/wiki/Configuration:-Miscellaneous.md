@@ -428,7 +428,14 @@ zoom {
     max-zoom 10.0
     increment-factor 1.2
     deadzone-size 0.5
+    follow-min-speed 80
+    follow-max-speed 1400
     // pinch-fingers 3
+
+    // debug {
+    //     deadzone
+    //     focal-point
+    // }
 }
 ```
 
@@ -463,12 +470,39 @@ While zoomed, the viewport follows the pointer.
 `deadzone-size` is the fraction of the output size, centered on the output, in which the pointer can move without moving the zoomed viewport.
 Ranges from `0` to `1`; defaults to `0.5`.
 
-- `0`: the viewport follows the pointer immediately, keeping it centered.
-- `1`: the viewport moves only when the pointer reaches the edges of the output.
+- `0`: the deadzone collapses to the center of the output, so the viewport continuously keeps the pointer centered, like a classic centered magnifier.
+- `1`: the deadzone covers the whole output, so viewport following is effectively disabled.
+
+Once the pointer leaves the deadzone, the viewport starts following it and keeps moving—even if the pointer itself stops—until the pointer is visually back at the deadzone edge or the viewport reaches the output bounds.
 
 ```kdl
 zoom {
     deadzone-size 0.25
+}
+```
+
+#### `follow-min-speed`
+
+The speed of the viewport follow right at the deadzone edge, in displayed logical pixels per second.
+Must be greater than `0`; defaults to `80`.
+
+```kdl
+zoom {
+    follow-min-speed 40
+}
+```
+
+#### `follow-max-speed`
+
+The speed the viewport follow approaches when the pointer is near the corresponding output edge, in displayed logical pixels per second.
+Must be greater than `0` and at least `follow-min-speed`; defaults to `1400`.
+
+The follow speed grows smoothly with the pointer's distance outside the deadzone, and slows down again as the viewport catches up.
+Moving diagonally does not make the viewport follow faster just because both axes are active.
+
+```kdl
+zoom {
+    follow-max-speed 800
 }
 ```
 
@@ -477,7 +511,10 @@ zoom {
 The number of fingers of a touchpad pinch gesture that controls the desktop zoom.
 Unset by default: the compositor does not claim pinch gestures, so applications receive all of them.
 Set it to an integer of at least `2` to opt in; only pinch gestures with exactly that many fingers control the zoom.
+The gesture is claimed when it begins, so a matching pinch belongs to the desktop zoom rather than the application.
 Moving the fingers apart zooms in, and moving them together zooms out.
+
+Three fingers are a good choice, since two-finger pinch gestures commonly belong to applications.
 
 > [!WARNING]
 > `pinch-fingers 2` claims two-finger pinch gestures for the compositor, so applications will no longer receive those matching pinch gestures.
@@ -487,6 +524,24 @@ zoom {
     pinch-fingers 3
 }
 ```
+
+#### `debug`
+
+Draws compositor-side overlays that help tune the desktop zoom.
+
+```kdl
+zoom {
+    debug {
+        deadzone
+        focal-point
+    }
+}
+```
+
+- `deadzone`: outlines the current deadzone in red. With `deadzone-size 0`, when the deadzone collapses to a point, a crosshair marks the output center instead.
+- `focal-point`: marks the focal point of the zoom transform with an amber crosshair. At 1× the marker is dimmed: the focal point does not affect the normal view, but the compositor keeps it as part of the stored zoom state.
+
+The overlays are drawn on the physical output only; they are not included in screencasts or screen captures, and they are hidden while the Overview or the window switcher is open.
 
 Each output keeps its own zoom state.
 Zoom actions apply to the output under the pointer, or to the focused output when the pointer is not on any output.

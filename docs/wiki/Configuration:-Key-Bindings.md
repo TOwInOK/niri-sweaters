@@ -430,14 +430,20 @@ binds {
     Mod+Z { toggle-zoom 2.0; }
     Mod+X { hold-zoom 2.0; }
     Mod+0 { reset-zoom; }
+
+    // Mouse wheel zooming works too.
+    // Mod+WheelScrollUp { zoom-in; }
+    // Mod+WheelScrollDown { zoom-out; }
 }
 ```
+
+Zoom actions apply to the output under the pointer, or to the focused output when the pointer is not on any output.
 
 - `zoom-in`: multiplies the target zoom level by [`increment-factor`](./Configuration:-Miscellaneous.md#increment-factor), clamped between 1× and `max-zoom`.
 - `zoom-out`: divides the target zoom level by `increment-factor`, ending at exactly 1×.
 - `set-zoom-level <LEVEL>`: sets the target zoom level to `LEVEL`, which must be at least `1`. Values above `max-zoom` are clamped to it.
 - `reset-zoom`: returns the target zoom level to 1×.
-- `zoom-lock`: toggles the zoom lock. While locked, the zoomed viewport no longer follows the pointer. `zoom-lock hold=true` inverts the lock only while the trigger is held: pressing locks an unlocked viewport or unlocks a locked one, and releasing restores the previous state.
+- `zoom-lock`: toggles the zoom lock. While locked, the zoomed viewport no longer follows the pointer, and changing the zoom level keeps the content at the center of the viewport centered. `zoom-lock hold=true` inverts the lock only while the trigger is held: pressing locks an unlocked viewport or unlocks a locked one, and releasing restores the previous state.
 - `toggle-zoom <LEVEL>`: if the current target zoom level is above 1×, returns it to 1×; otherwise zooms to `LEVEL`. `LEVEL` must be greater than `1` and is clamped to `max-zoom`. It is the preset used when entering zoom, not a permanent fixed target. `toggle-zoom <LEVEL> hold=true` also locks the viewport while zoomed in and unlocks it when toggling back to 1×.
 - `hold-zoom <LEVEL>`: pressing the trigger remembers the current zoom view and temporarily zooms to `LEVEL`; releasing the same trigger restores the previous view, not simply 1×. `LEVEL` must be greater than `1` and is clamped to `max-zoom`. `hold-zoom <LEVEL> hold=true` also locks the viewport during the hold and restores the previous lock state on release.
 

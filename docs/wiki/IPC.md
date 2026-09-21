@@ -65,6 +65,20 @@ $ echo '{"Action":{"FocusWorkspace":{"reference":{"Id":8}}}}' | niri msg raw-req
 
 You can find all available requests and response types in the [niri-ipc sub-crate documentation](https://niri-wm.github.io/niri/niri_ipc/).
 
+### Desktop Zoom
+
+<sup>Since: next release</sup>
+
+`niri msg zoom` prints the [desktop zoom](./Accessibility.md#desktop-zoom) state of each output.
+With `--json`, the response is a list of objects with the following fields:
+
+- `output`: the output name.
+- `level`: the currently displayed zoom level. While a zoom transition is in progress this is the current animation sample; during a pinch gesture it is the level set by the latest gesture update.
+- `target_level`: the zoom level the output is transitioning towards. It equals `level` at rest and during a pinch gesture, and differs while a zoom animation or a `hold-zoom` restore is in progress.
+- `effective_level`: the zoom of the desktop scene after Overview suppression. While the Overview is open this is `1`; during the Overview transition it moves between `level` and `1`. It is not necessarily the transform currently visible on screen—for example, the lock screen is always shown unzoomed.
+- `focal`: the fixed point of the current zoom transform in output-local logical coordinates, as `[x, y]`.
+- `locked`: whether the zoom lock is enabled.
+
 ### Backwards Compatibility
 
 The JSON output *should* remain stable, as in:

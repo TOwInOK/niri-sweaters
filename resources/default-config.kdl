@@ -318,8 +318,20 @@ animations {
 // Find more information on the wiki:
 // https://niri-wm.github.io/niri/Configuration:-Miscellaneous
 // zoom {
+//     max-zoom 10.0
+//     increment-factor 1.2
+//     deadzone-size 0.5
+//     follow-min-speed 80
+//     follow-max-speed 1400
+//
 //     // Enable three-finger pinch for desktop zoom.
 //     // pinch-fingers 3
+//
+//     // Draw the deadzone and the focal point on screen for local tuning.
+//     // debug {
+//     //     deadzone
+//     //     focal-point
+//     // }
 // }
 
 // Window rules let you adjust behavior for individual windows.

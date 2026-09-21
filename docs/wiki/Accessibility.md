@@ -60,16 +60,29 @@ Each output keeps its own zoom state.
 Zoom actions apply to the output under the pointer, or to the focused output when the pointer is not on any output.
 
 While zoomed, the viewport follows the pointer.
-The [`deadzone-size` setting](./Configuration:-Miscellaneous.md#deadzone-size) controls how far the pointer can move before the viewport follows.
-The `zoom-lock` action fixes the viewport and disables this pointer tracking.
+The [`deadzone-size` setting](./Configuration:-Miscellaneous.md#deadzone-size) defines a centered area of the output in which the pointer can move without moving the zoomed viewport.
+Once the pointer leaves the deadzone, the viewport starts following it and keeps moving—even if the pointer itself stops—until the pointer is visually back at the deadzone edge or the viewport reaches the output bounds.
+The follow speed grows with the pointer's distance outside the deadzone, between [`follow-min-speed` and `follow-max-speed`](./Configuration:-Miscellaneous.md#follow-min-speed).
+
+Zooming in keeps the point under the pointer visually anchored.
+If the pointer is already outside the deadzone, the viewport starts following it during the zoom animation itself, so zooming and following read as one continuous movement.
+Zooming back out to 1× returns cleanly to the normal view.
+
+The `zoom-lock` action stops pointer-driven viewport following: while locked, moving the pointer does not pan the view, and the pointer stays confined to the visible area.
+Changing the zoom level while locked keeps the content at the center of the viewport centered.
+
+`hold-zoom` is a momentary zoom: pressing the trigger remembers the current view and temporarily zooms in, normal zoom interactions keep working while it is held, and releasing the trigger restores the previous view.
 
 You can also zoom with a touchpad pinch gesture by setting [`pinch-fingers`](./Configuration:-Miscellaneous.md#pinch-fingers) in the `zoom` config section.
-This is an opt-in: for example, `pinch-fingers 2` claims two-finger pinch gestures for the compositor, so applications will no longer receive those matching pinch gestures.
+This is an opt-in: a matching pinch gesture is claimed by the compositor when it begins, so applications will no longer receive pinch gestures with that finger count.
 
 Opening the [Overview](./Overview.md) temporarily returns the desktop to normal scale; the zoom level is restored when the Overview closes.
-Desktop zoom does not affect the lock screen.
+The lock screen is shown unzoomed; the stored zoom is restored when you unlock.
+Viewport following is also suspended while the screenshot UI or the window switcher is open.
 
 Monitor screenshots and monitor screencasts include desktop zoom.
 Window-only screenshots and window casts capture the window unzoomed.
+
+The `zoom` config section also has a [`debug` subsection](./Configuration:-Miscellaneous.md#debug) that can draw the deadzone and the focal point on screen for local tuning.
 
 As an alternative, you can use third-party utilities like [wooz](https://github.com/negrel/wooz).
