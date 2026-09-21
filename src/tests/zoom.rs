@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use approx::assert_abs_diff_eq;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
@@ -8,7 +10,6 @@ use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_lay
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use wayland_client::protocol::wl_pointer;
-use std::time::Duration;
 
 use super::client::{ClientId, LayerConfigureProps};
 use super::fixture::Fixture;
@@ -94,13 +95,8 @@ fn set_up() -> Fixture {
 /// its displayed position, which at level 1 is the anchor itself, so the focal
 /// point becomes `anchor`.
 fn set_zoom(f: &mut Fixture, output: &Output, level: f64, anchor: Point<f64, Logical>) {
-    let mon = f
-        .niri()
-        .layout
-        .monitor_for_output_mut(output)
-        .unwrap();
-    mon.zoom_mut()
-        .set_level_immediate(level, anchor);
+    let mon = f.niri().layout.monitor_for_output_mut(output).unwrap();
+    mon.zoom_mut().set_level_immediate(level, anchor);
 }
 
 fn render_elements(
@@ -156,10 +152,7 @@ fn add_top_layer(f: &mut Fixture, id: ClientId, height: u16) -> Rectangle<i32, L
     layer.ack_last_and_commit();
     f.double_roundtrip(id);
 
-    Rectangle::new(
-        Point::from((0, 0)),
-        Size::from((1920, i32::from(height))),
-    )
+    Rectangle::new(Point::from((0, 0)), Size::from((1920, i32::from(height))))
 }
 
 #[test]
@@ -234,10 +227,7 @@ fn zoom_geometry_2x() {
 
     // display = focal + (content - focal) * level, in physical pixels.
     let scale = Scale::from(output.current_scale().fractional_scale());
-    let expected = Rectangle::new(
-        Point::from((-100, -100)),
-        Size::from((200, 200)),
-    );
+    let expected = Rectangle::new(Point::from((-100, -100)), Size::from((200, 200)));
     assert_eq!(layer.geometry(scale), expected);
     let _ = layer_geo;
 }
@@ -303,15 +293,14 @@ fn zoom_focal_change_moves_geometry() {
 
     // Move the focal point: with a zero-size deadzone, a cursor at (0, 0) pulls
     // the viewport to the output corner, i.e. focal (0, 0).
-    let mon = f
-        .niri()
-        .layout
-        .monitor_for_output_mut(&output)
-        .unwrap();
+    let mon = f.niri().layout.monitor_for_output_mut(&output).unwrap();
     let changed = mon
         .zoom_mut()
         .update_focal_for_cursor(Point::from((0., 0.)), 0.);
-    assert!(changed, "focal must move when the cursor leaves the deadzone");
+    assert!(
+        changed,
+        "focal must move when the cursor leaves the deadzone"
+    );
 
     let after = geometry(&mut f);
     assert_ne!(before, after, "focal change must change render geometry");
@@ -370,7 +359,14 @@ fn zoom_damage_on_focal_change() {
     let mut f = set_up();
     let output = f.niri_output(1);
     let id = f.add_client();
-    open_window(&mut f, id, "zoom-damage-focal", 400, 300, [0xff, 0, 0, 0xff]);
+    open_window(
+        &mut f,
+        id,
+        "zoom-damage-focal",
+        400,
+        300,
+        [0xff, 0, 0, 0xff],
+    );
 
     let size = output.current_mode().unwrap().size;
     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -391,11 +387,7 @@ fn zoom_damage_on_focal_change() {
     );
 
     // Move the focal point to (0, 0).
-    let mon = f
-        .niri()
-        .layout
-        .monitor_for_output_mut(&output)
-        .unwrap();
+    let mon = f.niri().layout.monitor_for_output_mut(&output).unwrap();
     assert!(mon
         .zoom_mut()
         .update_focal_for_cursor(Point::from((0., 0.)), 0.));
@@ -461,7 +453,14 @@ fn zoom_window_pixels_2x() {
     }
     let output = f.niri_output(1);
     let id = f.add_client();
-    open_window(&mut f, id, "zoom-pixels", 400, 300, [0x40, 0x80, 0xc0, 0xff]);
+    open_window(
+        &mut f,
+        id,
+        "zoom-pixels",
+        400,
+        300,
+        [0x40, 0x80, 0xc0, 0xff],
+    );
 
     let (size, pixels) = render_output_rgba(f.niri_state(), &output);
     let before = color_bbox(&pixels, size, [0x40, 0x80, 0xc0]);
@@ -496,11 +495,14 @@ fn zoom_window_pixels_2x() {
     }
 }
 
-use niri_config::{Action, FloatOrInt, Bind, Key, Modifiers, MruDirection, Trigger, ZoomLevelPreset};
-use smithay::backend::renderer::element::Kind;
-use smithay::wayland::seat::WaylandFocus;
+use niri_config::{
+    Action, Bind, FloatOrInt, Key, Modifiers, MruDirection, Trigger, ZoomLevelPreset,
+};
 use smithay::backend::input::Keycode;
+use smithay::backend::renderer::element::Kind;
 use smithay::input::keyboard::Keysym;
+use smithay::wayland::seat::WaylandFocus;
+
 use crate::input::{ZoomHoldTrigger, ZoomPinchRouting};
 
 fn color_bbox(
@@ -513,10 +515,7 @@ fn color_bbox(
     let mut found = false;
 
     for (i, px) in pixels.chunks_exact(4).enumerate() {
-        let matches = px[..3]
-            .iter()
-            .zip(rgb)
-            .all(|(a, b)| a.abs_diff(b) <= 2);
+        let matches = px[..3].iter().zip(rgb).all(|(a, b)| a.abs_diff(b) <= 2);
         if !matches {
             continue;
         }
@@ -529,15 +528,8 @@ fn color_bbox(
         max.y = max.y.max(y);
     }
 
-    found.then(|| {
-        Rectangle::new(
-            min,
-            Size::from((max.x - min.x + 1, max.y - min.y + 1)),
-        )
-    })
+    found.then(|| Rectangle::new(min, Size::from((max.x - min.x + 1, max.y - min.y + 1))))
 }
-
-
 
 fn cursor_hotspot(f: &mut Fixture, output: &Output) -> Point<f64, Logical> {
     let niri = f.niri();
@@ -547,7 +539,9 @@ fn cursor_hotspot(f: &mut Fixture, output: &Output) -> Point<f64, Logical> {
         crate::cursor::RenderCursor::Surface { hotspot, .. } => hotspot.to_f64(),
         crate::cursor::RenderCursor::Named { scale, cursor, .. } => {
             let (_, frame) = cursor.frame(niri.start_time.elapsed().as_millis() as u32);
-            crate::cursor::XCursor::hotspot(frame).to_logical(scale).to_f64()
+            crate::cursor::XCursor::hotspot(frame)
+                .to_logical(scale)
+                .to_f64()
         }
     }
 }
@@ -565,7 +559,6 @@ fn advance_clock(f: &mut Fixture, ms: u64) {
     f.niri().clock.set_rate(0.);
     f.niri().advance_animations();
 }
-
 
 /// Renders the output including the pointer and returns the physical location
 /// of every pointer element.
@@ -728,11 +721,7 @@ fn zoom_lock_clamps_pointer_to_viewport() {
 
     set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
     {
-        let mon = f
-            .niri()
-            .layout
-            .monitor_for_output_mut(&output)
-            .unwrap();
+        let mon = f.niri().layout.monitor_for_output_mut(&output).unwrap();
         mon.zoom_mut().set_locked(true);
     }
     f.niri_state().move_cursor(Point::from((960., 360.)));
@@ -752,11 +741,7 @@ fn zoom_lock_1x_does_not_clamp() {
     let id = f.add_client();
 
     {
-        let mon = f
-            .niri()
-            .layout
-            .monitor_for_output_mut(&output)
-            .unwrap();
+        let mon = f.niri().layout.monitor_for_output_mut(&output).unwrap();
         mon.zoom_mut().set_locked(true);
     }
     f.niri_state().move_cursor(Point::from((1900., 360.)));
@@ -842,8 +827,6 @@ fn zoom_dnd_icon_follows_display_pointer() {
     );
 }
 
-
-
 /// Sends an absolute pointer motion in the supplied logical display rectangle.
 fn move_pointer_absolute(
     f: &mut Fixture,
@@ -889,7 +872,6 @@ fn global_output_bounds(f: &mut Fixture) -> Rectangle<i32, Logical> {
         Size::from((max_x - min_x, max_y - min_y)),
     )
 }
-
 
 #[test]
 fn zoom_absolute_pointer_identity() {
@@ -980,10 +962,7 @@ fn zoom_absolute_pointer_applies_output_transform_before_zoom() {
     move_pointer_absolute(&mut f, id, raw, raw_size, Some(0));
 
     let actual = pointer_location(&mut f);
-    assert_eq!(
-        actual,
-        focal + Point::from((20., 0.))
-    );
+    assert_eq!(actual, focal + Point::from((20., 0.)));
 }
 
 #[test]
@@ -1069,13 +1048,7 @@ fn zoom_absolute_pointer_explicit_output_mapping() {
     let extent = f.niri().global_space.output_geometry(&output).unwrap().size;
 
     set_zoom(&mut f, &output, 2., Point::from((100., 360.)));
-    move_pointer_absolute(
-        &mut f,
-        id,
-        Point::from((600., 360.)),
-        extent,
-        Some(0),
-    );
+    move_pointer_absolute(&mut f, id, Point::from((600., 360.)), extent, Some(0));
 
     assert_eq!(pointer_location(&mut f), Point::from((350., 360.)));
 }
@@ -1094,13 +1067,18 @@ fn zoom_absolute_pointer_hot_corner_uses_display_space() {
     assert!(f.niri().pointer_inside_hot_corner);
 }
 
-
-
 fn displayed_pointer_location(f: &mut Fixture) -> Point<f64, Logical> {
     let location = pointer_location(f);
     let niri = f.niri();
-    let (output, local) = niri.output_under(location).expect("pointer must be on output");
-    let origin = niri.global_space.output_geometry(output).unwrap().loc.to_f64();
+    let (output, local) = niri
+        .output_under(location)
+        .expect("pointer must be on output");
+    let origin = niri
+        .global_space
+        .output_geometry(output)
+        .unwrap()
+        .loc
+        .to_f64();
     let transform = niri
         .layout
         .monitor_for_output(output)
@@ -1113,12 +1091,7 @@ fn displayed_pointer_location(f: &mut Fixture) -> Point<f64, Logical> {
 fn silent_warp(f: &mut Fixture, requested: Point<f64, Logical>) -> Point<f64, Logical> {
     let state = f.niri_state();
     let (target, output) = state.prepare_zoom_warp_target(requested);
-    state
-        .niri
-        .seat
-        .get_pointer()
-        .unwrap()
-        .set_location(target);
+    state.niri.seat.get_pointer().unwrap().set_location(target);
     state.update_zoom_focal_for_cursor(target, output.as_ref());
     target
 }
@@ -1145,7 +1118,10 @@ fn zoom_programmatic_warp_inside_deadzone_preserves_focal() {
 
     assert_eq!(pointer_location(&mut f), target);
     assert_eq!(zoom_focal(&mut f, &output), focal);
-    assert_eq!(displayed_pointer_location(&mut f), Point::from((1040., 360.)));
+    assert_eq!(
+        displayed_pointer_location(&mut f),
+        Point::from((1040., 360.))
+    );
 }
 
 #[test]
@@ -1159,7 +1135,10 @@ fn zoom_programmatic_warp_outside_deadzone_tracks_immediately() {
 
     assert_eq!(pointer_location(&mut f), target);
     assert_eq!(zoom_focal(&mut f, &output), Point::from((1560., 360.)));
-    assert_eq!(displayed_pointer_location(&mut f), Point::from((1440., 360.)));
+    assert_eq!(
+        displayed_pointer_location(&mut f),
+        Point::from((1440., 360.))
+    );
 }
 
 #[test]
@@ -1186,8 +1165,15 @@ fn zoom_programmatic_warp_has_no_animation_step() {
 
     assert_eq!(zoom_focal(&mut f, &output), Point::from((1560., 360.)));
     let locs = pointer_element_locs(f.niri_state(), &output);
-    assert_eq!(locs.len(), 1, "expected one cursor element after immediate warp");
-    assert_eq!(displayed_pointer_location(&mut f), Point::from((1440., 360.)));
+    assert_eq!(
+        locs.len(),
+        1,
+        "expected one cursor element after immediate warp"
+    );
+    assert_eq!(
+        displayed_pointer_location(&mut f),
+        Point::from((1440., 360.))
+    );
 }
 
 #[test]
@@ -1252,7 +1238,13 @@ fn zoom_programmatic_warp_cross_output_uses_destination_identity() {
     f.add_output(2, (1920, 720));
     let output1 = f.niri_output(1);
     let output2 = f.niri_output(2);
-    let target = f.niri().global_space.output_geometry(&output2).unwrap().loc.to_f64()
+    let target = f
+        .niri()
+        .global_space
+        .output_geometry(&output2)
+        .unwrap()
+        .loc
+        .to_f64()
         + Point::from((200., 100.));
 
     set_zoom(&mut f, &output1, 2., Point::from((100., 100.)));
@@ -1279,7 +1271,10 @@ fn zoom_programmatic_warp_cross_output_unlocked_tracks_destination() {
     assert_eq!(pointer_location(&mut f), target);
     assert_eq!(zoom_focal(&mut f, &output1), Point::from((100., 100.)));
     assert_eq!(zoom_focal(&mut f, &output2), Point::from((1560., 360.)));
-    assert_eq!(displayed_pointer_location(&mut f), geo2.loc.to_f64() + Point::from((1440., 360.)));
+    assert_eq!(
+        displayed_pointer_location(&mut f),
+        geo2.loc.to_f64() + Point::from((1440., 360.))
+    );
 }
 
 #[test]
@@ -1390,7 +1385,10 @@ fn zoom_programmatic_warp_destination_is_rendered_after_focal_change() {
 
     let locs = pointer_element_locs(f.niri_state(), &output);
     assert_eq!(locs.len(), 1, "expected destination cursor to be rendered");
-    assert_eq!(displayed_pointer_location(&mut f), Point::from((1440., 360.)));
+    assert_eq!(
+        displayed_pointer_location(&mut f),
+        Point::from((1440., 360.))
+    );
 }
 
 #[test]
@@ -1405,8 +1403,6 @@ fn zoom_tablet_cursor_does_not_track_focal() {
 
     assert_eq!(zoom_focal(&mut f, &output), focal);
 }
-
-
 
 #[test]
 fn zoom_tablet_cursor_visual_2x_uses_canonical_location() {
@@ -1441,8 +1437,7 @@ fn zoom_tablet_cursor_visual_fractional_levels() {
         assert_eq!(locs.len(), 1, "expected one tablet cursor element");
         let hotspot = cursor_hotspot(&mut f, &output);
         let scale = Scale::from(output.current_scale().fractional_scale());
-        let expected = (Point::from((expected_x, 100.)) - hotspot)
-            .to_physical_precise_round(scale);
+        let expected = (Point::from((expected_x, 100.)) - hotspot).to_physical_precise_round(scale);
         assert_eq!(locs[0], expected);
     }
 }
@@ -1468,7 +1463,6 @@ fn zoom_tablet_cursor_locked_render_does_not_move_focal() {
     assert_eq!(zoom_focal(&mut f, &output), focal);
     assert_eq!(f.niri().tablet_cursor_location, Some(content));
 }
-
 
 #[test]
 fn zoom_geometry_fractional_output_scale() {
@@ -1976,16 +1970,12 @@ fn zoom_reload_max_clamps_per_output() {
     assert_eq!(zoom_level(&mut f, &output2), 2.);
 }
 
-
 fn reload_with_animated(f: &mut Fixture, extra: &str) {
     let config = niri_config::Config::parse_mem(&format!("{ANIMATED_CONFIG}\n{extra}")).unwrap();
     f.niri_state().reload_config(Ok(config));
 }
 
 // --- toggle-zoom / hold-zoom ---
-
-
-
 
 /// Simulates a `hold-zoom` bind press: the resolved bind is dispatched with
 /// the physical trigger identity, exactly as the input handlers do.
@@ -3142,7 +3132,6 @@ fn zoom_anim_redraw_scheduled_while_animating() {
     assert!(!f.niri().layout.are_animations_ongoing(Some(&output)));
 }
 
-
 // --- animated hold-zoom lifecycle ---
 
 /// Resizes the output's mode and notifies the compositor.
@@ -3763,7 +3752,6 @@ fn zoom_anim_hold_suspend_restores_immediately() {
     assert!(f.niri().zoom_hold.is_none());
 }
 
-
 #[test]
 fn zoom_anim_hold_global_off_is_immediate() {
     let mut f = set_up();
@@ -3878,10 +3866,6 @@ fn zoom_anim_hold_multi_output_independence() {
     assert_eq!(zoom_level(&mut f, &output2), 4.);
 }
 
-
-
-
-
 fn effective_zoom_transform(
     f: &mut Fixture,
     output: &Output,
@@ -3894,9 +3878,7 @@ fn effective_zoom_transform(
 }
 
 fn set_overview_progress(f: &mut Fixture, _output: &Output, progress: Option<f64>) {
-    f.niri()
-        .layout
-        .set_overview_progress_for_test(progress);
+    f.niri().layout.set_overview_progress_for_test(progress);
 }
 
 fn set_overview_open(f: &mut Fixture, _output: &Output, open: bool) {
@@ -4068,7 +4050,10 @@ fn zoom_overview_pointer_visual_and_deadzone_are_presentation_bound() {
     let scale = Scale::from(output.current_scale().fractional_scale());
     let locs = pointer_element_locs(f.niri_state(), &output);
     assert_eq!(locs.len(), 1);
-    assert_eq!(locs[0], (content - hotspot).to_physical_precise_round(scale));
+    assert_eq!(
+        locs[0],
+        (content - hotspot).to_physical_precise_round(scale)
+    );
     assert_eq!(zoom_focal(&mut f, &output), before_focal);
 
     set_overview_progress(&mut f, &output, Some(0.5));
@@ -4077,7 +4062,10 @@ fn zoom_overview_pointer_visual_and_deadzone_are_presentation_bound() {
         focal.x + (content.x - focal.x) * 2.,
         focal.y + (content.y - focal.y) * 2.,
     ));
-    assert_eq!(locs[0], (displayed - hotspot).to_physical_precise_round(scale));
+    assert_eq!(
+        locs[0],
+        (displayed - hotspot).to_physical_precise_round(scale)
+    );
 
     f.niri_state().move_cursor(Point::from((0., 0.)));
     assert_eq!(zoom_focal(&mut f, &output), before_focal);
@@ -4124,7 +4112,10 @@ fn zoom_overview_actions_hold_and_multi_output_state_survive() {
 
     f.niri().layout.toggle_overview();
     f.niri_complete_animations();
-    assert_eq!(effective_zoom_transform(&mut f, &output1).factor(), target_after_action);
+    assert_eq!(
+        effective_zoom_transform(&mut f, &output1).factor(),
+        target_after_action
+    );
     assert_eq!(effective_zoom_transform(&mut f, &output2).factor(), 4.);
 }
 
@@ -4149,9 +4140,7 @@ fn zoom_overview_hides_zoom_redraw_and_completes_from_clock() {
 
     let now = f.niri().clock.now_unadjusted();
     f.niri().clock.set_rate(1.);
-    f.niri()
-        .clock
-        .set_unadjusted(now + Duration::from_secs(5));
+    f.niri().clock.set_unadjusted(now + Duration::from_secs(5));
     let _ = f.niri().clock.now();
     f.niri().clock.set_rate(0.);
 
@@ -4203,7 +4192,6 @@ fn zoom_overview_output_add_and_remove_are_isolated() {
     assert_eq!(effective_zoom_transform(&mut f, &output1).factor(), 2.);
 }
 
-
 #[test]
 fn zoom_overview_preserves_stored_transition_state() {
     let mut f = set_up_animated();
@@ -4236,7 +4224,6 @@ fn zoom_overview_preserves_stored_transition_state() {
     assert_eq!(zoom_target_level(&mut f, &output), 4.);
     assert_eq!(zoom_focal(&mut f, &output), stored_focal);
 }
-
 
 #[test]
 fn zoom_displayed_pointer_uses_owner_output_transform() {

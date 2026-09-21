@@ -283,12 +283,14 @@ impl Client {
             .unwrap()
             .get_viewport(&surface, &self.qh, ());
         viewport.set_destination(i32::from(w), i32::from(h));
-        let buffer = self
-            .state
-            .spbm
-            .as_ref()
-            .unwrap()
-            .create_u32_rgba_buffer(0xff, 0xff, 0xff, 0xff, &self.qh, ());
+        let buffer = self.state.spbm.as_ref().unwrap().create_u32_rgba_buffer(
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            &self.qh,
+            (),
+        );
         surface.attach(Some(&buffer), 0, 0);
         surface
     }
@@ -319,10 +321,7 @@ impl Client {
     }
 
     /// Last preferred buffer transform received on the surface.
-    pub fn surface_transform(
-        &mut self,
-        surface: &WlSurface,
-    ) -> Option<wl_output::Transform> {
+    pub fn surface_transform(&mut self, surface: &WlSurface) -> Option<wl_output::Transform> {
         self.state.surface_transforms.get(&surface.id()).copied()
     }
 }

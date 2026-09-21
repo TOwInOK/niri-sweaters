@@ -6154,7 +6154,6 @@ impl Niri {
         }
     }
 
-
     /// Sends cursor position, hotspot and size to cursor sessions independently
     /// of the cursor image.
     pub fn refresh_image_copy_cursor_sessions(&mut self) {
@@ -6202,7 +6201,8 @@ impl Niri {
             let hotspot = Point::<i32, Physical>::from((hotspot.x, hotspot.y));
             let cursor_size = Size::<i32, Physical>::from((cursor_size.w, cursor_size.h));
             let pos = self.image_copy_cursor_pos(&output, geo, mode, cursor_size, hotspot);
-            s.session.set_cursor_pos(pos.map(|pos| Point::from((pos.x, pos.y))));
+            s.session
+                .set_cursor_pos(pos.map(|pos| Point::from((pos.x, pos.y))));
         }
         // This shouldn't be possible since sessions are only added from the
         // ImageCopyCaptureHandler callbacks, which run in dispatch_clients()

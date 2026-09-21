@@ -3833,9 +3833,7 @@ impl State {
     where
         I::Device: 'static,
     {
-        let Some(location) = self.compute_tablet_location(event) else {
-            return None;
-        };
+        let location = self.compute_tablet_location(event)?;
         let pos = location.content;
 
         if let Some(output) = self.niri.screenshot_ui.selection_output() {
