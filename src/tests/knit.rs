@@ -5,7 +5,7 @@ use niri_config::Config;
 use smithay::backend::renderer::gles::ffi;
 use smithay::output::Output;
 use smithay::reexports::gbm::Format as Fourcc;
-use smithay::utils::{Physical, Scale, Size, Transform};
+use smithay::utils::{Physical, Scale, Size};
 
 use super::client::ClientId;
 use super::*;
@@ -50,7 +50,8 @@ pub(crate) fn render_output_rgba(
 ) -> (Size<i32, Physical>, Vec<u8>) {
     state.niri.update_render_elements(Some(output));
 
-    let size = output.current_mode().unwrap().size;
+    let transform = output.current_transform();
+    let size = transform.transform_size(output.current_mode().unwrap().size);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     let pixels = state
@@ -67,7 +68,7 @@ pub(crate) fn render_output_rgba(
                 renderer,
                 size,
                 scale,
-                Transform::Normal,
+                transform,
                 Fourcc::Abgr8888,
                 elements.iter().rev(),
             )
@@ -87,7 +88,7 @@ fn golden_path(name: &str) -> PathBuf {
 /// Compares the rendered pixels against the golden image.
 ///
 /// Run with `NIRI_GOLDEN_UPDATE=1` to (re)generate the golden images.
-fn assert_golden(name: &str, size: Size<i32, Physical>, pixels: &[u8]) {
+pub(crate) fn assert_golden(name: &str, size: Size<i32, Physical>, pixels: &[u8]) {
     let path = golden_path(name);
     let width = size.w as u32;
     let height = size.h as u32;
@@ -104,7 +105,7 @@ fn assert_golden(name: &str, size: Size<i32, Physical>, pixels: &[u8]) {
         Ok(file) => file,
         Err(err) => panic!(
             "error opening golden {}: {err}\n\
-             generate it with: NIRI_GOLDEN_UPDATE=1 cargo test knit",
+             generate it with: NIRI_GOLDEN_UPDATE=1 cargo test {name}",
             path.display()
         ),
     };

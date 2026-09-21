@@ -14,7 +14,7 @@ use wayland_client::protocol::wl_pointer;
 
 use super::client::{ClientId, LayerConfigureProps};
 use super::fixture::Fixture;
-use super::knit::{assert_llvmpipe, open_window, render_output_rgba};
+use super::knit::{assert_golden, assert_llvmpipe, open_window, render_output_rgba};
 use crate::layout::zoom::OutputZoomState;
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::background_effect::RenderParams;
@@ -139,6 +139,16 @@ fn is_zoomed<R: NiriRenderer>(elem: &OutputRenderElements<R>) -> bool {
 /// Returns the surface's logical geometry, which is deterministic: the layer
 /// is anchored to the top edge with a fixed height.
 fn add_top_layer(f: &mut Fixture, id: ClientId, height: u16) -> Rectangle<i32, Logical> {
+    add_top_layer_with_color(f, id, height, [0, 0, 0, 0])
+}
+
+/// Adds a top-anchored layer surface with a solid-color buffer.
+fn add_top_layer_with_color(
+    f: &mut Fixture,
+    id: ClientId,
+    height: u16,
+    rgba: [u32; 4],
+) -> Rectangle<i32, Logical> {
     let layer = f.client(id).create_layer(None, Layer::Top, "");
     let surface = layer.surface.clone();
     layer.set_configure_props(LayerConfigureProps {
@@ -150,7 +160,7 @@ fn add_top_layer(f: &mut Fixture, id: ClientId, height: u16) -> Rectangle<i32, L
     f.roundtrip(id);
 
     let layer = f.client(id).layer(&surface);
-    layer.attach_new_buffer();
+    layer.attach_new_buffer_with_color(rgba[0], rgba[1], rgba[2], rgba[3]);
     layer.set_size(100, 100);
     layer.ack_last_and_commit();
     f.double_roundtrip(id);
@@ -1001,7 +1011,6 @@ fn zoom_relative_motion_scaled() {
 #[test]
 fn zoom_relative_motion_1x() {
     let mut f = set_up();
-    let output = f.niri_output(1);
     let id = f.add_client();
 
     f.niri_state().move_cursor(Point::from((960., 360.)));
@@ -6573,4 +6582,212 @@ fn zoom_follow_static_pointer_moves_camera() {
     // stays outside the deadzone and no further correction is possible.
     assert_eq!(zoom_focal(&mut f, &output), Point::from((0., 0.)));
     assert_eq!(displayed_pointer_location(&mut f), Point::from((0., 0.)));
+}
+
+// --- golden image tests ---
+//
+// Pixel-exact regression coverage for the zoom presentation paths. The
+// reference images are deterministic only on llvmpipe; regenerate them with
+// NIRI_GOLDEN_UPDATE=1.
+//
+// The scene is four 480-wide solid-color columns (red, green, blue, yellow)
+// so that the zoom level and the focal point are both visible in the frame:
+// a content seam lands on the focal point, and the level controls how far
+// apart the remaining seams sit.
+
+const GOLDEN_CONFIG: &str = r#"
+animations {
+    off
+}
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+layout {
+    gaps 0
+    default-column-width { fixed 480; }
+}
+"#;
+
+const GOLDEN_ROTATED_CONFIG: &str = r#"
+animations {
+    off
+}
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+output "headless-1" {
+    transform "90"
+}
+
+layout {
+    gaps 0
+    default-column-width { fixed 480; }
+}
+"#;
+
+const GOLDEN_FRACTIONAL_SCALE_CONFIG: &str = r#"
+animations {
+    off
+}
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+output "headless-1" {
+    scale 1.5
+}
+
+layout {
+    gaps 0
+    default-column-width { fixed 480; }
+}
+"#;
+
+/// Four solid-color windows filling the output: red, green, blue, yellow.
+fn golden_scene(f: &mut Fixture) -> ClientId {
+    let id = f.add_client();
+    open_window(
+        f,
+        id,
+        "golden-red",
+        480,
+        720,
+        [0xffffffff, 0, 0, 0xffffffff],
+    );
+    open_window(
+        f,
+        id,
+        "golden-green",
+        480,
+        720,
+        [0, 0xffffffff, 0, 0xffffffff],
+    );
+    open_window(
+        f,
+        id,
+        "golden-blue",
+        480,
+        720,
+        [0, 0, 0xffffffff, 0xffffffff],
+    );
+    open_window(
+        f,
+        id,
+        "golden-yellow",
+        480,
+        720,
+        [0xffffffff, 0xffffffff, 0, 0xffffffff],
+    );
+    id
+}
+
+fn assert_zoom_golden(f: &mut Fixture, output: &Output, name: &str) {
+    let (size, pixels) = render_output_rgba(f.niri_state(), output);
+    assert_golden(name, size, &pixels);
+}
+
+#[test]
+fn zoom_golden_2x() {
+    let mut f = set_up_with_config(GOLDEN_CONFIG);
+    assert_llvmpipe(f.niri_state());
+    let output = f.niri_output(1);
+    golden_scene(&mut f);
+
+    // Focal on the green/blue seam: green on the left half, blue on the right.
+    set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
+    assert_zoom_golden(&mut f, &output, "zoom_2x");
+}
+
+#[test]
+fn zoom_golden_fractional() {
+    let mut f = set_up_with_config(GOLDEN_CONFIG);
+    assert_llvmpipe(f.niri_state());
+    let output = f.niri_output(1);
+    golden_scene(&mut f);
+
+    // Same focal as zoom_2x but level 1.5: the outer seams move inward,
+    // showing all four columns.
+    set_zoom(&mut f, &output, 1.5, Point::from((960., 360.)));
+    assert_zoom_golden(&mut f, &output, "zoom_fractional");
+}
+
+#[test]
+fn zoom_golden_pan() {
+    let mut f = set_up_with_config(GOLDEN_CONFIG);
+    assert_llvmpipe(f.niri_state());
+    let output = f.niri_output(1);
+    golden_scene(&mut f);
+
+    // A focal point right of center pans the viewport: the green/blue seam
+    // sits right of the output center.
+    set_zoom(&mut f, &output, 2., Point::from((1200., 360.)));
+    assert_zoom_golden(&mut f, &output, "zoom_pan");
+}
+
+#[test]
+fn zoom_golden_layer() {
+    let mut f = set_up_with_config(GOLDEN_CONFIG);
+    assert_llvmpipe(f.niri_state());
+    let output = f.niri_output(1);
+    let id = golden_scene(&mut f);
+    add_top_layer_with_color(&mut f, id, 80, [0, 0, 0, 0xffffffff]);
+
+    set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
+    assert_zoom_golden(&mut f, &output, "zoom_layer");
+}
+
+#[test]
+fn zoom_golden_debug() {
+    let mut f = set_up_debug();
+    assert_llvmpipe(f.niri_state());
+    let output = f.niri_output(1);
+    golden_scene(&mut f);
+
+    set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
+    assert_zoom_golden(&mut f, &output, "zoom_debug");
+}
+
+#[test]
+fn zoom_golden_overview() {
+    let mut f = set_up_with_config(GOLDEN_CONFIG);
+    assert_llvmpipe(f.niri_state());
+    let output = f.niri_output(1);
+    golden_scene(&mut f);
+
+    // Overview at 50% suppresses the stored 2x to an effective ~1.41x: the
+    // outer seams move inward compared to zoom_2x.
+    set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
+    set_overview_open(&mut f, &output, true);
+    set_overview_progress(&mut f, &output, Some(0.5));
+    assert_zoom_golden(&mut f, &output, "zoom_overview");
+}
+
+#[test]
+fn zoom_golden_rotated() {
+    let mut f = set_up_with_config(GOLDEN_ROTATED_CONFIG);
+    assert_llvmpipe(f.niri_state());
+    let output = f.niri_output(1);
+    golden_scene(&mut f);
+
+    // The logical output is 720x1920 after the 90-degree transform.
+    set_zoom(&mut f, &output, 2., Point::from((360., 960.)));
+    assert_zoom_golden(&mut f, &output, "zoom_rotated");
+}
+
+#[test]
+fn zoom_golden_fractional_scale() {
+    let mut f = set_up_with_config(GOLDEN_FRACTIONAL_SCALE_CONFIG);
+    assert_llvmpipe(f.niri_state());
+    let output = f.niri_output(1);
+    golden_scene(&mut f);
+
+    // The logical output is 1280x480 at scale 1.5; focal on the red/green
+    // seam shows all three columns plus the empty tail.
+    set_zoom(&mut f, &output, 2., Point::from((480., 240.)));
+    assert_zoom_golden(&mut f, &output, "zoom_fractional_scale");
 }
