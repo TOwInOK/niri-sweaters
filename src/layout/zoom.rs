@@ -4,6 +4,8 @@
 //! viewport/deadzone math on top of [`ViewportTransform`]. All coordinates are
 //! output-local logical. Rendering and input integration live elsewhere.
 
+use std::time::Duration;
+
 use smithay::utils::{Logical, Point, Rectangle, Size};
 use tracing::trace;
 
@@ -33,6 +35,13 @@ pub struct OutputZoomState {
     view_size: Size<f64, Logical>,
     /// In-progress zoom level transition, if any.
     transition: Option<ZoomLevelTransition>,
+    /// Timestamp of the last deadzone follow evaluation.
+    ///
+    /// Updated on every `update_follow` call and on every commit of an
+    /// active follow, so the distance-driven step always uses the elapsed
+    /// time since the previous evaluation — including the frame a follow is
+    /// created on.
+    last_follow_eval: Option<Duration>,
 }
 
 /// An in-progress zoom level transition.
@@ -46,6 +55,15 @@ enum ZoomLevelTransition {
         animation: Animation,
         /// How the focal point behaves while the level animates.
         focal: ZoomTransitionFocal,
+        /// Deadzone drift of the anchor's displayed position, if any.
+        ///
+        /// While the displayed cursor is outside the deadzone during a level
+        /// transition, the anchor's display position moves towards the
+        /// deadzone boundary with the shared distance-driven follow physics,
+        /// so the camera starts following immediately instead of waiting for
+        /// the level animation to finish. The value is the timestamp of the
+        /// last drift step, used to compute the frame delta.
+        display_follow: Option<Duration>,
     },
     /// A viewport restore driven by an [`Animation`] over progress `0 → 1`.
     ///
@@ -69,12 +87,6 @@ enum ZoomLevelTransition {
         clock: Clock,
         config: niri_config::Animation,
     },
-    /// Direct user manipulation of the zoom level, e.g. a touchpad pinch.
-    ///
-    /// There is no animation: each gesture event sets `current_level`
-    /// directly from the cumulative gesture scale relative to `start_level`,
-    /// and `target_level` tracks `current_level` so that the displayed state
-    /// is always the current user intent.
     Gesturing {
         /// The displayed level when the gesture began.
         start_level: f64,
@@ -82,6 +94,17 @@ enum ZoomLevelTransition {
         current_level: f64,
         /// How the focal point behaves while the level changes.
         focal: ZoomTransitionFocal,
+    },
+    /// A deadzone-driven camera follow at a resting zoom level.
+    ///
+    /// The level is already at its target; only the focal point moves,
+    /// driven by the shared distance-driven follow physics towards
+    /// `to_focal`. A follow is mutually exclusive with the other
+    /// transitions: it starts only once the level animation, restore or
+    /// gesture that owned the viewport has finished.
+    Follow {
+        /// The clamped focal point the follow converges to.
+        to_focal: Point<f64, Logical>,
     },
 }
 
@@ -110,11 +133,30 @@ enum ZoomTransitionFocal {
         content: Point<f64, Logical>,
         display: Point<f64, Logical>,
     },
+
     /// The focal point stays fixed while the level animates.
     ///
     /// Used while the zoom is locked: the camera does not move, so the
     /// displayed content shifts relative to the screen instead.
     Fixed { focal: Point<f64, Logical> },
+}
+
+/// The distance-driven deadzone follow input for one frame.
+///
+/// Computed from the current displayed geometry only: no momentum or
+/// carried velocity is stored between frames.
+#[derive(Debug, Clone, Copy)]
+struct DeadzoneFollowInput {
+    /// Unit vector of the displayed overshoot, pointing away from the
+    /// deadzone. The camera moves the displayed point along `-direction`.
+    direction: Point<f64, Logical>,
+    /// The follow speed in displayed logical pixels per second, derived
+    /// from the relative overshoot depth through the smoothstep easing.
+    speed: f64,
+    /// The nearest point inside/on the deadzone: the displayed destination.
+    target: Point<f64, Logical>,
+    /// The Euclidean length of the displayed overshoot.
+    overshoot_length: f64,
 }
 
 impl OutputZoomState {
@@ -136,6 +178,7 @@ impl OutputZoomState {
             locked: false,
             view_size,
             transition: None,
+            last_follow_eval: None,
         }
     }
 
@@ -181,6 +224,11 @@ impl OutputZoomState {
                 let z = from_level.log2() + (to_level.log2() - from_level.log2()) * p;
                 z.exp2()
             }
+            ZoomLevelTransition::Follow { .. } => {
+                // The level is already resting at its target; a follow only
+                // moves the focal point.
+                self.level
+            }
         }
     }
 
@@ -205,6 +253,8 @@ impl OutputZoomState {
         match transition {
             ZoomLevelTransition::Animation { focal, .. }
             | ZoomLevelTransition::Gesturing { focal, .. } => match focal {
+                // The anchor's display position already carries any deadzone
+                // drift: it is mutated in place by the distance-driven step.
                 ZoomTransitionFocal::Anchored { content, display } => {
                     self.anchored_focal(*content, *display, self.level())
                 }
@@ -236,6 +286,11 @@ impl OutputZoomState {
                 ));
                 Self::clamp_focal(focal, self.view_size)
             }
+            ZoomLevelTransition::Follow { .. } => {
+                // The distance-driven follow mutates the committed focal
+                // point in place every frame.
+                Self::clamp_focal(self.focal, self.view_size)
+            }
         }
     }
 
@@ -250,8 +305,14 @@ impl OutputZoomState {
     /// events drive the displayed level directly and queue their own redraws.
     pub fn is_animating(&self) -> bool {
         match &self.transition {
-            Some(ZoomLevelTransition::Animation { animation, .. })
-            | Some(ZoomLevelTransition::Restore { animation, .. }) => !animation.is_clamped_done(),
+            Some(ZoomLevelTransition::Animation {
+                animation,
+                display_follow,
+                ..
+            }) => !animation.is_clamped_done() || display_follow.is_some(),
+            Some(ZoomLevelTransition::Restore { animation, .. }) => !animation.is_clamped_done(),
+            // A distance-driven follow animates until it reaches its target.
+            Some(ZoomLevelTransition::Follow { to_focal, .. }) => self.focal() != *to_focal,
             Some(ZoomLevelTransition::Gesturing { .. }) | None => false,
         }
     }
@@ -272,6 +333,10 @@ impl OutputZoomState {
     /// tracking the anchor. Unlocking keeps the current focal point; regular
     /// deadzone tracking can move it again on the next pointer event.
     pub fn set_locked(&mut self, locked: bool) {
+        // A follow owns the focal point: materialize its current displayed
+        // value first so the camera freezes where it actually is.
+        self.commit_follow_focal();
+
         self.locked = locked;
 
         if locked {
@@ -283,12 +348,23 @@ impl OutputZoomState {
                 self.convert_restore_to_level_animation(ZoomTransitionFocal::Fixed {
                     focal: current,
                 });
-            } else if let Some(
-                ZoomLevelTransition::Animation { focal, .. }
-                | ZoomLevelTransition::Gesturing { focal, .. },
-            ) = &mut self.transition
-            {
-                *focal = ZoomTransitionFocal::Fixed { focal: current };
+            } else {
+                match &mut self.transition {
+                    Some(ZoomLevelTransition::Animation {
+                        focal,
+                        display_follow,
+                        ..
+                    }) => {
+                        *focal = ZoomTransitionFocal::Fixed { focal: current };
+                        // The lock freezes the camera: drop any deadzone
+                        // drift so it cannot keep moving under the lock.
+                        *display_follow = None;
+                    }
+                    Some(ZoomLevelTransition::Gesturing { focal, .. }) => {
+                        *focal = ZoomTransitionFocal::Fixed { focal: current };
+                    }
+                    _ => (),
+                }
             }
         }
     }
@@ -304,7 +380,8 @@ impl OutputZoomState {
     /// `anchor` is a content position in output-local logical coordinates,
     /// typically the cursor. While unlocked, the transition keeps the anchor
     /// at its current displayed position where the output bounds allow it.
-    /// While locked, the focal point stays fixed instead.
+    /// While locked, the anchor is ignored and the viewport center stays
+    /// fixed instead.
     ///
     /// If a transition is already in progress, the new animation starts from
     /// the currently displayed level and preserves the current velocity when
@@ -330,14 +407,32 @@ impl OutputZoomState {
             return;
         }
 
+        // A follow owns the focal point: materialize its current displayed
+        // value so the new level animation starts from the real camera
+        // position, not the stale committed focal point.
+        self.commit_follow_focal();
+
         let from_level = self.level();
         let velocity = self.transition_log_velocity();
 
         self.target_level = level;
 
-        let focal = if self.locked {
+        let focal = if level == 1. {
+            // Zooming out to the identity transform: the anchored focal solve
+            // degenerates as the level approaches 1 (it divides by
+            // `level - 1`), so the focal point would fly to a clamped corner.
+            // Keep the current focal point fixed instead: the zoom-out
+            // pivots around its displayed position and lands continuously.
             ZoomTransitionFocal::Fixed {
                 focal: self.focal(),
+            }
+        } else if self.locked {
+            // A locked camera does not track the pointer: zoom around the
+            // viewport center so the viewed content stays centered.
+            let center = self.view_size.to_point().downscale(2.);
+            ZoomTransitionFocal::Anchored {
+                content: self.viewport_transform().apply_inverse(center),
+                display: center,
             }
         } else {
             ZoomTransitionFocal::Anchored {
@@ -346,6 +441,9 @@ impl OutputZoomState {
             }
         };
 
+        // The deadzone drift is not seeded here: the per-frame follow
+        // evaluation starts it on the first frame the displayed cursor is
+        // outside the deadzone.
         self.transition = Some(ZoomLevelTransition::Animation {
             animation: Animation::new(
                 clock.clone(),
@@ -355,6 +453,7 @@ impl OutputZoomState {
                 config,
             ),
             focal,
+            display_follow: None,
         });
     }
 
@@ -395,48 +494,32 @@ impl OutputZoomState {
         Rectangle::new(loc, size)
     }
 
-    /// Updates the focal point to follow the cursor.
+    /// The focal point that brings the displayed cursor back to the nearest
+    /// deadzone boundary, clamped to the output.
     ///
     /// `cursor` is the cursor position in output-local logical coordinates.
-    /// While the displayed cursor stays inside the deadzone the focal point
-    /// does not move. Once it leaves, the focal point moves just enough to
-    /// bring the displayed cursor back to the deadzone edge, unless that would
-    /// push the viewport outside the output—in that case the viewport stays
-    /// clamped and the cursor may remain outside the deadzone.
-    ///
-    /// During a transition the focal point is derived from the transition
-    /// state, so instead of writing the focal point this updates the
-    /// transition's anchor display position such that the derived focal point
-    /// equals the desired one at the current animated level. The level
-    /// animation continues uninterrupted.
-    ///
-    /// Does nothing while [`is_locked()`](Self::is_locked) or at `level == 1`.
-    ///
-    /// Returns `true` if the focal point changed.
+    /// Returns `None` when no camera movement is required: at `level == 1`,
+    /// while the displayed cursor is inside the deadzone, or when the clamped
+    /// target equals the currently displayed focal point (including the case
+    /// where the viewport clamp makes further correction impossible).
     ///
     /// # Panics
     ///
     /// Panics if `deadzone_size` is not finite or outside `[0, 1]`.
-    pub fn update_focal_for_cursor(
-        &mut self,
+    fn focal_target_for_cursor(
+        &self,
         cursor: Point<f64, Logical>,
         deadzone_size: f64,
-    ) -> bool {
-        // A gesture owns the viewport: the anchor is fixed at gesture begin
-        // and must not be re-pinned by pointer motion.
-        if self.is_gesturing() {
-            return false;
-        }
-
+    ) -> Option<Point<f64, Logical>> {
         let level = self.level();
-        if self.locked || level == 1. {
-            return false;
+        if level == 1. {
+            return None;
         }
 
         let deadzone = Self::deadzone_rect(self.view_size, deadzone_size);
         let display = self.viewport_transform().apply(cursor);
         if deadzone.contains(display) {
-            return false;
+            return None;
         }
 
         let desired = Point::<f64, Logical>::from((
@@ -448,25 +531,398 @@ impl OutputZoomState {
                 .clamp(deadzone.loc.y, deadzone.loc.y + deadzone.size.h),
         ));
 
-        // During a restore the camera is heading back to a saved focal point.
-        // User-driven tracking takes over: the restore becomes a regular level
-        // transition anchored on the cursor, so the level keeps animating
-        // towards the restore target while the focal point follows the cursor.
-        if matches!(self.transition, Some(ZoomLevelTransition::Restore { .. })) {
-            self.convert_restore_to_level_animation(ZoomTransitionFocal::Anchored {
-                content: cursor,
-                display: desired,
-            });
-            return true;
-        }
-
         // The focal point that places the content cursor at the desired
         // displayed position: display = focal + (cursor - focal) * level.
         let focal = Point::from((
             (level * cursor.x - desired.x) / (level - 1.),
             (level * cursor.y - desired.y) / (level - 1.),
         ));
-        self.set_current_focal(focal)
+        let focal = Self::clamp_focal(focal, self.view_size);
+
+        (focal != self.focal()).then_some(focal)
+    }
+
+    /// The distance-driven follow input for a displayed point.
+    ///
+    /// `display` is a point in displayed output-local logical coordinates,
+    /// typically the displayed cursor. Returns `None` when the point is
+    /// inside or on the deadzone: there is no overshoot and no follow.
+    ///
+    /// The intensity is the rectangular `L∞` relative depth of the
+    /// overshoot: each axis is normalized by the space available from the
+    /// crossed deadzone border to the output edge, and the intensity is the
+    /// maximum of the two. The direction is the Euclidean unit vector of the
+    /// overshoot. Keeping them separate means a diagonal overshoot at the
+    /// same relative depth produces the same speed as a single-axis one —
+    /// no `√2` boost.
+    fn deadzone_follow_input(
+        view_size: Size<f64, Logical>,
+        deadzone_size: f64,
+        display: Point<f64, Logical>,
+        min_speed: f64,
+        max_speed: f64,
+    ) -> Option<DeadzoneFollowInput> {
+        let deadzone = Self::deadzone_rect(view_size, deadzone_size);
+
+        // The nearest point inside/on the deadzone and the overshoot vector.
+        let target = Point::from((
+            display
+                .x
+                .clamp(deadzone.loc.x, deadzone.loc.x + deadzone.size.w),
+            display
+                .y
+                .clamp(deadzone.loc.y, deadzone.loc.y + deadzone.size.h),
+        ));
+        let overshoot = display - target;
+
+        // The space available for the overshoot on each axis, measured from
+        // the crossed deadzone border to the output edge in the overshoot
+        // direction. An axis without room (e.g. deadzone-size 1) contributes
+        // nothing and can never divide by zero.
+        let available_x = if overshoot.x > 0. {
+            view_size.w - (deadzone.loc.x + deadzone.size.w)
+        } else if overshoot.x < 0. {
+            deadzone.loc.x
+        } else {
+            0.
+        };
+        let available_y = if overshoot.y > 0. {
+            view_size.h - (deadzone.loc.y + deadzone.size.h)
+        } else if overshoot.y < 0. {
+            deadzone.loc.y
+        } else {
+            0.
+        };
+
+        let nx = if available_x > 0. {
+            (overshoot.x.abs() / available_x).clamp(0., 1.)
+        } else {
+            0.
+        };
+        let ny = if available_y > 0. {
+            (overshoot.y.abs() / available_y).clamp(0., 1.)
+        } else {
+            0.
+        };
+        let intensity = nx.max(ny);
+
+        let length = (overshoot.x * overshoot.x + overshoot.y * overshoot.y).sqrt();
+        if intensity == 0. || length == 0. {
+            return None;
+        }
+
+        // smoothstep(t) = t²(3 − 2t): gentle near the border, approaching
+        // max speed smoothly near the output edge.
+        let e = intensity * intensity * (3. - 2. * intensity);
+        let speed = min_speed + (max_speed - min_speed) * e;
+
+        Some(DeadzoneFollowInput {
+            direction: Point::from((overshoot.x / length, overshoot.y / length)),
+            speed,
+            target,
+            overshoot_length: length,
+        })
+    }
+
+    /// Evaluates deadzone tracking for the cursor.
+    ///
+    /// `cursor` is the cursor position in output-local logical coordinates.
+    /// While the displayed cursor stays inside the deadzone the focal point
+    /// does not move. Once it leaves, the camera smoothly follows the cursor
+    /// until the displayed cursor reaches the deadzone edge or the viewport
+    /// clamp makes further correction impossible.
+    ///
+    /// Pointer interaction during a restore takes over the camera: the
+    /// restore converts to a regular level transition anchored at the
+    /// cursor's current displayed position, so the level keeps animating
+    /// towards the restore target without a focal jump. During a level
+    /// animation the anchor owns the camera, but tracking still applies as a
+    /// drift of the anchor's display position towards the deadzone edge, so
+    /// the camera starts following the cursor during the zoom animation
+    /// rather than after it.
+    ///
+    /// Does nothing while [`is_locked()`](Self::is_locked), at `level == 1`,
+    /// or while a gesture owns the viewport.
+    ///
+    /// Returns `true` if the state changed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `deadzone_size` is not finite or outside `[0, 1]`.
+    pub fn update_focal_for_cursor(
+        &mut self,
+        cursor: Point<f64, Logical>,
+        zoom: niri_config::Zoom,
+        clock: &Clock,
+        config: niri_config::Animation,
+    ) -> bool {
+        // A gesture owns the viewport: the anchor is fixed at gesture begin
+        // and must not be re-pinned by pointer motion.
+        if self.is_gesturing() {
+            return false;
+        }
+
+        if self.locked || self.level() == 1. {
+            return false;
+        }
+
+        // During a level transition the anchor owns the camera: retarget the
+        // deadzone drift (or stop it when the cursor re-enters the deadzone)
+        // instead of evaluating a resting-level follow.
+        if matches!(self.transition, Some(ZoomLevelTransition::Animation { .. })) {
+            return self.update_follow(cursor, zoom, clock, config);
+        }
+
+        let Some(_) = self.focal_target_for_cursor(cursor, zoom.deadzone_size) else {
+            // The displayed cursor is inside the deadzone or already at the
+            // target: an active follow has nothing left to do.
+            return self.commit_follow_focal();
+        };
+
+        // During a restore the camera is heading back to a saved focal point.
+        // User-driven tracking takes over: the restore becomes a regular level
+        // transition anchored on the cursor at its current displayed position,
+        // so the level keeps animating towards the restore target while the
+        // camera stays continuous. The follow evaluation brings the cursor to
+        // the deadzone edge once the level animation completes.
+        if matches!(self.transition, Some(ZoomLevelTransition::Restore { .. })) {
+            let display = self.viewport_transform().apply(cursor);
+            self.convert_restore_to_level_animation(ZoomTransitionFocal::Anchored {
+                content: cursor,
+                display,
+            });
+            return true;
+        }
+
+        self.update_follow(cursor, zoom, clock, config)
+    }
+
+    /// Starts or retargets a deadzone follow for the cursor.
+    ///
+    /// This is the per-frame evaluation entry point. During a level
+    /// transition it retargets the anchor's deadzone drift instead of
+    /// starting a resting-level follow; a restore or gesture is never
+    /// disturbed. When the displayed cursor is inside the deadzone or
+    /// already at the clamped target, an active follow commits its current
+    /// displayed focal point and stops.
+    ///
+    /// With `config.off` the focal point is set immediately instead of
+    /// starting a follow.
+    ///
+    /// Returns `true` if the state changed.
+    pub fn update_follow(
+        &mut self,
+        cursor: Point<f64, Logical>,
+        zoom: niri_config::Zoom,
+        clock: &Clock,
+        config: niri_config::Animation,
+    ) -> bool {
+        // The evaluation timestamp is updated on every call, including early
+        // returns, so the distance-driven step always measures the elapsed
+        // time since the previous evaluation.
+        let now = clock.now_unadjusted();
+        let dt = self
+            .last_follow_eval
+            .map(|last| now.saturating_sub(last).as_secs_f64())
+            .unwrap_or(0.);
+        self.last_follow_eval = Some(now);
+
+        if self.locked {
+            // A locked camera does not track the pointer: no deadzone drift
+            // during a level transition, no resting-level follow.
+            return false;
+        }
+
+        match &self.transition {
+            // A level transition owns the camera through its anchor: retarget
+            // the deadzone drift instead of starting a resting-level follow.
+            Some(ZoomLevelTransition::Animation { .. }) => {
+                return self.update_display_follow(cursor, zoom, clock, config);
+            }
+            // A restore or gesture owns the viewport.
+            Some(ZoomLevelTransition::Restore { .. })
+            | Some(ZoomLevelTransition::Gesturing { .. }) => return false,
+            Some(ZoomLevelTransition::Follow { .. }) | None => (),
+        }
+
+        if self.level() == 1. {
+            return self.commit_follow_focal();
+        }
+
+        let Some(target) = self.focal_target_for_cursor(cursor, zoom.deadzone_size) else {
+            // Inside the deadzone or already at the clamped target: commit
+            // the current displayed focal point without a jump.
+            return self.commit_follow_focal();
+        };
+
+        if config.off || clock.should_complete_instantly() {
+            return self.set_current_focal(target);
+        }
+
+        let display = self.viewport_transform().apply(cursor);
+        let input = Self::deadzone_follow_input(
+            self.view_size,
+            zoom.deadzone_size,
+            display,
+            zoom.follow_min_speed,
+            zoom.follow_max_speed,
+        );
+
+        // Start a follow if none is active, then apply the distance-driven
+        // step for the elapsed time since the previous evaluation.
+        if !matches!(self.transition, Some(ZoomLevelTransition::Follow { .. })) {
+            self.transition = Some(ZoomLevelTransition::Follow { to_focal: target });
+        }
+        let Some(ZoomLevelTransition::Follow { to_focal }) = &mut self.transition else {
+            unreachable!();
+        };
+
+        // The follow target tracks the live cursor.
+        *to_focal = target;
+
+        // The distance-driven step: speed comes from the current displayed
+        // overshoot, direction from the remaining path to the target (which
+        // is parallel to the overshoot). The step is capped at the target so
+        // the camera can never cross the deadzone border.
+        let Some(input) = input else {
+            self.focal = target;
+            self.transition = None;
+            return true;
+        };
+
+        let distance = input.speed * dt;
+        let remaining = target - self.focal;
+        let rem_len = (remaining.x * remaining.x + remaining.y * remaining.y).sqrt();
+
+        if distance >= rem_len {
+            self.focal = target;
+            self.transition = None;
+        } else {
+            let scale = distance / rem_len;
+            self.focal = Point::from((
+                self.focal.x + remaining.x * scale,
+                self.focal.y + remaining.y * scale,
+            ));
+        }
+        true
+    }
+
+    /// Retargets the deadzone drift of an in-progress level transition.
+    ///
+    /// While the displayed cursor is outside the deadzone, the anchor is
+    /// re-pinned on the live cursor and its display position steps towards
+    /// the deadzone boundary with the shared distance-driven physics, so the
+    /// camera follows the cursor during the level animation rather than
+    /// after it. When the cursor re-enters the deadzone the drift stops:
+    /// the display position is already live, so nothing needs materializing.
+    ///
+    /// Does nothing unless the current transition is an anchored level
+    /// animation. Returns `true` if the state changed.
+    fn update_display_follow(
+        &mut self,
+        cursor: Point<f64, Logical>,
+        zoom: niri_config::Zoom,
+        clock: &Clock,
+        config: niri_config::Animation,
+    ) -> bool {
+        let display = self.viewport_transform().apply(cursor);
+        let input = Self::deadzone_follow_input(
+            self.view_size,
+            zoom.deadzone_size,
+            display,
+            zoom.follow_min_speed,
+            zoom.follow_max_speed,
+        );
+
+        // The drift only applies while the transition zooms in: at a target
+        // level of 1 the deadzone is meaningless.
+        let drift_allowed = self.target_level > 1. && input.is_some();
+
+        // Whether the drift target is reachable at the current level: when
+        // the output clamp already pins the camera, the anchor display
+        // position cannot move and no drift is started.
+        let reachable = drift_allowed
+            && self.anchored_focal(cursor, input.unwrap().target, self.level()) != self.focal();
+
+        let now = clock.now_unadjusted();
+        let Some(ZoomLevelTransition::Animation {
+            focal:
+                ZoomTransitionFocal::Anchored {
+                    content,
+                    display: anchor_display,
+                },
+            display_follow,
+            ..
+        }) = &mut self.transition
+        else {
+            return false;
+        };
+
+        if !drift_allowed || !reachable {
+            // The display position is live: dropping the drift marker stops
+            // the camera exactly where it is.
+            return display_follow.take().is_some();
+        }
+        let input = input.unwrap();
+
+        if config.off || clock.should_complete_instantly() {
+            // Instant completion: the drift jumps straight to the deadzone
+            // border.
+            *content = cursor;
+            *anchor_display = input.target;
+            *display_follow = None;
+            return true;
+        }
+        // Re-anchor on the live cursor: the camera pans so that the cursor's
+        // displayed position drifts towards the deadzone boundary.
+        *content = cursor;
+
+        let Some(last) = *display_follow else {
+            *display_follow = Some(now);
+            *anchor_display = display;
+            return true;
+        };
+
+        let dt = now.saturating_sub(last).as_secs_f64();
+        *display_follow = Some(now);
+
+        let distance = input.speed * dt;
+        if distance >= input.overshoot_length {
+            *anchor_display = input.target;
+            *display_follow = None;
+        } else {
+            *anchor_display = Point::from((
+                display.x - input.direction.x * distance,
+                display.y - input.direction.y * distance,
+            ));
+        }
+        true
+    }
+
+    /// Commits an active follow's current displayed focal point.
+    ///
+    /// The distance-driven follow mutates the committed focal point in
+    /// place every frame, so committing only drops the transition: the
+    /// camera stays exactly where it is. Does nothing unless a follow is
+    /// active.
+    ///
+    /// Returns `true` if a follow was committed.
+    pub fn commit_follow_focal(&mut self) -> bool {
+        if !matches!(self.transition, Some(ZoomLevelTransition::Follow { .. })) {
+            return false;
+        }
+
+        self.transition = None;
+        true
+    }
+
+    /// Notes a deadzone follow evaluation timestamp without stepping.
+    ///
+    /// Called by the per-frame driver for outputs where tracking is
+    /// suspended or the pointer is elsewhere: keeps the evaluation clock
+    /// fresh so a follow started later does not see a stale delta.
+    pub fn note_follow_eval(&mut self, clock: &Clock) {
+        self.last_follow_eval = Some(clock.now_unadjusted());
     }
 
     /// Sets the focal point that the current state should display.
@@ -479,6 +935,11 @@ impl OutputZoomState {
             return false;
         }
 
+        // A follow has no anchor to re-pin: materialize its current
+        // displayed focal point first so the write lands on the committed
+        // focal point.
+        self.commit_follow_focal();
+
         // A restore has no anchor to re-pin; it converts to a regular level
         // transition first so that the focal point can be set directly.
         if matches!(self.transition, Some(ZoomLevelTransition::Restore { .. })) {
@@ -489,36 +950,45 @@ impl OutputZoomState {
 
         let level = self.level();
         match &mut self.transition {
-            Some(
-                ZoomLevelTransition::Animation {
-                    focal: ZoomTransitionFocal::Anchored { content, display },
-                    ..
-                }
-                | ZoomLevelTransition::Gesturing {
-                    focal: ZoomTransitionFocal::Anchored { content, display },
-                    ..
-                },
-            ) => {
+            Some(ZoomLevelTransition::Animation {
+                focal: ZoomTransitionFocal::Anchored { content, display },
+                display_follow,
+                ..
+            }) => {
                 // Solve display = level * content - focal * (level - 1) so
-                // that the anchored focal resolves to `focal` right now.
+                // that the anchored focal resolves to `focal` right now. A
+                // deadzone drift is dropped: the explicit focal wins.
+                *display = Point::from((
+                    level * content.x - focal.x * (level - 1.),
+                    level * content.y - focal.y * (level - 1.),
+                ));
+                *display_follow = None;
+            }
+            Some(ZoomLevelTransition::Gesturing {
+                focal: ZoomTransitionFocal::Anchored { content, display },
+                ..
+            }) => {
                 *display = Point::from((
                     level * content.x - focal.x * (level - 1.),
                     level * content.y - focal.y * (level - 1.),
                 ));
             }
-            Some(
-                ZoomLevelTransition::Animation {
-                    focal: ZoomTransitionFocal::Fixed { focal: fixed },
-                    ..
-                }
-                | ZoomLevelTransition::Gesturing {
-                    focal: ZoomTransitionFocal::Fixed { focal: fixed },
-                    ..
-                },
-            ) => {
+            Some(ZoomLevelTransition::Animation {
+                focal: ZoomTransitionFocal::Fixed { focal: fixed },
+                display_follow,
+                ..
+            }) => {
+                *fixed = focal;
+                *display_follow = None;
+            }
+            Some(ZoomLevelTransition::Gesturing {
+                focal: ZoomTransitionFocal::Fixed { focal: fixed },
+                ..
+            }) => {
                 *fixed = focal;
             }
-            Some(ZoomLevelTransition::Restore { .. }) => unreachable!(),
+            Some(ZoomLevelTransition::Restore { .. })
+            | Some(ZoomLevelTransition::Follow { .. }) => unreachable!(),
             None => {
                 self.focal = focal;
             }
@@ -531,8 +1001,9 @@ impl OutputZoomState {
     /// displayed position where the output bounds allow it.
     ///
     /// `anchor` is a content position in output-local logical coordinates,
-    /// typically the cursor. Also sets `target_level` to `level` and cancels
-    /// any transition in progress.
+    /// typically the cursor; while locked it is ignored and the viewport
+    /// center is kept fixed instead. Also sets `target_level` to `level` and
+    /// cancels any transition in progress.
     ///
     /// At `level == 1` the transform is the identity, so the displayed
     /// position of `anchor` cannot be preserved; the focal point is still kept
@@ -543,6 +1014,19 @@ impl OutputZoomState {
     /// Panics if `level` is not finite or less than 1.
     pub fn set_level_immediate(&mut self, level: f64, anchor: Point<f64, Logical>) {
         assert!(level.is_finite() && level >= 1.);
+
+        // A follow owns the focal point: materialize its current displayed
+        // value so the camera position is not lost with the transition.
+        self.commit_follow_focal();
+
+        // A locked camera does not track the pointer: zoom around the
+        // viewport center so the viewed content stays centered.
+        let anchor = if self.locked {
+            let center = self.view_size.to_point().downscale(2.);
+            self.viewport_transform().apply_inverse(center)
+        } else {
+            anchor
+        };
 
         let screen_anchor = self.viewport_transform().apply(anchor);
 
@@ -571,17 +1055,25 @@ impl OutputZoomState {
     /// gesture base: a transition in progress is abandoned at its current
     /// displayed state, including a restore's saved destination. While
     /// unlocked, the anchor is kept at its current displayed position like a
-    /// regular zoom transition; while locked, the focal point stays fixed.
+    /// regular zoom transition; while locked, the viewport center stays fixed.
     ///
     /// `target_level` is set to the displayed level: during a gesture the
     /// displayed state is the current user intent.
     pub fn begin_gesture(&mut self, anchor: Point<f64, Logical>) {
+        // A follow owns the focal point: materialize its current displayed
+        // value so the gesture takes over the real camera position.
+        self.commit_follow_focal();
+
         let level = self.level();
         self.target_level = level;
 
         let focal = if self.locked {
-            ZoomTransitionFocal::Fixed {
-                focal: self.focal(),
+            // A locked camera does not track the pointer: zoom around the
+            // viewport center so the viewed content stays centered.
+            let center = self.view_size.to_point().downscale(2.);
+            ZoomTransitionFocal::Anchored {
+                content: self.viewport_transform().apply_inverse(center),
+                display: center,
             }
         } else {
             ZoomTransitionFocal::Anchored {
@@ -666,6 +1158,10 @@ impl OutputZoomState {
         assert!(view_size.w.is_finite() && view_size.h.is_finite());
         assert!(view_size.w >= 0. && view_size.h >= 0.);
 
+        // A follow owns the focal point: materialize its current displayed
+        // value so the resize clamp applies to the real camera position.
+        self.commit_follow_focal();
+
         self.view_size = view_size;
 
         if self.level() == 1. {
@@ -682,8 +1178,11 @@ impl OutputZoomState {
     /// clamped focal point are committed and the transition is dropped.
     pub fn advance_animations(&mut self) {
         let done = match &self.transition {
-            Some(ZoomLevelTransition::Animation { animation, .. })
-            | Some(ZoomLevelTransition::Restore { animation, .. }) => animation.is_clamped_done(),
+            Some(ZoomLevelTransition::Animation { animation, .. }) => animation.is_clamped_done(),
+            Some(ZoomLevelTransition::Restore { animation, .. }) => animation.is_clamped_done(),
+            // A distance-driven follow completes when the focal point
+            // reaches its target; the step caps exactly at it.
+            Some(ZoomLevelTransition::Follow { to_focal, .. }) => self.focal() == *to_focal,
             // A gesture is driven by input events, not the clock; it never
             // completes here.
             Some(ZoomLevelTransition::Gesturing { .. }) | None => return,
@@ -727,6 +1226,10 @@ impl OutputZoomState {
         assert!(snapshot.target_level.is_finite() && snapshot.target_level >= 1.);
         assert!(view_size.w.is_finite() && view_size.h.is_finite());
         assert!(view_size.w >= 0. && view_size.h >= 0.);
+
+        // A follow owns the focal point: materialize its current displayed
+        // value so the camera position is not lost with the transition.
+        self.commit_follow_focal();
 
         self.view_size = view_size;
         self.transition = None;
@@ -772,6 +1275,10 @@ impl OutputZoomState {
         assert!(snapshot.level.is_finite() && snapshot.level >= 1.);
         assert!(snapshot.target_level.is_finite() && snapshot.target_level >= 1.);
 
+        // A follow owns the focal point: materialize its current displayed
+        // value so the restore starts from the real camera position.
+        self.commit_follow_focal();
+
         if config.off {
             let view_size = self.view_size;
             self.restore_immediate(snapshot, view_size);
@@ -784,7 +1291,9 @@ impl OutputZoomState {
         if self.locked {
             // The lock is stronger than focal restoration: keep the camera
             // fixed and animate only the level towards the saved target.
-            let anchor = self.focal();
+            // `set_target_level` ignores the anchor while locked and zooms
+            // around the viewport center.
+            let anchor = self.view_size.to_point().downscale(2.);
             self.set_target_level(to_level, anchor, clock, config);
             return;
         }
@@ -842,7 +1351,9 @@ impl OutputZoomState {
                 let dz = to_level.log2() - from_level.log2();
                 animation.velocity().unwrap_or(0.) * dz
             }
-            Some(ZoomLevelTransition::Gesturing { .. }) | None => 0.,
+            Some(ZoomLevelTransition::Gesturing { .. })
+            | Some(ZoomLevelTransition::Follow { .. })
+            | None => 0.,
         }
     }
 
@@ -878,6 +1389,7 @@ impl OutputZoomState {
         self.transition = Some(ZoomLevelTransition::Animation {
             animation: Animation::new(clock, level.log2(), to_level.log2(), velocity, config),
             focal,
+            display_follow: None,
         });
     }
 
@@ -968,6 +1480,32 @@ mod tests {
         let now = clock.now_unadjusted() + std::time::Duration::from_millis(ms);
         clock.set_unadjusted(now);
         state.advance_animations();
+    }
+
+    /// Deadzone tracking with animations off: the focal point is set
+    /// immediately, like the pre-follow semantics.
+    fn track(state: &mut OutputZoomState, cursor: Point<f64, Logical>, deadzone: f64) -> bool {
+        let clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: deadzone,
+            ..Default::default()
+        };
+        state.update_focal_for_cursor(cursor, zoom, &clock, niri_config::Animation::new_off())
+    }
+
+    /// Deadzone follow evaluation with the given animation config.
+    fn follow(
+        state: &mut OutputZoomState,
+        cursor: Point<f64, Logical>,
+        deadzone: f64,
+        clock: &Clock,
+        config: niri_config::Animation,
+    ) -> bool {
+        let zoom = niri_config::Zoom {
+            deadzone_size: deadzone,
+            ..Default::default()
+        };
+        state.update_follow(cursor, zoom, clock, config)
     }
 
     fn assert_point_eq(a: Point<f64, Logical>, b: Point<f64, Logical>) {
@@ -1091,14 +1629,14 @@ mod tests {
         let cursor = state
             .viewport_transform()
             .apply_inverse(Point::from((960., 540.)));
-        assert!(!state.update_focal_for_cursor(cursor, 0.5));
+        assert!(!track(&mut state, cursor, 0.5));
         assert_point_eq(state.focal(), Point::from((960., 540.)));
 
         // Display (700, 400) is inside the deadzone but off-center.
         let cursor = state
             .viewport_transform()
             .apply_inverse(Point::from((700., 400.)));
-        assert!(!state.update_focal_for_cursor(cursor, 0.5));
+        assert!(!track(&mut state, cursor, 0.5));
         assert_point_eq(state.focal(), Point::from((960., 540.)));
     }
 
@@ -1112,7 +1650,7 @@ mod tests {
         let cursor = state
             .viewport_transform()
             .apply_inverse(Point::from((1700., 540.)));
-        assert!(state.update_focal_for_cursor(cursor, 0.5));
+        assert!(track(&mut state, cursor, 0.5));
 
         // The cursor lands on the deadzone's right edge.
         let display = state.viewport_transform().apply(cursor);
@@ -1130,7 +1668,7 @@ mod tests {
         let cursor = state
             .viewport_transform()
             .apply_inverse(Point::from((200., 540.)));
-        assert!(state.update_focal_for_cursor(cursor, 0.5));
+        assert!(track(&mut state, cursor, 0.5));
 
         let display = state.viewport_transform().apply(cursor);
         assert_point_eq(display, Point::from((480., 540.)));
@@ -1147,7 +1685,7 @@ mod tests {
         let cursor = state
             .viewport_transform()
             .apply_inverse(Point::from((960., 100.)));
-        assert!(state.update_focal_for_cursor(cursor, 0.5));
+        assert!(track(&mut state, cursor, 0.5));
 
         let display = state.viewport_transform().apply(cursor);
         assert_point_eq(display, Point::from((960., 270.)));
@@ -1164,7 +1702,7 @@ mod tests {
         let cursor = state
             .viewport_transform()
             .apply_inverse(Point::from((960., 1000.)));
-        assert!(state.update_focal_for_cursor(cursor, 0.5));
+        assert!(track(&mut state, cursor, 0.5));
 
         let display = state.viewport_transform().apply(cursor);
         assert_point_eq(display, Point::from((960., 810.)));
@@ -1181,7 +1719,7 @@ mod tests {
         let cursor = state
             .viewport_transform()
             .apply_inverse(Point::from((1800., 1000.)));
-        assert!(state.update_focal_for_cursor(cursor, 0.5));
+        assert!(track(&mut state, cursor, 0.5));
 
         // The cursor lands on the deadzone's bottom-right corner.
         let display = state.viewport_transform().apply(cursor);
@@ -1198,7 +1736,7 @@ mod tests {
         // Cursor near the left content edge: the deadzone would want focal
         // x = -480, but the viewport cannot leave the output.
         let cursor = Point::from((10., 540.));
-        assert!(state.update_focal_for_cursor(cursor, 0.5));
+        assert!(track(&mut state, cursor, 0.5));
 
         assert_point_eq(state.focal(), Point::from((0., 540.)));
         assert_viewport_within(state.viewport(), output);
@@ -1217,7 +1755,7 @@ mod tests {
 
         // With a zero deadzone the cursor is kept at the output center.
         let cursor = Point::from((1200., 700.));
-        assert!(state.update_focal_for_cursor(cursor, 0.));
+        assert!(track(&mut state, cursor, 0.));
         let display = state.viewport_transform().apply(cursor);
         assert_point_eq(display, Point::from((960., 540.)));
         assert_viewport_within(state.viewport(), output);
@@ -1225,7 +1763,7 @@ mod tests {
         // At the content edge the viewport clamps and the cursor leaves the
         // center.
         let cursor = Point::from((10., 540.));
-        assert!(state.update_focal_for_cursor(cursor, 0.));
+        assert!(track(&mut state, cursor, 0.));
         assert_point_eq(state.focal(), Point::from((0., 540.)));
         let display = state.viewport_transform().apply(cursor);
         assert_point_eq(display, Point::from((20., 540.)));
@@ -1241,13 +1779,13 @@ mod tests {
         // The deadzone covers the whole output: no tracking while the
         // displayed cursor is inside.
         let cursor = Point::from((1200., 700.));
-        assert!(!state.update_focal_for_cursor(cursor, 1.));
+        assert!(!track(&mut state, cursor, 1.));
         assert_point_eq(state.focal(), Point::from((960., 540.)));
 
         // Once the cursor would display outside the output, the focal point
         // pushes it back to the edge.
         let cursor = Point::from((1900., 540.));
-        assert!(state.update_focal_for_cursor(cursor, 1.));
+        assert!(track(&mut state, cursor, 1.));
         let display = state.viewport_transform().apply(cursor);
         assert_point_eq(display, Point::from((1920., 540.)));
         assert_viewport_within(state.viewport(), output);
@@ -1259,7 +1797,7 @@ mod tests {
         let mut state = OutputZoomState::new(view_size);
 
         for deadzone in [0., 0.5, 1.] {
-            assert!(!state.update_focal_for_cursor(Point::from((10., 10.)), deadzone));
+            assert!(!track(&mut state, Point::from((10., 10.)), deadzone));
             assert_point_eq(state.focal(), Point::from((960., 540.)));
         }
 
@@ -1277,12 +1815,12 @@ mod tests {
 
         // This cursor would move the focal point if not locked.
         let cursor = Point::from((1500., 540.));
-        assert!(!state.update_focal_for_cursor(cursor, 0.5));
+        assert!(!track(&mut state, cursor, 0.5));
         assert_point_eq(state.focal(), Point::from((960., 540.)));
 
         state.toggle_locked();
         assert!(!state.is_locked());
-        assert!(state.update_focal_for_cursor(cursor, 0.5));
+        assert!(track(&mut state, cursor, 0.5));
     }
 
     #[test]
@@ -1478,7 +2016,9 @@ mod tests {
         match &state.transition {
             Some(ZoomLevelTransition::Animation { animation, .. })
             | Some(ZoomLevelTransition::Restore { animation, .. }) => Some(animation),
-            Some(ZoomLevelTransition::Gesturing { .. }) | None => None,
+            Some(ZoomLevelTransition::Gesturing { .. })
+            | Some(ZoomLevelTransition::Follow { .. })
+            | None => None,
         }
     }
 
@@ -1791,7 +2331,7 @@ mod tests {
     }
 
     #[test]
-    fn transition_deadzone_moves_focal_immediately() {
+    fn transition_deadzone_drifts_during_level_animation() {
         let view_size = Size::from((1920., 1080.));
         let mut state = OutputZoomState::new(view_size);
         let mut clock = test_clock();
@@ -1800,21 +2340,27 @@ mod tests {
         state.set_target_level(2., anchor, &clock, test_anim_config());
         advance(&mut state, &mut clock, 50);
         let level = state.level();
-        let focal_before = state.focal();
 
-        // A cursor at the content corner is far outside the deadzone.
-        assert!(state.update_focal_for_cursor(Point::from((0., 0.)), 0.));
-        assert!(state.focal() != focal_before);
-
-        // The level animation is untouched and continues.
+        // A cursor at the content corner is far outside the deadzone: the
+        // level animation keeps owning the viewport, but tracking retargets
+        // the anchor's display position so the camera drifts during the
+        // animation. With the instant tracking config the drift lands
+        // immediately.
+        assert!(track(&mut state, Point::from((0., 0.)), 0.));
         assert!(state.is_animating());
         assert_eq!(state.level(), level);
+        assert_point_eq(state.focal(), Point::from((0., 0.)));
+
+        // Once the level animation completes the camera is already at the
+        // deadzone edge: no follow phase remains.
         advance(&mut state, &mut clock, 5000);
         assert_eq!(state.level(), 2.);
+        assert!(!track(&mut state, Point::from((0., 0.)), 0.));
+        assert_point_eq(state.focal(), Point::from((0., 0.)));
     }
 
     #[test]
-    fn transition_deadzone_keeps_derived_focal() {
+    fn transition_deadzone_drift_completes_with_animation() {
         let view_size = Size::from((1920., 1080.));
         let output = Rectangle::from_size(view_size);
         let mut state = OutputZoomState::new(view_size);
@@ -1824,39 +2370,96 @@ mod tests {
         state.set_target_level(2., anchor, &clock, test_anim_config());
         advance(&mut state, &mut clock, 50);
 
-        // Move the focal point through the deadzone path: the transition's
-        // anchor is re-pinned so that the derived focal equals the desired
-        // one at the current level.
-        assert!(state.update_focal_for_cursor(Point::from((0., 0.)), 0.));
-        assert_point_eq(state.focal(), Point::from((0., 0.)));
+        // Tracking during the level animation retargets the anchor drift.
+        assert!(track(&mut state, Point::from((0., 0.)), 0.));
 
-        // As the level keeps animating, the anchor-preserving solve takes
-        // over again; the focal point stays finite and the viewport within
-        // the output.
-        for _ in 0..20 {
-            advance(&mut state, &mut clock, 20);
-            assert_finite_point(state.focal());
-            assert_viewport_within(state.viewport(), output);
-        }
+        // Once the animation completes the camera is already at the deadzone
+        // edge: no separate follow phase runs.
+        advance(&mut state, &mut clock, 5000);
         assert_eq!(state.level(), 2.);
+        assert!(!state.is_animating());
+        assert!(!track(&mut state, Point::from((0., 0.)), 0.));
+        assert_point_eq(state.focal(), Point::from((0., 0.)));
+        assert_viewport_within(state.viewport(), output);
+    }
+
+    /// The displayed displacement of the cursor over one follow step.
+    fn follow_display_step(
+        state: &mut OutputZoomState,
+        cursor: Point<f64, Logical>,
+        deadzone: f64,
+        clock: &mut Clock,
+        ms: u64,
+    ) -> f64 {
+        let before = state.viewport_transform().apply(cursor);
+        advance(state, clock, ms);
+        let zoom = niri_config::Zoom {
+            deadzone_size: deadzone,
+            ..Default::default()
+        };
+        state.update_follow(cursor, zoom, clock, test_anim_config());
+        let after = state.viewport_transform().apply(cursor);
+        let d = after - before;
+        (d.x * d.x + d.y * d.y).sqrt()
     }
 
     #[test]
-    fn transition_locked_keeps_focal_fixed() {
+    fn follow_diagonal_speed_matches_axis() {
+        let view_size = Size::from((1080., 1080.));
+
+        // deadzone 0.5 on a square output: deadzone (270..810), available
+        // space 270 per side. A 135px overshoot is t = 0.5 on each axis.
+        // At level 2 with focal (540, 540): cursor = (display + 540) / 2.
+        // Horizontal: display (945, 540) -> cursor (742.5, 540).
+        // Diagonal: display (945, 945) -> cursor (742.5, 742.5).
+        let horizontal = Point::from((742.5, 540.));
+        let diagonal = Point::from((742.5, 742.5));
+
+        let mut state_h = state_at(2., Point::from((540., 540.)), view_size);
+        let mut state_d = state_at(2., Point::from((540., 540.)), view_size);
+
+        // Start the follows.
+        let clock0 = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        state_h.update_follow(horizontal, zoom, &clock0, test_anim_config());
+        state_d.update_follow(diagonal, zoom, &clock0, test_anim_config());
+
+        // Each state gets its own clock so both measure the same 16ms step.
+        let mut clock_h = test_clock();
+        let mut clock_d = test_clock();
+        let step_h = follow_display_step(&mut state_h, horizontal, 0.5, &mut clock_h, 16);
+        let step_d = follow_display_step(&mut state_d, diagonal, 0.5, &mut clock_d, 16);
+
+        // The distance-driven model gives the same speed magnitude for the
+        // same relative depth regardless of direction. The old per-axis
+        // springs moved the diagonal case ~sqrt(2) faster.
+        assert_abs_diff_eq!(step_d, step_h, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn transition_locked_keeps_viewport_center_fixed() {
         let view_size = Size::from((1920., 1080.));
         let mut state = state_at(2., Point::from((500., 400.)), view_size);
         state.set_locked(true);
         let mut clock = test_clock();
 
+        // The content point at the viewport center: it must stay fixed while
+        // the level animates, so the focal point moves.
+        let center = view_size.to_point().downscale(2.);
+        let center_content = state.viewport_transform().apply_inverse(center);
+
         state.set_target_level(4., Point::from((960., 540.)), &clock, test_anim_config());
 
         for _ in 0..20 {
             advance(&mut state, &mut clock, 10);
-            assert_point_eq(state.focal(), Point::from((500., 400.)));
+            assert_point_eq(state.viewport_transform().apply(center_content), center);
         }
         advance(&mut state, &mut clock, 5000);
         assert_eq!(state.level(), 4.);
-        assert_point_eq(state.focal(), Point::from((500., 400.)));
+        assert_point_eq(state.viewport_transform().apply(center_content), center);
     }
 
     #[test]
@@ -1877,12 +2480,17 @@ mod tests {
         state.set_locked(false);
         assert_point_eq(state.focal(), frozen);
 
-        // Deadzone tracking can move the focal point again.
-        assert!(state.update_focal_for_cursor(Point::from((0., 0.)), 0.));
-        assert_point_eq(state.focal(), Point::from((0., 0.)));
+        // Deadzone tracking waits for the level animation to finish.
+        assert!(!track(&mut state, Point::from((0., 0.)), 0.));
+        assert_point_eq(state.focal(), frozen);
 
         advance(&mut state, &mut clock, 5000);
         assert_eq!(state.level(), 3.);
+
+        // Once the animation completes, the follow evaluation moves the
+        // camera to the deadzone edge.
+        assert!(track(&mut state, Point::from((0., 0.)), 0.));
+        assert_point_eq(state.focal(), Point::from((0., 0.)));
     }
 
     #[test]
@@ -1993,7 +2601,7 @@ mod tests {
         let snapshot = snapshot_of(&state);
 
         // Move the camera away so the restore has to bring the focal back.
-        assert!(state.update_focal_for_cursor(Point::from((0., 0.)), 0.));
+        assert!(track(&mut state, Point::from((0., 0.)), 0.));
         assert_point_eq(state.focal(), Point::from((0., 0.)));
 
         state.restore_animated(snapshot, &clock, test_anim_config());
@@ -2026,7 +2634,7 @@ mod tests {
         let snapshot = snapshot_of(&state);
 
         // Same level, different focal: the restore is focal-only.
-        assert!(state.update_focal_for_cursor(Point::from((0., 0.)), 0.));
+        assert!(track(&mut state, Point::from((0., 0.)), 0.));
 
         state.restore_animated(snapshot, &clock, test_anim_config());
         assert!(state.is_animating());
@@ -2161,7 +2769,7 @@ mod tests {
         let mut clock = test_clock();
         let snapshot = snapshot_of(&state);
 
-        assert!(state.update_focal_for_cursor(Point::from((0., 0.)), 0.));
+        assert!(track(&mut state, Point::from((0., 0.)), 0.));
         // A slow easing restore so that it is still in flight when the
         // deadzone tracking kicks in.
         state.restore_animated(snapshot, &clock, easing_config(1000));
@@ -2170,9 +2778,11 @@ mod tests {
         assert!(state.is_animating());
 
         // Deadzone tracking during the restore abandons the saved focal
-        // destination and applies the desired focal immediately.
-        assert!(state.update_focal_for_cursor(Point::from((0., 0.)), 0.));
-        assert_point_eq(state.focal(), Point::from((0., 0.)));
+        // destination: the restore converts to a regular level animation
+        // anchored on the cursor, keeping the displayed focal continuous.
+        let focal_before = state.focal();
+        assert!(track(&mut state, Point::from((0., 0.)), 0.));
+        assert_point_eq(state.focal(), focal_before);
 
         // The transition is now a regular level animation towards the same
         // target; the level did not jump.
@@ -2185,6 +2795,10 @@ mod tests {
 
         advance(&mut state, &mut clock, 5000);
         assert_eq!(state.level(), 2.);
+        // After the level animation completes, the follow evaluation brings
+        // the camera to the deadzone edge.
+        assert!(track(&mut state, Point::from((0., 0.)), 0.));
+        assert_point_eq(state.focal(), Point::from((0., 0.)));
     }
 
     #[test]
@@ -2194,7 +2808,7 @@ mod tests {
         let mut clock = test_clock();
         let snapshot = snapshot_of(&state);
 
-        assert!(state.update_focal_for_cursor(Point::from((0., 0.)), 0.));
+        assert!(track(&mut state, Point::from((0., 0.)), 0.));
         // A slow easing restore so that it is still in flight when the lock
         // engages.
         state.restore_animated(snapshot, &clock, easing_config(1000));
@@ -2230,7 +2844,7 @@ mod tests {
 
         // Move the camera away and lock it: the lock is stronger than the
         // saved focal destination.
-        assert!(state.update_focal_for_cursor(Point::from((0., 0.)), 0.));
+        assert!(track(&mut state, Point::from((0., 0.)), 0.));
         state.set_locked(true);
         let fixed = state.focal();
 
@@ -2603,7 +3217,7 @@ mod tests {
         let focal = state.focal();
 
         // Pointer motion does not re-pin the gesture anchor.
-        assert!(!state.update_focal_for_cursor(Point::from((1800., 900.)), 0.5));
+        assert!(!track(&mut state, Point::from((1800., 900.)), 0.5));
         assert_point_eq(state.focal(), focal);
     }
 
@@ -2699,7 +3313,7 @@ mod tests {
             let output = Rectangle::from_size(view_size);
             let mut state = state_at(level, Point::from((fx, fy)), view_size);
 
-            state.update_focal_for_cursor(Point::from((cx, cy)), deadzone);
+            track(&mut state, Point::from((cx, cy)), deadzone);
 
             assert_finite_point(state.focal());
             let viewport = state.viewport();

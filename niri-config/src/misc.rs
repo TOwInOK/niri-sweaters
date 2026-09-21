@@ -211,6 +211,19 @@ pub struct Zoom {
     /// Fraction of the output size along each axis that the cursor can
     /// traverse before the zoomed viewport starts following it.
     pub deadzone_size: f64,
+    /// Minimum speed of the deadzone camera follow, in displayed
+    /// output-local logical pixels per second.
+    ///
+    /// Applied as soon as the displayed cursor leaves the deadzone so that
+    /// the follow never decays to a crawl right at the border.
+    pub follow_min_speed: f64,
+    /// Maximum speed of the deadzone camera follow, in displayed
+    /// output-local logical pixels per second.
+    ///
+    /// Reached when the displayed cursor is at the output edge: the speed
+    /// scales with the relative depth of the overshoot between the deadzone
+    /// border and the output edge.
+    pub follow_max_speed: f64,
     /// Number of fingers of a touchpad pinch gesture that controls the
     /// desktop zoom.
     ///
@@ -218,6 +231,8 @@ pub struct Zoom {
     /// forwarded to clients. Setting this is an explicit opt-in that hands
     /// matching pinch sequences to the compositor instead of applications.
     pub pinch_fingers: Option<u32>,
+    /// Debug visualization of the desktop zoom state.
+    pub debug: ZoomDebug,
 }
 
 impl Default for Zoom {
@@ -226,8 +241,38 @@ impl Default for Zoom {
             max_zoom: 10.,
             increment_factor: 1.2,
             deadzone_size: 0.5,
+            follow_min_speed: 80.,
+            follow_max_speed: 1400.,
             pinch_fingers: None,
+            debug: ZoomDebug::default(),
         }
+    }
+}
+
+/// Debug visualization of the desktop zoom state.
+///
+/// Draws compositor-side overlays on the physical output only; they never
+/// appear in screencasts or screen captures and do not affect zoom tracking.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct ZoomDebug {
+    /// Outline the deadzone rectangle that the cursor can traverse before the
+    /// zoomed viewport starts following it.
+    pub deadzone: bool,
+    /// Mark the focal point of the current viewport transform.
+    pub focal_point: bool,
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct ZoomDebugPart {
+    #[knuffel(child)]
+    pub deadzone: Option<Flag>,
+    #[knuffel(child)]
+    pub focal_point: Option<Flag>,
+}
+
+impl MergeWith<ZoomDebugPart> for ZoomDebug {
+    fn merge_with(&mut self, part: &ZoomDebugPart) {
+        merge!((self, part), deadzone, focal_point);
     }
 }
 
@@ -240,7 +285,13 @@ pub struct ZoomPart {
     #[knuffel(child, unwrap(argument))]
     pub deadzone_size: Option<FloatOrInt<0, 1>>,
     #[knuffel(child, unwrap(argument))]
+    pub follow_min_speed: Option<ZoomFollowSpeed>,
+    #[knuffel(child, unwrap(argument))]
+    pub follow_max_speed: Option<ZoomFollowSpeed>,
+    #[knuffel(child, unwrap(argument))]
     pub pinch_fingers: Option<PinchFingers>,
+    #[knuffel(child)]
+    pub debug: Option<ZoomDebugPart>,
 }
 
 impl MergeWith<ZoomPart> for Zoom {
@@ -250,8 +301,16 @@ impl MergeWith<ZoomPart> for Zoom {
             max_zoom,
             increment_factor,
             deadzone_size,
-            pinch_fingers
+            follow_min_speed,
+            follow_max_speed,
+            pinch_fingers,
+            debug
         );
+
+        // The maximum must cover the minimum: a config that merges a lower
+        // max over a higher min clamps instead of producing an inverted
+        // range. Same-node violations are rejected at decode time.
+        self.follow_max_speed = self.follow_max_speed.max(self.follow_min_speed);
     }
 }
 
@@ -261,6 +320,71 @@ impl MergeWith<ZoomPart> for Zoom {
 /// would invert them, so unlike [`FloatOrInt`] the lower bound is exclusive.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct ZoomIncrementFactor(pub f64);
+
+/// Deadzone camera follow speed: a finite number strictly greater than 0.
+///
+/// Speeds are in displayed output-local logical pixels per second. A value
+/// of 0 would freeze the follow, so unlike [`FloatOrInt`] the lower bound is
+/// exclusive.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct ZoomFollowSpeed(pub f64);
+
+impl MergeWith<ZoomFollowSpeed> for f64 {
+    fn merge_with(&mut self, part: &ZoomFollowSpeed) {
+        *self = part.0;
+    }
+}
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for ZoomFollowSpeed {
+    fn type_check(
+        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) {
+        if let Some(type_name) = &type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+    }
+
+    fn raw_decode(
+        val: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let value = match &**val {
+            knuffel::ast::Literal::Int(value) => match i32::try_from(value) {
+                Ok(v) => f64::from(v),
+                Err(e) => {
+                    ctx.emit_error(DecodeError::conversion(val, e));
+                    return Ok(Self::default());
+                }
+            },
+            knuffel::ast::Literal::Decimal(value) => match f64::try_from(value) {
+                Ok(v) => v,
+                Err(e) => {
+                    ctx.emit_error(DecodeError::conversion(val, e));
+                    return Ok(Self::default());
+                }
+            },
+            _ => {
+                ctx.emit_error(DecodeError::unsupported(
+                    val,
+                    "Unsupported value, only numbers are recognized",
+                ));
+                return Ok(Self::default());
+            }
+        };
+
+        if value.is_finite() && value > 0. {
+            Ok(ZoomFollowSpeed(value))
+        } else {
+            ctx.emit_error(DecodeError::conversion(val, "value must be greater than 0"));
+            Ok(Self::default())
+        }
+    }
+}
 
 impl MergeWith<ZoomIncrementFactor> for f64 {
     fn merge_with(&mut self, part: &ZoomIncrementFactor) {

@@ -208,7 +208,19 @@ where
                 "xwayland-satellite" => m_merge!(xwayland_satellite),
                 "switch-events" => m_merge!(switch_events),
                 "debug" => m_merge!(debug),
-                "zoom" => m_merge!(zoom),
+                "zoom" => {
+                    let part = ZoomPart::decode_node(node, ctx)?;
+                    if let (Some(min), Some(max)) = (part.follow_min_speed, part.follow_max_speed) {
+                        if max.0 < min.0 {
+                            ctx.emit_error(DecodeError::unexpected(
+                                &node.node_name,
+                                "node",
+                                "follow-max-speed must be >= follow-min-speed",
+                            ));
+                        }
+                    }
+                    config.borrow_mut().zoom.merge_with(&part);
+                }
 
                 // Multipart sections.
                 "output" => {
@@ -1756,7 +1768,13 @@ mod tests {
                 max_zoom: 10.0,
                 increment_factor: 1.2,
                 deadzone_size: 0.5,
+                follow_min_speed: 80.0,
+                follow_max_speed: 1400.0,
                 pinch_fingers: None,
+                debug: ZoomDebug {
+                    deadzone: false,
+                    focal_point: false,
+                },
             },
             environment: Environment(
                 [
@@ -2668,6 +2686,88 @@ mod tests {
         assert_eq!(config.zoom.increment_factor, 1.2);
         assert_eq!(config.zoom.deadzone_size, 0.5);
         assert_eq!(config.zoom.pinch_fingers, Some(3));
+    }
+
+    #[test]
+    fn parse_zoom_debug() {
+        // Disabled by default.
+        let config = do_parse("");
+        assert!(!config.zoom.debug.deadzone);
+        assert!(!config.zoom.debug.focal_point);
+
+        // Both flags on.
+        let config = do_parse(
+            r#"
+            zoom {
+                debug {
+                    deadzone true
+                    focal-point true
+                }
+            }
+            "#,
+        );
+        assert!(config.zoom.debug.deadzone);
+        assert!(config.zoom.debug.focal_point);
+
+        // A bare flag means true; an explicit false disables.
+        let config = do_parse("zoom { debug { deadzone; focal-point false; }; }");
+        assert!(config.zoom.debug.deadzone);
+        assert!(!config.zoom.debug.focal_point);
+
+        let config = do_parse("zoom { debug { deadzone false; }; }");
+        assert!(!config.zoom.debug.deadzone);
+        assert!(!config.zoom.debug.focal_point);
+
+        // A partial debug block leaves the other zoom settings alone.
+        let config = do_parse(
+            r#"
+            zoom {
+                max-zoom 4
+                deadzone-size 0.25
+                debug {
+                    focal-point true
+                }
+            }
+            "#,
+        );
+        assert_eq!(config.zoom.max_zoom, 4.);
+        assert_eq!(config.zoom.deadzone_size, 0.25);
+        assert!(!config.zoom.debug.deadzone);
+        assert!(config.zoom.debug.focal_point);
+    }
+
+    #[test]
+    fn merge_zoom_debug() {
+        use crate::utils::MergeWith;
+
+        // A debug block in an included file merges field-by-field: it must
+        // not reset debug flags set earlier, nor other zoom settings.
+        let mut zoom = Zoom {
+            max_zoom: 4.,
+            debug: ZoomDebug {
+                deadzone: true,
+                focal_point: false,
+            },
+            ..Zoom::default()
+        };
+
+        let part: ZoomPart = knuffel::parse("part.kdl", "debug { focal-point true; }")
+            .map_err(miette::Report::new)
+            .unwrap();
+        zoom.merge_with(&part);
+
+        assert_eq!(zoom.max_zoom, 4.);
+        assert!(zoom.debug.deadzone);
+        assert!(zoom.debug.focal_point);
+
+        // An explicit false clears a previously set flag.
+        let part: ZoomPart = knuffel::parse("part.kdl", "debug { deadzone false; }")
+            .map_err(miette::Report::new)
+            .unwrap();
+        zoom.merge_with(&part);
+
+        assert!(!zoom.debug.deadzone);
+        assert!(zoom.debug.focal_point);
     }
 
     #[test]

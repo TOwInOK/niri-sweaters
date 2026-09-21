@@ -2180,8 +2180,10 @@ impl<W: LayoutElement> Monitor<W> {
     /// `level`, keeping `anchor` at its displayed position where possible.
     ///
     /// `anchor` is a content position in output-local logical coordinates.
-    /// Uses the current `animations.zoom` config; when it is `off` the level
-    /// is set immediately.
+    /// While the displayed anchor is outside the deadzone, the camera starts
+    /// following it during the level animation. Uses the current
+    /// `animations.zoom` config; when it is `off` the level is set
+    /// immediately.
     pub fn zoom_to(&mut self, level: f64, anchor: Point<f64, Logical>) {
         let clock = self.clock.clone();
         let config = self.options.animations.zoom.0;
@@ -2198,6 +2200,60 @@ impl<W: LayoutElement> Monitor<W> {
         let clock = self.clock.clone();
         let config = self.options.animations.zoom.0;
         self.zoom.restore_animated(snapshot, &clock, config);
+    }
+
+    /// Evaluates deadzone tracking for the cursor at its output-local
+    /// position.
+    ///
+    /// Pointer-interaction entry point: while the displayed cursor is inside
+    /// the deadzone the camera does not move; once it leaves, the camera
+    /// smoothly follows it using the current `animations.zoom` config. When
+    /// the animation is `off` the focal point is set immediately.
+    ///
+    /// Returns `true` if the zoom state changed.
+    pub fn update_zoom_focal_for_cursor(
+        &mut self,
+        cursor: Point<f64, Logical>,
+        zoom: niri_config::Zoom,
+    ) -> bool {
+        let clock = self.clock.clone();
+        let config = self.options.animations.zoom.0;
+        self.zoom
+            .update_focal_for_cursor(cursor, zoom, &clock, config)
+    }
+
+    /// Per-frame deadzone follow evaluation for the cursor at its
+    /// output-local position.
+    ///
+    /// Unlike [`update_zoom_focal_for_cursor`](Self::update_zoom_focal_for_cursor)
+    /// this never takes over an in-progress level animation, restore or
+    /// gesture: it only starts, retargets or stops a deadzone follow. The
+    /// caller is responsible for the tracking policy (session lock,
+    /// Overview, screenshot UI, MRU) and for cancelling follows on outputs
+    /// that do not own the pointer.
+    ///
+    /// Returns `true` if the zoom state changed.
+    pub fn update_zoom_follow(
+        &mut self,
+        cursor: Point<f64, Logical>,
+        zoom: niri_config::Zoom,
+    ) -> bool {
+        let clock = self.clock.clone();
+        let config = self.options.animations.zoom.0;
+        self.zoom.update_follow(cursor, zoom, &clock, config)
+    }
+
+    /// Commits an active deadzone follow's current displayed focal point.
+    ///
+    /// Used by the per-frame driver for outputs that do not own the pointer
+    /// or where tracking is suspended: the camera freezes where it actually
+    /// is instead of snapping back to the stale committed focal point.
+    ///
+    /// Returns `true` if a follow was committed.
+    pub fn commit_zoom_follow(&mut self) -> bool {
+        let clock = self.clock.clone();
+        self.zoom.note_follow_eval(&clock);
+        self.zoom.commit_follow_focal()
     }
 
     pub fn layout_config(&self) -> Option<&niri_config::LayoutPart> {

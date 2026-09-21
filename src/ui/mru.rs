@@ -924,6 +924,14 @@ impl WindowMruUi {
         matches!(self.state, UiState::Open { .. })
     }
 
+    /// Whether the MRU UI is visually present on screen.
+    ///
+    /// Unlike [`is_open()`](Self::is_open), this is also true while the
+    /// closing animation is still fading the UI out.
+    pub fn is_active(&self) -> bool {
+        matches!(self.state, UiState::Open(_) | UiState::Closing { .. })
+    }
+
     pub fn open(&mut self, clock: Clock, wmru: WindowMru, output: Output) {
         if self.is_open() {
             return;

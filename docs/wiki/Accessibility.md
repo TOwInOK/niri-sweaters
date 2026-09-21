@@ -61,7 +61,7 @@ Zoom actions apply to the output under the pointer, or to the focused output whe
 
 While zoomed, the viewport follows the pointer.
 The [`deadzone-size` setting](./Configuration:-Miscellaneous.md#deadzone-size) controls how far the pointer can move before the viewport follows.
-The `toggle-zoom-lock` action fixes the viewport and disables this pointer tracking.
+The `zoom-lock` action fixes the viewport and disables this pointer tracking.
 
 You can also zoom with a touchpad pinch gesture by setting [`pinch-fingers`](./Configuration:-Miscellaneous.md#pinch-fingers) in the `zoom` config section.
 This is an opt-in: for example, `pinch-fingers 2` claims two-finger pinch gestures for the compositor, so applications will no longer receive those matching pinch gestures.

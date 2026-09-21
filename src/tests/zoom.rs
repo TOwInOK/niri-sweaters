@@ -5,6 +5,7 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Element;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::Color32F;
 use smithay::output::{Mode, Output};
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
@@ -14,11 +15,13 @@ use wayland_client::protocol::wl_pointer;
 use super::client::{ClientId, LayerConfigureProps};
 use super::fixture::Fixture;
 use super::knit::{assert_llvmpipe, open_window, render_output_rgba};
+use crate::layout::zoom::OutputZoomState;
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::framebuffer_effect::FramebufferEffect;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::{RenderCtx, RenderTarget};
+use crate::ui::zoom_debug;
 
 /// Minimal config for deterministic rendering: no animations, no gaps.
 const CONFIG: &str = r#"
@@ -294,9 +297,13 @@ fn zoom_focal_change_moves_geometry() {
     // Move the focal point: with a zero-size deadzone, a cursor at (0, 0) pulls
     // the viewport to the output corner, i.e. focal (0, 0).
     let mon = f.niri().layout.monitor_for_output_mut(&output).unwrap();
-    let changed = mon
-        .zoom_mut()
-        .update_focal_for_cursor(Point::from((0., 0.)), 0.);
+    let changed = mon.update_zoom_focal_for_cursor(
+        Point::from((0., 0.)),
+        Zoom {
+            deadzone_size: 0.,
+            ..Default::default()
+        },
+    );
     assert!(
         changed,
         "focal must move when the cursor leaves the deadzone"
@@ -388,10 +395,13 @@ fn zoom_damage_on_focal_change() {
 
     // Move the focal point to (0, 0).
     let mon = f.niri().layout.monitor_for_output_mut(&output).unwrap();
-    assert!(mon
-        .zoom_mut()
-        .update_focal_for_cursor(Point::from((0., 0.)), 0.));
-
+    assert!(mon.update_zoom_focal_for_cursor(
+        Point::from((0., 0.)),
+        Zoom {
+            deadzone_size: 0.,
+            ..Default::default()
+        }
+    ));
     let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
     let (damage, _states) = tracker.damage_output(1, &elements).unwrap();
     let damage = damage.expect("focal change must damage the output");
@@ -442,6 +452,329 @@ fn zoom_framebuffer_effect_forwarding() {
     };
     let elem = effect.render(None, params, None, 0., 1.);
     assert!(elem.is_framebuffer_effect());
+}
+
+// --- zoom debug overlay ---
+
+const DEBUG_CONFIG: &str = r#"
+animations {
+    off
+}
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+zoom {
+    deadzone-size 0.5
+
+    debug {
+        deadzone true
+        focal-point true
+    }
+}
+
+layout {
+    gaps 0
+}
+"#;
+
+fn set_up_debug() -> Fixture {
+    set_up_with_config(DEBUG_CONFIG)
+}
+
+/// Solid-color elements with the given color, in render order.
+fn debug_solids<R: NiriRenderer>(
+    elements: &[OutputRenderElements<R>],
+    color: niri_config::Color,
+) -> Vec<Rectangle<f64, Logical>> {
+    let color = Color32F::from(color.to_array_premul());
+    elements
+        .iter()
+        .filter_map(|elem| match elem {
+            OutputRenderElements::SolidColor(e) if e.color() == color => Some(e.geo()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn zoom_debug_disabled_by_default() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    for color in [
+        zoom_debug::DEADZONE_COLOR,
+        zoom_debug::FOCAL_ACTIVE_COLOR,
+        zoom_debug::FOCAL_INACTIVE_COLOR,
+        zoom_debug::HALO_COLOR,
+    ] {
+        assert!(
+            debug_solids(&elements, color).is_empty(),
+            "no debug elements without debug flags"
+        );
+    }
+}
+
+#[test]
+fn zoom_debug_deadzone_output() {
+    let mut f = set_up_debug();
+    let output = f.niri_output(1);
+
+    // The deadzone is visible at 1x: it is a debug view of the tracking
+    // region, not of the zoomed state.
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+
+    let deadzone = OutputZoomState::deadzone_rect(Size::from((1920., 720.)), 0.5);
+    assert_eq!(
+        debug_solids(&elements, zoom_debug::DEADZONE_COLOR),
+        zoom_debug::deadzone_border_rects(deadzone, 2.),
+    );
+
+    // The halo covers the deadzone border and the focal crosshair.
+    let mut expected = zoom_debug::deadzone_border_rects(deadzone, 4.).to_vec();
+    expected.extend(zoom_debug::crosshair_rects(
+        Point::from((960., 360.)),
+        14.,
+        4.,
+    ));
+    assert_eq!(debug_solids(&elements, zoom_debug::HALO_COLOR), expected);
+}
+
+#[test]
+fn zoom_debug_deadzone_zero_size() {
+    let mut f = set_up_with_config(&DEBUG_CONFIG.replace("deadzone-size 0.5", "deadzone-size 0"));
+    let output = f.niri_output(1);
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+
+    // A zero-area deadzone is drawn as a crosshair on its center.
+    let center = Point::from((960., 360.));
+    assert_eq!(
+        debug_solids(&elements, zoom_debug::DEADZONE_COLOR),
+        zoom_debug::crosshair_rects(center, 14., 2.),
+    );
+}
+
+#[test]
+fn zoom_debug_focal_inactive_at_1x() {
+    let mut f = set_up_debug();
+    let output = f.niri_output(1);
+
+    // The stored focal point is visible at 1x, in the dimmed inactive style.
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    assert!(!debug_solids(&elements, zoom_debug::FOCAL_INACTIVE_COLOR).is_empty());
+    assert!(debug_solids(&elements, zoom_debug::FOCAL_ACTIVE_COLOR).is_empty());
+}
+
+#[test]
+fn zoom_debug_focal_active_at_2x() {
+    let mut f = set_up_debug();
+    let output = f.niri_output(1);
+
+    set_zoom(&mut f, &output, 2., Point::from((480., 180.)));
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    assert!(!debug_solids(&elements, zoom_debug::FOCAL_ACTIVE_COLOR).is_empty());
+    assert!(debug_solids(&elements, zoom_debug::FOCAL_INACTIVE_COLOR).is_empty());
+}
+
+#[test]
+fn zoom_debug_focal_position() {
+    let mut f = set_up_debug();
+    let output = f.niri_output(1);
+
+    set_zoom(&mut f, &output, 2., Point::from((480., 180.)));
+    let focal = zoom_focal(&mut f, &output);
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    let rects = debug_solids(&elements, zoom_debug::FOCAL_ACTIVE_COLOR);
+
+    // The marker is centered on the focal point in output-local display
+    // coordinates: the desktop zoom transform is not applied to it. Elements
+    // are pushed topmost-first: the center square, then the crosshair.
+    let mut expected = vec![Rectangle::new(
+        Point::from((focal.x - 2., focal.y - 2.)),
+        Size::from((4., 4.)),
+    )];
+    expected.extend(zoom_debug::crosshair_rects(focal, 14., 2.));
+    assert_eq!(rects, expected);
+}
+
+#[test]
+fn zoom_debug_only_on_output_target() {
+    let mut f = set_up_debug();
+    let output = f.niri_output(1);
+
+    for target in [RenderTarget::Screencast, RenderTarget::ScreenCapture] {
+        let elements = render_elements(f.niri_state(), &output, target);
+        for color in [
+            zoom_debug::DEADZONE_COLOR,
+            zoom_debug::FOCAL_ACTIVE_COLOR,
+            zoom_debug::FOCAL_INACTIVE_COLOR,
+            zoom_debug::HALO_COLOR,
+        ] {
+            assert!(
+                debug_solids(&elements, color).is_empty(),
+                "debug elements must not reach {target:?}"
+            );
+        }
+    }
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    assert!(!debug_solids(&elements, zoom_debug::DEADZONE_COLOR).is_empty());
+}
+
+#[test]
+fn zoom_debug_hidden_by_overview() {
+    let mut f = set_up_debug();
+    let output = f.niri_output(1);
+
+    set_overview_open(&mut f, &output, true);
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    assert!(debug_solids(&elements, zoom_debug::DEADZONE_COLOR).is_empty());
+    assert!(debug_solids(&elements, zoom_debug::FOCAL_INACTIVE_COLOR).is_empty());
+}
+
+#[test]
+fn zoom_debug_hidden_by_screenshot_ui() {
+    let mut f = set_up_debug();
+    let output = f.niri_output(1);
+
+    f.niri_state().open_screenshot_ui(true, None);
+    assert!(f.niri().screenshot_ui.is_open());
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    assert!(debug_solids(&elements, zoom_debug::DEADZONE_COLOR).is_empty());
+    assert!(debug_solids(&elements, zoom_debug::FOCAL_INACTIVE_COLOR).is_empty());
+}
+
+#[test]
+fn zoom_debug_hidden_by_mru() {
+    let mut f = set_up_with_config(&format!(
+        "{DEBUG_CONFIG}\nrecent-windows {{ open-delay-ms 0; }}"
+    ));
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    open_window(&mut f, id, "one", 100, 100, [255, 0, 0, 255]);
+    open_window(&mut f, id, "two", 100, 100, [0, 255, 0, 255]);
+
+    open_mru(&mut f);
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    assert!(debug_solids(&elements, zoom_debug::DEADZONE_COLOR).is_empty());
+    assert!(debug_solids(&elements, zoom_debug::FOCAL_INACTIVE_COLOR).is_empty());
+}
+
+#[test]
+fn zoom_debug_hidden_by_mru_closing() {
+    let mut f = set_up_with_config(&format!(
+        "{MRU_ANIMATED_CONFIG}\nzoom {{ debug {{ deadzone true; focal-point true; }}; }}"
+    ));
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    open_window(&mut f, id, "one", 100, 100, [255, 0, 0, 255]);
+    open_window(&mut f, id, "two", 100, 100, [0, 255, 0, 255]);
+
+    freeze_clock(&mut f);
+    open_mru(&mut f);
+
+    // The closing animation keeps the UI visually present: the debug overlay
+    // stays hidden until the UI is fully closed.
+    f.niri().cancel_mru();
+    assert!(!f.niri().window_mru_ui.is_open());
+    assert!(f.niri().window_mru_ui.is_active());
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    assert!(debug_solids(&elements, zoom_debug::DEADZONE_COLOR).is_empty());
+
+    advance_clock(&mut f, 5000);
+    assert!(!f.niri().window_mru_ui.is_active());
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    assert!(!debug_solids(&elements, zoom_debug::DEADZONE_COLOR).is_empty());
+}
+
+#[test]
+fn zoom_debug_config_reload() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    assert!(debug_solids(&elements, zoom_debug::DEADZONE_COLOR).is_empty());
+
+    reload_with_zoom(&mut f, "zoom { debug { deadzone true; }; }");
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    assert!(!debug_solids(&elements, zoom_debug::DEADZONE_COLOR).is_empty());
+}
+
+#[test]
+fn zoom_debug_hold_restore_focal() {
+    let mut f = set_up_debug();
+    let output = f.niri_output(1);
+
+    // Store a focal point at 1x by zooming to 2x and back.
+    set_zoom(&mut f, &output, 2., Point::from((480., 180.)));
+    set_zoom(&mut f, &output, 1., Point::from((0., 0.)));
+    let stored = zoom_focal(&mut f, &output);
+
+    // A hold-zoom to 2x anchors at the cursor: the marker follows it in the
+    // active style.
+    f.niri_state().move_cursor(Point::from((1200., 500.)));
+    let trigger = key_trigger(30);
+    hold_press(&mut f, trigger, 2.);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+
+    let held = zoom_focal(&mut f, &output);
+    assert_ne!(held, stored);
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    let rects = debug_solids(&elements, zoom_debug::FOCAL_ACTIVE_COLOR);
+    assert!(rects.iter().all(|rect| rect.contains(held)));
+    assert!(debug_solids(&elements, zoom_debug::FOCAL_INACTIVE_COLOR).is_empty());
+
+    // Releasing the hold restores the stored 1x state: the marker is back on
+    // the stored focal point in the inactive style.
+    hold_release(&mut f, trigger);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert_eq!(zoom_focal(&mut f, &output), stored);
+
+    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+    let rects = debug_solids(&elements, zoom_debug::FOCAL_INACTIVE_COLOR);
+    assert!(rects.iter().all(|rect| rect.contains(stored)));
+    assert!(debug_solids(&elements, zoom_debug::FOCAL_ACTIVE_COLOR).is_empty());
+}
+
+#[test]
+fn zoom_debug_multi_output() {
+    let mut f = set_up_debug();
+    let output1 = f.niri_output(1);
+    f.add_output(2, (1280, 1024));
+    let output2 = f.niri_output(2);
+
+    set_zoom(&mut f, &output2, 2., Point::from((320., 256.)));
+
+    // Each output gets its own deadzone and focal geometry.
+    let elements = render_elements(f.niri_state(), &output1, RenderTarget::Output);
+    let deadzone1 = OutputZoomState::deadzone_rect(Size::from((1920., 720.)), 0.5);
+    assert_eq!(
+        debug_solids(&elements, zoom_debug::DEADZONE_COLOR),
+        zoom_debug::deadzone_border_rects(deadzone1, 2.),
+    );
+    assert!(!debug_solids(&elements, zoom_debug::FOCAL_INACTIVE_COLOR).is_empty());
+    assert!(debug_solids(&elements, zoom_debug::FOCAL_ACTIVE_COLOR).is_empty());
+
+    let elements = render_elements(f.niri_state(), &output2, RenderTarget::Output);
+    let deadzone2 = OutputZoomState::deadzone_rect(Size::from((1280., 1024.)), 0.5);
+    assert_eq!(
+        debug_solids(&elements, zoom_debug::DEADZONE_COLOR),
+        zoom_debug::deadzone_border_rects(deadzone2, 2.),
+    );
+    assert!(!debug_solids(&elements, zoom_debug::FOCAL_ACTIVE_COLOR).is_empty());
+    assert!(debug_solids(&elements, zoom_debug::FOCAL_INACTIVE_COLOR).is_empty());
 }
 
 #[test]
@@ -497,7 +830,7 @@ fn zoom_window_pixels_2x() {
 }
 
 use niri_config::{
-    Action, Bind, FloatOrInt, Key, Modifiers, MruDirection, Trigger, ZoomLevelPreset,
+    Action, Bind, FloatOrInt, Key, Modifiers, MruDirection, Trigger, Zoom, ZoomLevelPreset,
 };
 use smithay::backend::input::Keycode;
 use smithay::backend::renderer::element::Kind;
@@ -894,6 +1227,8 @@ fn zoom_absolute_pointer_inverse() {
     let extent = f.niri().global_space.output_geometry(&output).unwrap().size;
 
     set_zoom(&mut f, &output, 2., Point::from((100., 360.)));
+    // Keep the pointer inside the deadzone so the camera does not follow it.
+    f.niri_state().move_cursor(Point::from((530., 360.)));
     move_pointer_absolute(&mut f, id, Point::from((600., 360.)), extent, None);
 
     assert_eq!(pointer_location(&mut f), Point::from((350., 360.)));
@@ -915,6 +1250,8 @@ fn zoom_absolute_pointer_fractional_levels() {
         let extent = f.niri().global_space.output_geometry(&output).unwrap().size;
 
         set_zoom(&mut f, &output, level, Point::from((960., 360.)));
+        // Keep the pointer inside the deadzone so the camera does not follow it.
+        f.niri_state().move_cursor(Point::from((960., 360.)));
         move_pointer_absolute(&mut f, id, Point::from((1200., 360.)), extent, None);
 
         assert_eq!(pointer_location(&mut f), Point::from((expected_x, 360.)));
@@ -931,6 +1268,8 @@ fn zoom_absolute_pointer_fractional_output_scale() {
     let focal = Point::from((extent.w as f64 / 2., extent.h as f64 / 2.));
     let display = focal + Point::from((200., 0.));
     set_zoom(&mut f, &output, 2., focal);
+    // Keep the pointer inside the deadzone so the camera does not follow it.
+    f.niri_state().move_cursor(focal);
     move_pointer_absolute(&mut f, id, display, extent, None);
 
     assert_eq!(pointer_location(&mut f), focal + Point::from((100., 0.)));
@@ -958,8 +1297,9 @@ fn zoom_absolute_pointer_applies_output_transform_before_zoom() {
     let raw = transform
         .invert()
         .transform_point_in(display, &geo.size.to_f64());
-
     set_zoom(&mut f, &output, 2., focal);
+    // Keep the pointer inside the deadzone so the camera does not follow it.
+    f.niri_state().move_cursor(focal);
     move_pointer_absolute(&mut f, id, raw, raw_size, Some(0));
 
     let actual = pointer_location(&mut f);
@@ -974,6 +1314,8 @@ fn zoom_absolute_pointer_deadzone_moves_focal() {
     let extent = f.niri().global_space.output_geometry(&output).unwrap().size;
 
     set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
+    // Keep the pointer inside the deadzone so the camera does not follow it.
+    f.niri_state().move_cursor(Point::from((960., 360.)));
     move_pointer_absolute(&mut f, id, Point::from((1560., 360.)), extent, None);
 
     assert_eq!(pointer_location(&mut f), Point::from((1260., 360.)));
@@ -1013,6 +1355,9 @@ fn zoom_absolute_pointer_unmapped_multi_output() {
     let geo2 = f.niri().global_space.output_geometry(&output2).unwrap();
 
     set_zoom(&mut f, &output1, 2., Point::from((100., 100.)));
+    // Keep the pointer inside the deadzone so the camera does not follow it.
+    f.niri_state()
+        .move_cursor(geo1.loc.to_f64() + Point::from((530., 230.)));
 
     let display1 = geo1.loc.to_f64() + Point::from((600., 100.));
     move_pointer_absolute(
@@ -1049,6 +1394,8 @@ fn zoom_absolute_pointer_explicit_output_mapping() {
     let extent = f.niri().global_space.output_geometry(&output).unwrap().size;
 
     set_zoom(&mut f, &output, 2., Point::from((100., 360.)));
+    // Keep the pointer inside the deadzone so the camera does not follow it.
+    f.niri_state().move_cursor(Point::from((530., 360.)));
     move_pointer_absolute(&mut f, id, Point::from((600., 360.)), extent, Some(0));
 
     assert_eq!(pointer_location(&mut f), Point::from((350., 360.)));
@@ -1607,6 +1954,78 @@ fn zoom_action_zoom_out_snaps_to_one() {
 }
 
 #[test]
+fn zoom_action_locked_zooms_around_viewport_center() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri()
+        .layout
+        .monitor_for_output_mut(&output)
+        .unwrap()
+        .zoom_mut()
+        .set_locked(true);
+    f.niri_state().do_action(Action::ZoomIn, false);
+
+    assert_abs_diff_eq!(zoom_level(&mut f, &output), 1.2, epsilon = EPS);
+    let focal = zoom_focal(&mut f, &output);
+    assert_abs_diff_eq!(focal.x, 960., epsilon = EPS);
+    assert_abs_diff_eq!(focal.y, 360., epsilon = EPS);
+}
+
+#[test]
+fn zoom_action_locked_keeps_viewport_center_fixed() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+
+    // An off-center focal point, as left by a deadzone follow.
+    set_zoom(&mut f, &output, 2., Point::from((100., 100.)));
+    let center_before = crate::utils::center_f64(
+        f.niri()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .zoom()
+            .viewport(),
+    );
+
+    f.niri()
+        .layout
+        .monitor_for_output_mut(&output)
+        .unwrap()
+        .zoom_mut()
+        .set_locked(true);
+    f.niri_state().do_action(Action::ZoomIn, false);
+
+    let center_after = crate::utils::center_f64(
+        f.niri()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .zoom()
+            .viewport(),
+    );
+    assert_abs_diff_eq!(center_after.x, center_before.x, epsilon = EPS);
+    assert_abs_diff_eq!(center_after.y, center_before.y, epsilon = EPS);
+    // The focal point moved to keep the viewport center fixed.
+    assert_ne!(zoom_focal(&mut f, &output), Point::from((100., 100.)));
+}
+
+#[test]
+fn zoom_action_unlocked_zooms_around_pointer() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().do_action(Action::ZoomIn, false);
+    // Unlocked, the pointer stays the anchor: the focal point lands on the
+    // cursor, not the screen center.
+    let focal = zoom_focal(&mut f, &output);
+    assert_abs_diff_eq!(focal.x, 150., epsilon = EPS);
+    assert_abs_diff_eq!(focal.y, 100., epsilon = EPS);
+}
+
+#[test]
 fn zoom_action_max_clamp() {
     let mut f = set_up();
     let output = f.niri_output(1);
@@ -1675,9 +2094,9 @@ fn zoom_action_toggle_zoom_lock() {
     let focal = zoom_focal(&mut f, &output);
 
     assert!(!zoom_locked(&mut f, &output));
-    f.niri_state().do_action(Action::ToggleZoomLock, false);
+    f.niri_state().do_action(Action::ZoomLock(false), false);
     assert!(zoom_locked(&mut f, &output));
-    f.niri_state().do_action(Action::ToggleZoomLock, false);
+    f.niri_state().do_action(Action::ZoomLock(false), false);
     assert!(!zoom_locked(&mut f, &output));
 
     assert_eq!(zoom_level(&mut f, &output), 2.);
@@ -1981,12 +2400,17 @@ fn reload_with_animated(f: &mut Fixture, extra: &str) {
 /// Simulates a `hold-zoom` bind press: the resolved bind is dispatched with
 /// the physical trigger identity, exactly as the input handlers do.
 fn hold_press(f: &mut Fixture, trigger: ZoomHoldTrigger, level: f64) {
+    hold_press_locked(f, trigger, level, false);
+}
+
+/// Simulates a `hold-zoom hold=true` bind press.
+fn hold_press_locked(f: &mut Fixture, trigger: ZoomHoldTrigger, level: f64, hold: bool) {
     let bind = Bind {
         key: Key {
             trigger: Trigger::Keysym(Keysym::x),
             modifiers: Modifiers::COMPOSITOR,
         },
-        action: Action::HoldZoom(ZoomLevelPreset(level)),
+        action: Action::HoldZoom(ZoomLevelPreset(level), hold),
         repeat: true,
         cooldown: None,
         allow_when_locked: false,
@@ -2001,6 +2425,23 @@ fn hold_release(f: &mut Fixture, trigger: ZoomHoldTrigger) {
     f.niri_state().end_zoom_hold_for_trigger(trigger);
 }
 
+/// Simulates a `zoom-lock hold=true` bind press.
+fn zoom_lock_press(f: &mut Fixture, trigger: ZoomHoldTrigger) {
+    let bind = Bind {
+        key: Key {
+            trigger: Trigger::Keysym(Keysym::x),
+            modifiers: Modifiers::COMPOSITOR,
+        },
+        action: Action::ZoomLock(true),
+        repeat: true,
+        cooldown: None,
+        allow_when_locked: false,
+        allow_inhibiting: true,
+        hotkey_overlay_title: None,
+    };
+    f.niri_state().handle_bind(bind, Some(trigger));
+}
+
 fn key_trigger(code: u32) -> ZoomHoldTrigger {
     ZoomHoldTrigger::Key(Keycode::from(code))
 }
@@ -2012,12 +2453,12 @@ fn zoom_action_toggle_zoom() {
     f.niri_state().move_cursor(Point::from((150., 100.)));
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
     assert_eq!(zoom_level(&mut f, &output), 2.);
     assert_eq!(zoom_target_level(&mut f, &output), 2.);
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
     assert_eq!(zoom_level(&mut f, &output), 1.);
     assert_eq!(zoom_target_level(&mut f, &output), 1.);
 }
@@ -2029,7 +2470,7 @@ fn zoom_action_toggle_zoom_after_manual_zoom() {
     f.niri_state().move_cursor(Point::from((150., 100.)));
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
     assert_eq!(zoom_level(&mut f, &output), 2.);
 
     f.niri_state().do_action(Action::ZoomIn, false);
@@ -2038,11 +2479,11 @@ fn zoom_action_toggle_zoom_after_manual_zoom() {
     // The preset is an entry level, not a pinned session: toggling off any
     // active zoom returns to 1.
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
     assert_eq!(zoom_level(&mut f, &output), 1.);
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
     assert_eq!(zoom_level(&mut f, &output), 2.);
 }
 
@@ -2061,7 +2502,7 @@ fn zoom_action_toggle_zoom_uses_target_level() {
     assert_eq!(zoom_target_level(&mut f, &output), 1.);
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(3.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(3.), false), false);
     assert_eq!(zoom_target_level(&mut f, &output), 3.);
 
     advance_clock(&mut f, 5000);
@@ -2075,7 +2516,7 @@ fn zoom_action_toggle_zoom_clamps_to_max() {
     f.niri_state().move_cursor(Point::from((150., 100.)));
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(8.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(8.), false), false);
     assert_eq!(zoom_level(&mut f, &output), 3.);
     assert_eq!(zoom_target_level(&mut f, &output), 3.);
 }
@@ -2093,7 +2534,7 @@ fn zoom_action_toggle_zoom_targets_pointer_output() {
     f.niri_state().move_cursor(Point::from((150., 100.)));
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
 
     assert_eq!(zoom_level(&mut f, &output1), 2.);
     assert_eq!(zoom_level(&mut f, &output2), 1.);
@@ -2105,14 +2546,18 @@ fn zoom_action_toggle_zoom_ipc_parse() {
 
     let action = niri_ipc::Action::try_parse_from(["niri msg action", "toggle-zoom", "2.0"])
         .expect("toggle-zoom must parse from CLI");
-    let niri_ipc::Action::ToggleZoom { level } = action else {
+    let niri_ipc::Action::ToggleZoom { level, hold } = action else {
         panic!("expected ToggleZoom, got {action:?}");
     };
     assert_eq!(level, 2.);
+    assert!(!hold);
 
     // The IPC action converts into the config action.
-    let action = Action::from(niri_ipc::Action::ToggleZoom { level: 2.5 });
-    assert_eq!(action, Action::ToggleZoom(ZoomLevelPreset(2.5)));
+    let action = Action::from(niri_ipc::Action::ToggleZoom {
+        level: 2.5,
+        hold: false,
+    });
+    assert_eq!(action, Action::ToggleZoom(ZoomLevelPreset(2.5), false));
 }
 
 #[test]
@@ -2181,7 +2626,7 @@ fn zoom_hold_does_not_restore_lock() {
 
     // Locking during the hold is a user preference change, not part of the
     // temporary viewport override.
-    f.niri_state().do_action(Action::ToggleZoomLock, false);
+    f.niri_state().do_action(Action::ZoomLock(false), false);
     assert!(zoom_locked(&mut f, &output));
 
     hold_release(&mut f, trigger);
@@ -2354,7 +2799,7 @@ fn zoom_hold_is_not_repeatable() {
             trigger: Trigger::Keysym(Keysym::x),
             modifiers: Modifiers::COMPOSITOR,
         },
-        action: Action::HoldZoom(ZoomLevelPreset(2.)),
+        action: Action::HoldZoom(ZoomLevelPreset(2.), false),
         // Even with the default repeatable flag, hold-zoom must not arm the
         // key repeat timer.
         repeat: true,
@@ -2390,7 +2835,7 @@ fn zoom_hold_press_on_cooldown_starts_no_session() {
             trigger: Trigger::Keysym(Keysym::x),
             modifiers: Modifiers::COMPOSITOR,
         },
-        action: Action::HoldZoom(ZoomLevelPreset(2.)),
+        action: Action::HoldZoom(ZoomLevelPreset(2.), false),
         repeat: true,
         cooldown: Some(Duration::from_secs(60)),
         allow_when_locked: false,
@@ -2459,12 +2904,12 @@ fn zoom_hold_toggle_and_reset_during_hold_then_restore() {
     // toggle-zoom during a hold does not end the session; it changes the
     // hold-overridden zoom like a regular action.
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
     assert_eq!(zoom_level(&mut f, &output), 1.);
     assert!(f.niri().zoom_hold.is_some());
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
     assert_eq!(zoom_level(&mut f, &output), 2.);
 
     // reset-zoom during a hold is momentary too.
@@ -2615,6 +3060,124 @@ fn zoom_hold_release_without_session_is_noop() {
     assert_eq!(zoom_level(&mut f, &output), 1.);
 }
 
+#[test]
+fn zoom_toggle_locks_and_unlocks() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state()
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), true), false);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert!(zoom_locked(&mut f, &output));
+
+    f.niri_state()
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), true), false);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert!(!zoom_locked(&mut f, &output));
+}
+
+#[test]
+fn zoom_hold_lock_restores_lock_state() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    let trigger = key_trigger(30);
+    hold_press_locked(&mut f, trigger, 2., true);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert!(zoom_locked(&mut f, &output));
+
+    hold_release(&mut f, trigger);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert!(!zoom_locked(&mut f, &output));
+}
+
+#[test]
+fn zoom_hold_lock_preserves_prior_lock() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    set_zoom(&mut f, &output, 1.5, Point::from((150., 100.)));
+    f.niri_state().do_action(Action::ZoomLock(false), false);
+    assert!(zoom_locked(&mut f, &output));
+
+    let trigger = key_trigger(30);
+    hold_press_locked(&mut f, trigger, 2., true);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert!(zoom_locked(&mut f, &output));
+
+    hold_release(&mut f, trigger);
+    assert_eq!(zoom_level(&mut f, &output), 1.5);
+    assert!(zoom_locked(&mut f, &output));
+}
+
+#[test]
+fn zoom_lock_hold_momentary() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    let trigger = key_trigger(30);
+    zoom_lock_press(&mut f, trigger);
+    assert!(zoom_locked(&mut f, &output));
+    assert!(f.niri().zoom_lock_hold.is_some());
+
+    f.niri_state().end_zoom_lock_hold_for_trigger(trigger);
+    assert!(!zoom_locked(&mut f, &output));
+    assert!(f.niri().zoom_lock_hold.is_none());
+}
+
+#[test]
+fn zoom_lock_hold_inverts_existing_lock() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().do_action(Action::ZoomLock(false), false);
+    assert!(zoom_locked(&mut f, &output));
+
+    let trigger = key_trigger(30);
+    zoom_lock_press(&mut f, trigger);
+    assert!(!zoom_locked(&mut f, &output));
+
+    f.niri_state().end_zoom_lock_hold_for_trigger(trigger);
+    assert!(zoom_locked(&mut f, &output));
+}
+
+#[test]
+fn zoom_lock_hold_ends_on_vt_switch() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    let trigger = key_trigger(30);
+    zoom_lock_press(&mut f, trigger);
+    assert!(zoom_locked(&mut f, &output));
+
+    f.niri_state().do_action(Action::ChangeVt(2), false);
+    assert!(!zoom_locked(&mut f, &output));
+    assert!(f.niri().zoom_lock_hold.is_none());
+}
+
+#[test]
+fn zoom_lock_hold_output_removal_drops_session() {
+    let mut f = set_up();
+    let output1 = f.niri_output(1);
+    f.add_output(2, (1920, 720));
+    let output2 = f.niri_output(2);
+
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+    let trigger = key_trigger(30);
+    zoom_lock_press(&mut f, trigger);
+    assert!(zoom_locked(&mut f, &output1));
+
+    f.niri().remove_output(&output1);
+    assert!(f.niri().zoom_lock_hold.is_none());
+    assert!(!zoom_locked(&mut f, &output2));
+}
+
 // --- animated transitions ---
 
 fn set_up_animated() -> Fixture {
@@ -2689,6 +3252,60 @@ fn zoom_anim_zoom_out_exact_identity() {
         t.apply(Point::from((123., 456.))),
         Point::from((123., 456.))
     );
+}
+
+#[test]
+fn zoom_anim_zoom_out_to_one_keeps_focal_stable() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((960., 360.)));
+    freeze_clock(&mut f);
+
+    set_zoom(&mut f, &output, 2., Point::from((500., 300.)));
+
+    // Zooming out to the identity transform must not send the focal point
+    // into a clamped corner: the anchored solve degenerates as the level
+    // approaches 1, so the transition keeps the focal point fixed.
+    f.niri_state().do_action(Action::ResetZoom, false);
+    for _ in 0..10 {
+        advance_clock(&mut f, 20);
+        assert_eq!(zoom_focal(&mut f, &output), Point::from((500., 300.)));
+    }
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert_eq!(zoom_focal(&mut f, &output), Point::from((500., 300.)));
+}
+
+#[test]
+fn zoom_anim_toggle_zoom_hold_round_trip_keeps_focal_stable() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+    freeze_clock(&mut f);
+
+    // First press: locked zoom-in around the viewport center.
+    f.niri_state()
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), true), false);
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert!(zoom_locked(&mut f, &output));
+    let focal = zoom_focal(&mut f, &output);
+    assert_abs_diff_eq!(focal.x, 960., epsilon = EPS);
+    assert_abs_diff_eq!(focal.y, 360., epsilon = EPS);
+
+    // Second press: the zoom-out must stay locked (centered) and the focal
+    // point must not fly to a clamped corner.
+    f.niri_state()
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), true), false);
+    for _ in 0..10 {
+        advance_clock(&mut f, 20);
+        let focal = zoom_focal(&mut f, &output);
+        assert_abs_diff_eq!(focal.x, 960., epsilon = EPS);
+        assert_abs_diff_eq!(focal.y, 360., epsilon = EPS);
+    }
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert!(!zoom_locked(&mut f, &output));
 }
 
 #[test]
@@ -2786,13 +3403,13 @@ fn zoom_anim_toggle_mid_animation() {
     freeze_clock(&mut f);
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
     advance_clock(&mut f, 50);
     assert!(zoom_level(&mut f, &output) > 1.);
 
     // Toggling mid-flight targets 1 regardless of the displayed level.
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
     assert_eq!(zoom_target_level(&mut f, &output), 1.);
 
     advance_clock(&mut f, 5000);
@@ -2879,7 +3496,7 @@ fn zoom_anim_locked_viewport_clamps_pointer() {
 }
 
 #[test]
-fn zoom_anim_deadzone_moves_focal_immediately() {
+fn zoom_anim_deadzone_drifts_during_animation() {
     let mut f = set_up_animated();
     let output = f.niri_output(1);
     f.niri_state().move_cursor(Point::from((960., 360.)));
@@ -2889,26 +3506,46 @@ fn zoom_anim_deadzone_moves_focal_immediately() {
         .do_action(Action::SetZoomLevel(FloatOrInt(2.)), false);
     advance_clock(&mut f, 50);
     let level = zoom_level(&mut f, &output);
+    let focal_before = zoom_focal(&mut f, &output);
 
-    // A warp to the content corner leaves the deadzone and moves the focal
-    // point immediately, while the level animation continues.
+    // A warp to the content corner leaves the deadzone: the level animation
+    // keeps owning the viewport, but the anchor's display position starts
+    // drifting towards the deadzone edge immediately — the camera moves
+    // during the zoom animation, not after it.
     f.niri_state().move_cursor(Point::from((0., 0.)));
-    assert_eq!(zoom_focal(&mut f, &output), Point::from((0., 0.)));
+    let focal_after_warp = zoom_focal(&mut f, &output);
+    assert_abs_diff_eq!(focal_after_warp.x, focal_before.x, epsilon = 1e-6);
+    assert_abs_diff_eq!(focal_after_warp.y, focal_before.y, epsilon = 1e-6);
     assert!(zoom_is_animating(&mut f, &output));
     assert_eq!(zoom_level(&mut f, &output), level);
 
+    advance_clock(&mut f, 50);
+    assert_ne!(zoom_focal(&mut f, &output), focal_after_warp);
+
+    // The drift completes together with the level animation: the camera is
+    // already at the deadzone edge and no separate follow phase runs.
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert_eq!(zoom_focal(&mut f, &output), Point::from((0., 0.)));
+    assert!(!zoom_is_animating(&mut f, &output));
 }
 
 #[test]
-fn zoom_anim_locked_focal_fixed() {
+fn zoom_anim_locked_keeps_viewport_center_fixed() {
     let mut f = set_up_animated();
     let output = f.niri_output(1);
     f.niri_state().move_cursor(Point::from((960., 360.)));
     freeze_clock(&mut f);
 
     set_zoom(&mut f, &output, 2., Point::from((500., 300.)));
+    let center_before = crate::utils::center_f64(
+        f.niri()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .zoom()
+            .viewport(),
+    );
     f.niri()
         .layout
         .monitor_for_output_mut(&output)
@@ -2920,11 +3557,29 @@ fn zoom_anim_locked_focal_fixed() {
         .do_action(Action::SetZoomLevel(FloatOrInt(4.)), false);
     for _ in 0..10 {
         advance_clock(&mut f, 20);
-        assert_eq!(zoom_focal(&mut f, &output), Point::from((500., 300.)));
+        let center = crate::utils::center_f64(
+            f.niri()
+                .layout
+                .monitor_for_output(&output)
+                .unwrap()
+                .zoom()
+                .viewport(),
+        );
+        assert_abs_diff_eq!(center.x, center_before.x, epsilon = EPS);
+        assert_abs_diff_eq!(center.y, center_before.y, epsilon = EPS);
     }
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 4.);
-    assert_eq!(zoom_focal(&mut f, &output), Point::from((500., 300.)));
+    let center = crate::utils::center_f64(
+        f.niri()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .zoom()
+            .viewport(),
+    );
+    assert_abs_diff_eq!(center.x, center_before.x, epsilon = EPS);
+    assert_abs_diff_eq!(center.y, center_before.y, epsilon = EPS);
 }
 
 #[test]
@@ -2939,7 +3594,7 @@ fn zoom_anim_lock_mid_animation_freezes_focal() {
     advance_clock(&mut f, 50);
 
     let frozen = zoom_focal(&mut f, &output);
-    f.niri_state().do_action(Action::ToggleZoomLock, false);
+    f.niri_state().do_action(Action::ZoomLock(false), false);
 
     for _ in 0..10 {
         advance_clock(&mut f, 20);
@@ -2960,19 +3615,22 @@ fn zoom_anim_unlock_mid_animation_no_jump() {
         .do_action(Action::SetZoomLevel(FloatOrInt(3.)), false);
     advance_clock(&mut f, 50);
 
-    f.niri_state().do_action(Action::ToggleZoomLock, false);
+    f.niri_state().do_action(Action::ZoomLock(false), false);
     let frozen = zoom_focal(&mut f, &output);
     advance_clock(&mut f, 20);
 
-    f.niri_state().do_action(Action::ToggleZoomLock, false);
+    f.niri_state().do_action(Action::ZoomLock(false), false);
     assert_eq!(zoom_focal(&mut f, &output), frozen);
 
-    // Deadzone tracking can move the focal point again.
+    // Deadzone tracking waits for the level animation to finish.
     f.niri_state().move_cursor(Point::from((0., 0.)));
-    assert_eq!(zoom_focal(&mut f, &output), Point::from((0., 0.)));
+    assert_eq!(zoom_focal(&mut f, &output), frozen);
 
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 3.);
+
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_focal(&mut f, &output), Point::from((0., 0.)));
 }
 
 #[test]
@@ -3237,12 +3895,16 @@ fn zoom_anim_hold_release_restores_focal() {
     let trigger = key_trigger(30);
     hold_press(&mut f, trigger, 3.);
     advance_clock(&mut f, 5000);
-
     // Move the camera during the hold: a cursor warp to the content corner
-    // pushes the focal point to the output edge.
+    // pushes the focal point to the output edge once the camera settles.
     f.niri_state().move_cursor(Point::from((0., 0.)));
+    advance_clock(&mut f, 5000);
     let held_focal = zoom_focal(&mut f, &output);
     assert_ne!(held_focal, saved_focal);
+
+    // Bring the pointer back inside the deadzone so the restore is not
+    // immediately retargeted by the follow evaluation.
+    f.niri_state().move_cursor(Point::from((960., 360.)));
 
     hold_release(&mut f, trigger);
     assert!(zoom_is_animating(&mut f, &output));
@@ -3272,7 +3934,6 @@ fn zoom_anim_hold_same_level_focal_restore() {
     let trigger = key_trigger(30);
     hold_press(&mut f, trigger, 3.);
     advance_clock(&mut f, 5000);
-
     // Return to the saved level but with a different focal point: the release
     // must animate the focal point without moving the level.
     f.niri_state()
@@ -3280,7 +3941,12 @@ fn zoom_anim_hold_same_level_focal_restore() {
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 2.);
     f.niri_state().move_cursor(Point::from((0., 0.)));
+    advance_clock(&mut f, 5000);
     assert_ne!(zoom_focal(&mut f, &output), saved_focal);
+
+    // Bring the pointer back inside the deadzone so the restore is not
+    // immediately retargeted by the follow evaluation.
+    f.niri_state().move_cursor(Point::from((960., 360.)));
 
     hold_release(&mut f, trigger);
     assert!(zoom_is_animating(&mut f, &output));
@@ -3343,7 +4009,7 @@ fn zoom_anim_hold_reset_and_toggle_during_hold() {
     assert!(f.niri().zoom_hold.is_some());
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 2.);
 
@@ -3371,16 +4037,22 @@ fn zoom_anim_hold_deadzone_during_restore() {
     advance_clock(&mut f, 50);
     assert!(zoom_is_animating(&mut f, &output));
 
-    // Pointer tracking during the restore takes over the camera: the focal
-    // point jumps to the deadzone-driven value and the saved destination is
-    // abandoned, while the level keeps animating to the saved target. The
-    // relative delta is scaled by the displayed level, so use a large one.
+    // Pointer tracking during the restore takes over the camera: the restore
+    // converts to a regular level animation anchored on the cursor, so the
+    // displayed focal stays continuous while the level keeps animating to
+    // the saved target. The relative delta is scaled by the displayed level,
+    // so use a large one.
+    let focal_before = zoom_focal(&mut f, &output);
     move_pointer(&mut f, id, -5000., -5000.);
-    assert_eq!(zoom_focal(&mut f, &output), Point::from((0., 0.)));
+    assert_abs_diff_eq!(zoom_focal(&mut f, &output).x, focal_before.x, epsilon = EPS);
+    assert_abs_diff_eq!(zoom_focal(&mut f, &output).y, focal_before.y, epsilon = EPS);
     assert!(zoom_is_animating(&mut f, &output));
 
+    // Once the level animation completes, the camera follows the pointer to
+    // the deadzone edge.
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 2.);
+    advance_clock(&mut f, 5000);
     assert_eq!(zoom_focal(&mut f, &output), Point::from((0., 0.)));
 }
 
@@ -3400,16 +4072,19 @@ fn zoom_anim_hold_warp_during_restore() {
 
     hold_release(&mut f, trigger);
     advance_clock(&mut f, 50);
-    assert!(zoom_is_animating(&mut f, &output));
-
-    // A programmatic warp teleports the cursor and moves the focal point
-    // immediately; the restore's saved focal destination is abandoned.
+    // A programmatic warp teleports the cursor; the restore converts to a
+    // regular level animation anchored on the cursor, so the displayed focal
+    let focal_before = zoom_focal(&mut f, &output);
     f.niri_state().move_cursor(Point::from((0., 0.)));
-    assert_eq!(zoom_focal(&mut f, &output), Point::from((0., 0.)));
+    assert_abs_diff_eq!(zoom_focal(&mut f, &output).x, focal_before.x, epsilon = EPS);
+    assert_abs_diff_eq!(zoom_focal(&mut f, &output).y, focal_before.y, epsilon = EPS);
+
     assert!(zoom_is_animating(&mut f, &output));
 
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 2.);
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_focal(&mut f, &output), Point::from((0., 0.)));
     assert_ne!(zoom_focal(&mut f, &output), saved_focal);
 }
 
@@ -3460,7 +4135,7 @@ fn zoom_anim_hold_toggle_during_restore() {
     // The toggle decision uses the restore's target (1.5 > 1), so it resets
     // to 1 from the displayed state without a jump.
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(4.)), false);
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(4.), false), false);
     assert_eq!(zoom_target_level(&mut f, &output), 1.);
     assert_abs_diff_eq!(zoom_level(&mut f, &output), mid, epsilon = EPS);
 
@@ -3485,6 +4160,7 @@ fn zoom_anim_hold_lock_during_restore() {
     // Move the camera during the hold so the restore has a focal destination
     // different from the current one.
     f.niri_state().move_cursor(Point::from((0., 0.)));
+    advance_clock(&mut f, 5000);
     assert_ne!(zoom_focal(&mut f, &output), saved_focal);
 
     hold_release(&mut f, trigger);
@@ -3494,7 +4170,7 @@ fn zoom_anim_hold_lock_during_restore() {
     // Locking mid-restore freezes the current focal point; the saved focal
     // destination is discarded while the level keeps animating.
     let frozen = zoom_focal(&mut f, &output);
-    f.niri_state().do_action(Action::ToggleZoomLock, false);
+    f.niri_state().do_action(Action::ZoomLock(false), false);
     assert!(zoom_locked(&mut f, &output));
 
     for _ in 0..10 {
@@ -3525,7 +4201,8 @@ fn zoom_anim_hold_locked_at_release() {
     // Move the camera during the hold, then lock it: the release must not
     // restore the saved focal point.
     f.niri_state().move_cursor(Point::from((0., 0.)));
-    f.niri_state().do_action(Action::ToggleZoomLock, false);
+    advance_clock(&mut f, 5000);
+    f.niri_state().do_action(Action::ZoomLock(false), false);
     let locked_focal = zoom_focal(&mut f, &output);
 
     hold_release(&mut f, trigger);
@@ -3665,6 +4342,7 @@ fn zoom_anim_hold_resize_during_hold() {
     // A focal point valid for 1920x720 but out of bounds for 960x540.
     set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
     f.niri_state().move_cursor(Point::from((1900., 700.)));
+    advance_clock(&mut f, 5000);
     let saved_focal = zoom_focal(&mut f, &output);
     assert_eq!(saved_focal, Point::from((1920., 720.)));
 
@@ -4101,7 +4779,7 @@ fn zoom_overview_actions_hold_and_multi_output_state_survive() {
     assert!(target_after_action > target_before);
     assert_eq!(effective_zoom_transform(&mut f, &output1).factor(), 1.);
 
-    f.niri_state().do_action(Action::ToggleZoomLock, false);
+    f.niri_state().do_action(Action::ZoomLock(false), false);
     assert!(zoom_locked(&mut f, &output1));
     let trigger = key_trigger(30);
     hold_press(&mut f, trigger, 3.);
@@ -4411,6 +5089,14 @@ fn zoom_pointer_surface_outputs_follow_displayed_bbox() {
     f.roundtrip(id);
 
     set_zoom(&mut f, &output1, 2., Point::from((960., 360.)));
+    // Lock the zoom so the displayed pointer can straddle the outputs without
+    // the deadzone follow moving the camera.
+    f.niri()
+        .layout
+        .monitor_for_output_mut(&output1)
+        .unwrap()
+        .zoom_mut()
+        .set_locked(true);
     f.niri().tablet_cursor_location = Some(Point::from((1430., 360.)));
     f.dispatch();
     f.double_roundtrip(id);
@@ -4679,13 +5365,19 @@ fn zoom_session_lock_presentation_viewport_is_full_output() {
 fn zoom_session_lock_deadzone_tracking_suspended() {
     // Pointer motion over the lock surface must not move the hidden zoom
     // camera: focal tracking is suspended while the session is locked.
-    assert!(!crate::input::zoom_tracking_enabled(true, false));
-    assert!(!crate::input::zoom_tracking_enabled(true, true));
+    let gates = |session_locked, overview_active| crate::input::ZoomTrackingGates {
+        session_locked,
+        overview_active,
+        screenshot_ui_open: false,
+        mru_active: false,
+    };
+    assert!(!crate::input::zoom_tracking_enabled(gates(true, false)));
+    assert!(!crate::input::zoom_tracking_enabled(gates(true, true)));
 
     // Regressions: the Overview still suspends tracking, and normal desktop
     // tracking stays enabled.
-    assert!(!crate::input::zoom_tracking_enabled(false, true));
-    assert!(crate::input::zoom_tracking_enabled(false, false));
+    assert!(!crate::input::zoom_tracking_enabled(gates(false, true)));
+    assert!(crate::input::zoom_tracking_enabled(gates(false, false)));
 }
 
 #[test]
@@ -4708,9 +5400,16 @@ fn zoom_session_lock_warp_policy_uses_presentation() {
     let locked = crate::niri::Niri::pointer_transform_for_presentation(true, effective);
     let viewport = locked.apply_inverse_rect(Rectangle::from_size(view_size));
 
-    let candidate = Point::from((1900., 700.));
+    let candidate = Point::<f64, Logical>::from((1900., 700.));
     assert!(viewport.contains(candidate));
-    assert!(!crate::input::zoom_tracking_enabled(true, false));
+    assert!(!crate::input::zoom_tracking_enabled(
+        crate::input::ZoomTrackingGates {
+            session_locked: true,
+            overview_active: false,
+            screenshot_ui_open: false,
+            mru_active: false,
+        }
+    ));
 }
 
 #[test]
@@ -5419,7 +6118,7 @@ fn zoom_pinch_hold_release_interrupts() {
     // A hold started before the pinch keeps its snapshot; the pinch drives
     // the temporary hold viewport.
     let trigger = key_trigger(100);
-    f.niri_state().begin_zoom_hold(trigger, 2.);
+    f.niri_state().begin_zoom_hold(trigger, 2., false);
     f.niri_state().begin_zoom_pinch("dev0".to_owned());
     f.niri_state().update_zoom_pinch(&output, 1.5);
     assert_eq!(zoom_level(&mut f, &output), 3.);
@@ -5831,4 +6530,44 @@ fn zoom_ipc_query_is_side_effect_free() {
     // The query did not finish the transition or change the target.
     assert!(zoom_is_animating(&mut f, &output));
     assert_eq!(zoom_target_level(&mut f, &output), 4.);
+}
+
+// --- continuous deadzone follow ---
+
+#[test]
+fn zoom_follow_static_pointer_moves_camera() {
+    // Regression: a pointer resting outside the deadzone must keep moving the
+    // camera until it reaches the deadzone boundary, without new pointer
+    // input. On the old immediate-tracking semantics the focal point jumped
+    // once on the warp and then froze.
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((960., 360.)));
+    freeze_clock(&mut f);
+
+    f.niri_state()
+        .do_action(Action::SetZoomLevel(FloatOrInt(2.)), false);
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+
+    // Warp to the content corner: the displayed pointer lands outside the
+    // deadzone and the physical pointer does not move again.
+    f.niri_state().move_cursor(Point::from((0., 0.)));
+    let focal = zoom_focal(&mut f, &output);
+
+    // Without further pointer input the camera must keep moving until the
+    // displayed pointer reaches the deadzone boundary.
+    advance_clock(&mut f, 50);
+    assert_ne!(
+        zoom_focal(&mut f, &output),
+        focal,
+        "a static pointer outside the deadzone must keep moving the camera"
+    );
+
+    advance_clock(&mut f, 5000);
+    assert!(!zoom_is_animating(&mut f, &output));
+    // The viewport clamp stops the follow at the output edge: the pointer
+    // stays outside the deadzone and no further correction is possible.
+    assert_eq!(zoom_focal(&mut f, &output), Point::from((0., 0.)));
+    assert_eq!(displayed_pointer_location(&mut f), Point::from((0., 0.)));
 }

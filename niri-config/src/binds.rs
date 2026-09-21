@@ -397,9 +397,15 @@ pub enum Action {
     ZoomOut,
     SetZoomLevel(#[knuffel(argument)] FloatOrInt<1, { i32::MAX }>),
     ResetZoom,
-    ToggleZoomLock,
-    ToggleZoom(#[knuffel(argument)] ZoomLevelPreset),
-    HoldZoom(#[knuffel(argument)] ZoomLevelPreset),
+    ZoomLock(#[knuffel(property(name = "hold"), default)] bool),
+    ToggleZoom(
+        #[knuffel(argument)] ZoomLevelPreset,
+        #[knuffel(property(name = "hold"), default)] bool,
+    ),
+    HoldZoom(
+        #[knuffel(argument)] ZoomLevelPreset,
+        #[knuffel(property(name = "hold"), default)] bool,
+    ),
 }
 
 /// A zoom level preset for `toggle-zoom` and `hold-zoom`: a finite number
@@ -775,8 +781,10 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::ZoomOut {} => Self::ZoomOut,
             niri_ipc::Action::SetZoomLevel { level } => Self::SetZoomLevel(FloatOrInt(level)),
             niri_ipc::Action::ResetZoom {} => Self::ResetZoom,
-            niri_ipc::Action::ToggleZoomLock {} => Self::ToggleZoomLock,
-            niri_ipc::Action::ToggleZoom { level } => Self::ToggleZoom(ZoomLevelPreset(level)),
+            niri_ipc::Action::ZoomLock {} => Self::ZoomLock(false),
+            niri_ipc::Action::ToggleZoom { level, hold } => {
+                Self::ToggleZoom(ZoomLevelPreset(level), hold)
+            }
         }
     }
 }
@@ -993,7 +1001,9 @@ where
 
                     // Scroll triggers have no release event, so a hold bound to
                     // one could never end.
-                    if matches!(action, Action::HoldZoom(_))
+                    let needs_release = matches!(action, Action::HoldZoom(..))
+                        || matches!(action, Action::ZoomLock(true));
+                    if needs_release
                         && matches!(
                             key.trigger,
                             Trigger::WheelScrollDown
@@ -1008,7 +1018,7 @@ where
                     {
                         ctx.emit_error(DecodeError::unsupported(
                             &node.node_name,
-                            "hold-zoom requires a trigger with a release event",
+                            "this action requires a trigger with a release event",
                         ));
                     }
 
@@ -1214,7 +1224,7 @@ mod tests {
                 Mod+0 { set-zoom-level 2; }
                 Mod+9 { set-zoom-level 1.5; }
                 Mod+Shift+0 { reset-zoom; }
-                Mod+Shift+L { toggle-zoom-lock; }
+                Mod+Shift+L { zoom-lock; }
             }
             "#,
         )
@@ -1229,7 +1239,7 @@ mod tests {
                 &Action::SetZoomLevel(FloatOrInt(2.)),
                 &Action::SetZoomLevel(FloatOrInt(1.5)),
                 &Action::ResetZoom,
-                &Action::ToggleZoomLock,
+                &Action::ZoomLock(false),
             ]
         );
     }
@@ -1241,9 +1251,13 @@ mod tests {
             binds {
                 Mod+Z { toggle-zoom 2.0; }
                 Mod+Shift+Z { toggle-zoom 4; }
+                Mod+Alt+Z { toggle-zoom 2.0 hold=true; }
                 Mod+X { hold-zoom 2.0; }
                 Mod+MouseBack { hold-zoom 3; }
                 Mod+TabletStylusButton1 { hold-zoom 1.5; }
+                Mod+Alt+X { hold-zoom 2.0 hold=true; }
+                Mod+L { zoom-lock; }
+                Mod+Alt+L { zoom-lock hold=true; }
             }
             "#,
         )
@@ -1253,11 +1267,15 @@ mod tests {
         assert_eq!(
             actions,
             [
-                &Action::ToggleZoom(ZoomLevelPreset(2.)),
-                &Action::ToggleZoom(ZoomLevelPreset(4.)),
-                &Action::HoldZoom(ZoomLevelPreset(2.)),
-                &Action::HoldZoom(ZoomLevelPreset(3.)),
-                &Action::HoldZoom(ZoomLevelPreset(1.5)),
+                &Action::ToggleZoom(ZoomLevelPreset(2.), false),
+                &Action::ToggleZoom(ZoomLevelPreset(4.), false),
+                &Action::ToggleZoom(ZoomLevelPreset(2.), true),
+                &Action::HoldZoom(ZoomLevelPreset(2.), false),
+                &Action::HoldZoom(ZoomLevelPreset(3.), false),
+                &Action::HoldZoom(ZoomLevelPreset(1.5), false),
+                &Action::HoldZoom(ZoomLevelPreset(2.), true),
+                &Action::ZoomLock(false),
+                &Action::ZoomLock(true),
             ]
         );
     }
@@ -1298,15 +1316,19 @@ mod tests {
             "TouchpadScrollLeft",
             "TouchpadScrollRight",
         ] {
-            let text = format!("binds {{\n    Mod+{trigger} {{ hold-zoom 2.0; }}\n}}");
-            assert!(
-                crate::Config::parse_mem(&text).is_err(),
-                "expected parse error for: {text}"
-            );
+            for action in ["hold-zoom 2.0", "zoom-lock hold=true"] {
+                let text = format!("binds {{\n    Mod+{trigger} {{ {action}; }}\n}}");
+                assert!(
+                    crate::Config::parse_mem(&text).is_err(),
+                    "expected parse error for: {text}"
+                );
+            }
         }
 
-        // Toggle is a press-only action and stays valid on scroll triggers.
-        let text = "binds {\n    Mod+WheelScrollUp { toggle-zoom 2.0; }\n}";
-        assert!(crate::Config::parse_mem(text).is_ok());
+        // Press-only actions stay valid on scroll triggers.
+        for action in ["toggle-zoom 2.0", "zoom-lock"] {
+            let text = format!("binds {{\n    Mod+WheelScrollUp {{ {action}; }}\n}}");
+            assert!(crate::Config::parse_mem(&text).is_ok());
+        }
     }
 }

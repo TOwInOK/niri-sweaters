@@ -1008,7 +1008,7 @@ pub enum Action {
     ///
     /// While locked, the zoomed viewport does not follow the pointer. Applies to the output under
     /// the pointer, or the focused output if the pointer is not on any output.
-    ToggleZoomLock {},
+    ZoomLock {},
     /// Toggle the zoom level of an output between 1 and a preset level.
     ///
     /// Zooms the output under the pointer, or the focused output if the pointer is not on any
@@ -1017,6 +1017,13 @@ pub enum Action {
         /// Zoom level to toggle to, must be greater than 1.
         #[cfg_attr(feature = "clap", arg(allow_hyphen_values = true))]
         level: f64,
+        /// Lock the viewport while zoomed in.
+        ///
+        /// Zooming in also locks the zoomed viewport so it does not follow the pointer; toggling
+        /// back to 1 unlocks it.
+        #[cfg_attr(feature = "clap", arg(long))]
+        #[serde(default)]
+        hold: bool,
     },
 }
 
@@ -2254,8 +2261,15 @@ mod tests {
             Action::ZoomOut {},
             Action::SetZoomLevel { level: 2.5 },
             Action::ResetZoom {},
-            Action::ToggleZoomLock {},
-            Action::ToggleZoom { level: 2. },
+            Action::ZoomLock {},
+            Action::ToggleZoom {
+                level: 2.,
+                hold: false,
+            },
+            Action::ToggleZoom {
+                level: 2.,
+                hold: true,
+            },
         ] {
             let json = serde_json::to_string(&action).unwrap();
             let parsed: Action = serde_json::from_str(&json).unwrap();

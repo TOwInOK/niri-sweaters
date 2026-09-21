@@ -142,14 +142,15 @@ use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
 use crate::input::scroll_tracker::ScrollTracker;
 use crate::input::{
     apply_libinput_settings, mods_with_finger_scroll_binds, mods_with_mouse_binds,
-    mods_with_tablet_stylus_binds, mods_with_wheel_binds, TabletData, ZoomHoldState,
-    ZoomPinchRouting,
+    mods_with_tablet_stylus_binds, mods_with_wheel_binds, zoom_tracking_enabled, TabletData,
+    ZoomHoldState, ZoomLockHoldState, ZoomPinchRouting, ZoomTrackingGates,
 };
 use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
 use crate::layer::MappedLayer;
 use crate::layout::tile::TileRenderElement;
 use crate::layout::workspace::{Workspace, WorkspaceId};
+use crate::layout::zoom::OutputZoomState;
 use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
 };
@@ -181,6 +182,7 @@ use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
+use crate::ui::zoom_debug;
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
@@ -355,6 +357,11 @@ pub struct Niri {
     /// animates the saved zoom state back on the owning output, while
     /// lost-release cleanup restores it immediately.
     pub zoom_hold: Option<ZoomHoldState>,
+    /// Active `zoom-lock hold=true` session, if any.
+    ///
+    /// Owned by the physical trigger that started it; releasing the trigger
+    /// restores the lock state captured at press time on the owning output.
+    pub zoom_lock_hold: Option<ZoomLockHoldState>,
     /// Routing state of a compositor-owned touchpad pinch gesture, if any.
     ///
     /// Owned by the input layer: `Active` sequences drive the desktop zoom of
@@ -2732,6 +2739,7 @@ impl Niri {
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
             zoom_hold: None,
+            zoom_lock_hold: None,
             zoom_pinch: None,
             presentation_state,
             security_context_state,
@@ -3087,6 +3095,16 @@ impl Niri {
             .is_some_and(|hold| hold.output == *output)
         {
             self.zoom_hold = None;
+        }
+
+        // A zoom lock hold owned by the removed output can no longer be
+        // restored; drop the session.
+        if self
+            .zoom_lock_hold
+            .as_ref()
+            .is_some_and(|hold| hold.output == *output)
+        {
+            self.zoom_lock_hold = None;
         }
 
         // A zoom pinch owned by the removed output can no longer control the
@@ -4443,12 +4461,67 @@ impl Niri {
         self.screenshot_ui.advance_animations();
         self.window_mru_ui.advance_animations();
 
+        self.update_zoom_follow();
+
         for state in self.output_state.values_mut() {
             if let Some(transition) = &mut state.screen_transition {
                 if transition.is_done() {
                     state.screen_transition = None;
                 }
             }
+        }
+    }
+
+    /// Per-frame deadzone follow driver.
+    ///
+    /// Evaluates the canonical pointer position once per animation pass: the
+    /// output owning the pointer may start, retarget or stop a deadzone
+    /// follow, while every other output commits any active follow so its
+    /// camera freezes at the real displayed position. This is what lets the
+    /// camera keep moving after the physical pointer stops, and what starts
+    /// a follow when another transition (level animation, restore, gesture,
+    /// Overview, session lock, MRU, screenshot UI) releases the viewport.
+    fn update_zoom_follow(&mut self) {
+        let pointer_pos = self.seat.get_pointer().map(|p| p.current_location());
+        let owner = pointer_pos.and_then(|pos| {
+            self.output_under(pos)
+                .map(|(output, local)| (output.clone(), local))
+        });
+
+        let session_locked = self.is_locked();
+        let screenshot_ui_open = self.screenshot_ui.is_open();
+        let mru_active = self.window_mru_ui.is_active();
+        let zoom_config = self.config.borrow().zoom;
+
+        let mut redraw = Vec::new();
+        for mon in self.layout.monitors_mut() {
+            let owns_pointer = owner
+                .as_ref()
+                .is_some_and(|(output, _)| output == mon.output());
+
+            let changed = if owns_pointer {
+                let (_, cursor_local) = owner.as_ref().unwrap();
+                if zoom_tracking_enabled(ZoomTrackingGates {
+                    session_locked,
+                    overview_active: mon.overview_active(),
+                    screenshot_ui_open,
+                    mru_active,
+                }) {
+                    mon.update_zoom_follow(*cursor_local, zoom_config)
+                } else {
+                    mon.commit_zoom_follow()
+                }
+            } else {
+                mon.commit_zoom_follow()
+            };
+
+            if changed {
+                redraw.push(mon.output().clone());
+            }
+        }
+
+        for output in redraw {
+            self.queue_redraw(&output);
         }
     }
 
@@ -4696,6 +4769,31 @@ impl Niri {
         // without a wrapper.
         let zoom_origin = desktop_zoom.focal().to_physical_precise_round(output_scale);
         let zoom_level = desktop_zoom.factor();
+
+        // The zoom debug overlay is screen-space UI: it goes above the
+        // desktop scene but below the MRU, hotkey overlay, notifications,
+        // dialogs, transitions and the pointer. It renders on the physical
+        // output only, never into screencasts or screen captures, and stays
+        // hidden while the overview or the MRU UI is visually active.
+        let zoom_config = self.config.borrow().zoom;
+        let zoom_debug_config = zoom_config.debug;
+        if ctx.target == RenderTarget::Output
+            && (zoom_debug_config.deadzone || zoom_debug_config.focal_point)
+            && !mon.overview_active()
+            && !self.window_mru_ui.is_active()
+        {
+            let zoom_state = mon.zoom();
+
+            if zoom_debug_config.deadzone {
+                let deadzone =
+                    OutputZoomState::deadzone_rect(mon.view_size(), zoom_config.deadzone_size);
+                zoom_debug::render_deadzone(deadzone, push);
+            }
+
+            if zoom_debug_config.focal_point {
+                zoom_debug::render_focal(zoom_state.focal(), zoom_state.level() > 1., push);
+            }
+        }
 
         // Get layer-shell elements.
         let layer_map = layer_map_for_output(output);

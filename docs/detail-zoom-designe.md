@@ -144,7 +144,7 @@ zoom-in
 zoom-out
 set-zoom-level <LEVEL>
 reset-zoom
-toggle-zoom-lock
+zoom-lock
 ```
 
 - `zoom-in`/`zoom-out` multiply/divide **`target_level`** by
@@ -154,7 +154,7 @@ toggle-zoom-lock
   residue.
 - `set-zoom-level` validates `level ≥ 1` and clamps to `max-zoom`.
 - `reset-zoom` is `set-zoom-level 1`.
-- `toggle-zoom-lock` toggles focal tracking.
+- `zoom-lock` toggles focal tracking.
 - Target output: the output under the canonical pointer position, or the
   active output when the pointer is on no output. Anchor: the pointer position
   on the target output, or the output center otherwise.
@@ -164,7 +164,7 @@ toggle-zoom-lock
   implementation state, not the final UX semantics — see Smooth level
   animation.
 - IPC exposes the same actions (`niri-ipc`: `ZoomIn`, `ZoomOut`,
-  `SetZoomLevel`, `ResetZoom`, `ToggleZoomLock`).
+  `SetZoomLevel`, `ResetZoom`, `ZoomLock`).
 - Config reload: lowering `max-zoom` clamps `level` and `target_level` of
   every output immediately (the lock does not exempt an output); other zoom
   settings only affect future actions and tracking.
