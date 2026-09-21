@@ -1317,7 +1317,7 @@ impl State {
             };
 
             let excl_focus_on_layer = |layer| {
-                layers.layers_on(layer).find_map(|surface| {
+                layers.layers_on(layer).rev().find_map(|surface| {
                     if surface.cached_state().keyboard_interactivity
                         != wlr_layer::KeyboardInteractivity::Exclusive
                     {
@@ -1335,7 +1335,7 @@ impl State {
             };
 
             let on_d_focus_on_layer = |layer| {
-                layers.layers_on(layer).find_map(|surface| {
+                layers.layers_on(layer).rev().find_map(|surface| {
                     let is_on_demand_surface =
                         Some(surface) == self.niri.layer_shell_on_demand_focus.as_ref();
                     is_on_demand_surface

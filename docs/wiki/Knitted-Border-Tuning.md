@@ -191,6 +191,18 @@ Keep the rule after your other palette settings: a later matching rule can repla
 
 Even at `fuzz 0` the material keeps a short nap. Do not try to fix a bunched-up corner with these parameters: match the radius and stitch size first.
 
+### Tune the edge
+
+Both outlines have shallow transparent notches instead of a straight cut. The notches stay inside the border geometry, so window spacing does not change.
+
+There is no separate setting for edge strength. These existing settings control it:
+
+- **`stitch-size`:** larger stitches allow deeper notches, up to the width-based limit
+- **`fuzz`:** increases notch depth and the short pile across the fabric; `fuzz 0` does not disable the irregular edge
+- **`width`:** caps notch depth before smoothing at 20% of the border width, protecting the centre of narrow borders
+
+For a subtler edge, lower `fuzz` first. If needed, reduce `stitch-size` and recheck the row count and corner spacing. These adjustments also change the fabric, not just its edge.
+
 ## 5. Check the result
 
 Change one parameter at a time, guided by the visible problem:
@@ -199,6 +211,7 @@ Change one parameter at a time, guided by the visible problem:
 | --------------------------------------- | -------------------------------------------------------------------------------------------- |
 | The corner looks bunched up             | Reduce `stitch-size` or increase the inner radius                                            |
 | The pattern is clipped across the width | Add rows or pick a simpler pattern                                                           |
+| The edge looks too deeply notched       | Lower `fuzz`, then reduce `stitch-size` if needed; recheck the row count and corners         |
 | The clip eats into the content          | Reduce the radius or set up an exception for the application                                 |
 | Inactive stands out too much            | Mute its base and accent                                                                     |
 | The colour does not change              | Check the matching gradient and later window-rules                                           |

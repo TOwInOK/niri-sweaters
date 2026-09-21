@@ -13,7 +13,7 @@ use wayland_client::protocol::wl_pointer;
 
 use super::client::{ClientId, LayerConfigureProps};
 use super::fixture::Fixture;
-use super::knit::{llvmpipe_renderer, open_window, render_output_rgba};
+use super::knit::{assert_llvmpipe, open_window, render_output_rgba};
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::framebuffer_effect::FramebufferEffect;
@@ -447,10 +447,7 @@ fn zoom_framebuffer_effect_forwarding() {
 #[test]
 fn zoom_window_pixels_2x() {
     let mut f = set_up();
-    if !llvmpipe_renderer(f.niri_state()) {
-        eprintln!("skipping: not llvmpipe");
-        return;
-    }
+    assert_llvmpipe(f.niri_state());
     let output = f.niri_output(1);
     let id = f.add_client();
     open_window(
@@ -4311,10 +4308,7 @@ fn zoom_image_copy_cursor_position_and_overlap_use_displayed_geometry() {
 #[test]
 fn zoom_color_picker_samples_the_displayed_framebuffer() {
     let mut f = set_up();
-    if !llvmpipe_renderer(f.niri_state()) {
-        eprintln!("skipping: not llvmpipe");
-        return;
-    }
+    assert_llvmpipe(f.niri_state());
 
     let output = f.niri_output(1);
     let id = f.add_client();

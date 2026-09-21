@@ -260,6 +260,7 @@ impl BorderRenderElement {
             knit_stitch_size,
             knit_relief,
             knit_fuzz,
+            knit_motif_bends,
         ) = if let Some(knit) = knit {
             let pattern = match knit.pattern {
                 KnitPattern::Stockinette => 0.,
@@ -269,6 +270,22 @@ impl BorderRenderElement {
                 KnitPattern::Diamond => 4.,
                 KnitPattern::Dots => 5.,
             };
+            // Reference bend counts align motif colours across rows. The shader
+            // only needs this vec4, so it is derived here once per element
+            // instead of per pixel. Mirrors knit_course() in border.frag.
+            let stitch_width = (knit.stitch_size as f32).max(1.0);
+            let inv_stitch_width = 1.0 / stitch_width;
+            let depth =
+                ((border_width - 0.5).max(0.0) * 0.5).min(geo_size.x.min(geo_size.y) * 0.49);
+            let radii = <[f32; 4]>::from(corner_radius);
+            let mut motif_bends = [0.0f32; 4];
+            for (i, bend) in motif_bends.iter_mut().enumerate() {
+                let radius = (radii[(i + 1) % 4] - depth).max(0.0);
+                *bend = (radius * 1.570_796_4 * inv_stitch_width + 0.5)
+                    .floor()
+                    .max(1.0)
+                    * if radius >= 0.001 { 1.0 } else { 0.0 };
+            }
             (
                 1.,
                 pattern,
@@ -276,9 +293,18 @@ impl BorderRenderElement {
                 knit.stitch_size as f32,
                 knit.relief as f32,
                 knit.fuzz as f32,
+                motif_bends,
             )
         } else {
-            (0., 0., Color::default().to_array_unpremul(), 1., 0., 0.)
+            (
+                0.,
+                0.,
+                Color::default().to_array_unpremul(),
+                1.,
+                0.,
+                0.,
+                [0.; 4],
+            )
         };
         self.inner.update(
             size,
@@ -304,6 +330,7 @@ impl BorderRenderElement {
                 Uniform::new("knit_stitch_size", knit_stitch_size),
                 Uniform::new("knit_relief", knit_relief),
                 Uniform::new("knit_fuzz", knit_fuzz),
+                Uniform::new("knit_motif_bends", knit_motif_bends),
             ]),
             HashMap::new(),
         );

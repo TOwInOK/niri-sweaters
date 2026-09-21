@@ -419,6 +419,8 @@ Compact fibres and short nap are intrinsic to the wool material, even with `fuzz
 `fuzz` extends the short pile and edge irregularity from 0 to 1; the default is 0 for compact wool.
 Fibres have varied lengths and slants, follow the yarn, and are filtered at small pixel sizes, including fractional output scales.
 The pile stays within the existing border geometry; it does not create a separate surface outside the frame.
+The inner and outer edges have shallow transparent notches that follow the yarn's noise field rather than a straight cut.
+Their depth follows the stitch size and is limited on narrow borders; window spacing is unchanged.
 The normal active, inactive and urgent colors or gradients provide the base yarn color; `accent-color` supplies the pattern yarn.
 Rounded corners use concentric courses with individually rotated stitches. Each course fits its own
 stitch count to the arc length, so inner turns contain fewer loops instead of radially pinched yarn.

@@ -1,0 +1,17 @@
+[package]
+name = "niri-visual-generator"
+version.workspace = true
+description = "Offscreen fixture renderer for niri documentation assets"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+niri = { version = "26.4.0", path = "../.." }
+niri-config = { version = "26.4.0", path = "../../niri-config" }
+pango = { version = "0.21.5", features = ["v1_44"] }
+pangocairo = "0.21.5"
+smithay.workspace = true
+webp-rust = "0.3.1"

@@ -1,6 +1,7 @@
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
+use std::sync::Once;
 use std::time::Duration;
 
 use calloop::generic::Generic;
@@ -23,12 +24,31 @@ pub struct State {
     pub clients: Vec<Client>,
 }
 
+/// Points GLVND at Mesa before any test can initialize EGL.
+///
+/// Golden tests require llvmpipe for deterministic pixels. Keep this in the
+/// shared fixture setup because the test harness runs tests in parallel and
+/// EGL vendor selection is process-global.
+fn prefer_mesa_egl() {
+    static INIT: Once = Once::new();
+
+    INIT.call_once(|| {
+        const MESA_JSON: &str = "/usr/share/glvnd/egl_vendor.d/50_mesa.json";
+        if std::env::var_os("__EGL_VENDOR_LIBRARY_FILENAMES").is_none()
+            && std::path::Path::new(MESA_JSON).exists()
+        {
+            std::env::set_var("__EGL_VENDOR_LIBRARY_FILENAMES", MESA_JSON);
+        }
+    });
+}
 impl Fixture {
     pub fn new() -> Self {
         Self::with_config(Config::default())
     }
 
     pub fn with_config(config: Config) -> Self {
+        prefer_mesa_egl();
+
         let event_loop = EventLoop::try_new().unwrap();
         let handle = event_loop.handle();
 

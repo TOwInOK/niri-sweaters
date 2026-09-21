@@ -3,6 +3,7 @@ members = [
     "niri-config",
     "niri-ipc",
     "niri-visual-tests",
+    "tools/visual-generator",
 ]
 
 [workspace.package]

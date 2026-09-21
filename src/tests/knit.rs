@@ -11,10 +11,8 @@ use super::client::ClientId;
 use super::*;
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
 
-/// Whether the primary renderer is llvmpipe.
-///
-/// The golden images are only deterministic on llvmpipe, so the tests skip on anything else.
-pub(crate) fn llvmpipe_renderer(state: &mut crate::niri::State) -> bool {
+/// The GL_RENDERER string of the primary renderer.
+fn renderer_name(state: &mut crate::niri::State) -> String {
     state
         .backend
         .headless()
@@ -23,16 +21,26 @@ pub(crate) fn llvmpipe_renderer(state: &mut crate::niri::State) -> bool {
                 .with_context(|gl| unsafe {
                     let ptr = gl.GetString(ffi::RENDERER);
                     if ptr.is_null() {
-                        return false;
+                        return String::new();
                     }
                     CStr::from_ptr(ptr as *const _)
                         .to_string_lossy()
-                        .to_lowercase()
-                        .contains("llvmpipe")
+                        .into_owned()
                 })
-                .unwrap_or(false)
+                .unwrap_or_default()
         })
-        .unwrap_or(false)
+        .unwrap_or_default()
+}
+
+/// The golden images are only deterministic on llvmpipe, so the tests require it.
+pub(crate) fn assert_llvmpipe(state: &mut crate::niri::State) {
+    let name = renderer_name(state);
+    assert!(
+        name.to_lowercase().contains("llvmpipe"),
+        "golden tests require the llvmpipe software renderer, got: {name}\n\
+         force Mesa EGL with: \
+         __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json cargo test knit"
+    );
 }
 
 /// Renders an output to a physical-size RGBA pixel buffer.
@@ -96,7 +104,7 @@ fn assert_golden(name: &str, size: Size<i32, Physical>, pixels: &[u8]) {
         Ok(file) => file,
         Err(err) => panic!(
             "error opening golden {}: {err}\n\
-             generate it with: LIBGL_ALWAYS_SOFTWARE=1 NIRI_GOLDEN_UPDATE=1 cargo test knit",
+             generate it with: NIRI_GOLDEN_UPDATE=1 cargo test knit",
             path.display()
         ),
     };
@@ -183,7 +191,7 @@ hotkey-overlay {
 
 layout {
     gaps 8
-    default-column-width { fixed 220; }
+    default-column-width { fixed 124; }
     focus-ring {
         off
     }
@@ -263,6 +271,106 @@ window-rule {
 
 window-rule {
     match title="knit-off"
+    draw-border-with-background false
+    border {
+        knit {
+            off
+        }
+    }
+}
+"##;
+
+const KNIT_GRADIENT_PATTERNS_CONFIG: &str = r##"
+animations {
+    off
+}
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+layout {
+    gaps 8
+    default-column-width { fixed 124; }
+    focus-ring {
+        off
+    }
+    border {
+        on
+        width 48
+        active-gradient from="#526c89" to="#8fa6bf" angle=90
+        inactive-gradient from="#526c89" to="#8fa6bf" angle=90
+        knit {
+            on
+            stitch-size 8
+            relief 0.65
+            fuzz 0.15
+        }
+    }
+}
+
+window-rule {
+    match title="knit-stockinette"
+    border {
+        knit {
+            pattern "stockinette"
+            accent-color "#f3d5a5"
+        }
+    }
+}
+
+window-rule {
+    match title="knit-rib"
+    border {
+        knit {
+            pattern "rib"
+            accent-color "#f3d5a5"
+        }
+    }
+}
+
+window-rule {
+    match title="knit-checker"
+    border {
+        knit {
+            pattern "checker"
+            accent-color "#f3d5a5"
+        }
+    }
+}
+
+window-rule {
+    match title="knit-zigzag"
+    border {
+        knit {
+            pattern "zigzag"
+            accent-color "#f3d5a5"
+        }
+    }
+}
+
+window-rule {
+    match title="knit-diamond"
+    border {
+        knit {
+            pattern "diamond"
+            accent-color "#f3d5a5"
+        }
+    }
+}
+
+window-rule {
+    match title="knit-dots"
+    border {
+        knit {
+            pattern "dots"
+            accent-color "#f3d5a5"
+        }
+    }
+}
+
+window-rule {
+    match title="border-gradient"
     draw-border-with-background false
     border {
         knit {
@@ -358,10 +466,7 @@ window-rule {
 #[test]
 fn knit_patterns() {
     let mut f = set_up(KNIT_PATTERNS_CONFIG);
-    if !llvmpipe_renderer(f.niri_state()) {
-        eprintln!("skipping: not llvmpipe");
-        return;
-    }
+    assert_llvmpipe(f.niri_state());
 
     let id = f.add_client();
 
@@ -391,12 +496,41 @@ fn knit_patterns() {
 }
 
 #[test]
+fn knit_gradient_patterns() {
+    let mut f = set_up(KNIT_GRADIENT_PATTERNS_CONFIG);
+    assert_llvmpipe(f.niri_state());
+
+    let id = f.add_client();
+
+    let windows = [
+        ("knit-stockinette", 0x1a1a1a1a),
+        ("knit-rib", 0x1c1a1a1a),
+        ("knit-checker", 0x1a1c1a1a),
+        ("knit-zigzag", 0x1a1a1c1a),
+        ("knit-diamond", 0x1c1c1a1a),
+        ("knit-dots", 0x1a1c1c1a),
+        ("border-gradient", 0x1a1a1a1a),
+    ];
+    for (title, shade) in windows {
+        open_window(
+            &mut f,
+            id,
+            title,
+            124,
+            560,
+            [shade, shade, shade, 0xffffffff],
+        );
+    }
+
+    let output = f.niri_output(1);
+    let (size, pixels) = render_output_rgba(f.niri_state(), &output);
+    assert_golden("knit_gradient_patterns", size, &pixels);
+}
+
+#[test]
 fn knit_rounded_corners() {
     let mut f = set_up(KNIT_ROUNDED_CONFIG);
-    if !llvmpipe_renderer(f.niri_state()) {
-        eprintln!("skipping: not llvmpipe");
-        return;
-    }
+    assert_llvmpipe(f.niri_state());
 
     let id = f.add_client();
 
@@ -411,10 +545,7 @@ fn knit_rounded_corners() {
 #[test]
 fn knit_fractional_scale() {
     let mut f = set_up(KNIT_FRACTIONAL_CONFIG);
-    if !llvmpipe_renderer(f.niri_state()) {
-        eprintln!("skipping: not llvmpipe");
-        return;
-    }
+    assert_llvmpipe(f.niri_state());
 
     let id = f.add_client();
 

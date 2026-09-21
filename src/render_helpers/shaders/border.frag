@@ -30,6 +30,8 @@ uniform vec4 knit_accent_color;
 uniform float knit_stitch_size;
 uniform float knit_relief;
 uniform float knit_fuzz;
+// Bend stitch counts of the reference course, computed on the CPU per element.
+uniform vec4 knit_motif_bends;
 vec4 premul_rect(vec4 color) {
     color.rgb *= color.a;
     return color;
@@ -71,26 +73,24 @@ vec3 linear_to_srgb(vec3 color) {
 }
 
 vec3 lch_to_lab(vec3 color) {
-    float a = color.y * clamp(cos(radians(color.z)), -1.0, 1.0);
-    float b = color.y * clamp(sin(radians(color.z)), -1.0, 1.0);
-    return vec3(
-        color.x,
-        a,
-        b
-    );
+    float rad = radians(color.z);
+    float a = color.y * clamp(cos(rad), -1.0, 1.0);
+    float b = color.y * clamp(sin(rad), -1.0, 1.0);
+    return vec3(color.x, a, b);
 }
 
+const mat3 oklab_to_lms = mat3(
+    vec3(1.0, 0.3963377774, 0.2158037573),
+    vec3(1.0, -0.1055613458, -0.0638541728),
+    vec3(1.0, -0.0894841775, -1.2914855480)
+);
+const mat3 lms_to_rgb = mat3(
+    vec3(4.0767416621, -3.3077115913, 0.2309699292),
+    vec3(-1.2684380046, 2.6097574011, -0.3413193965),
+    vec3(-0.0041960863, -0.7034186147, 1.7076147010)
+);
+
 vec3 oklab_to_linear(vec3 color){
-    mat3 oklab_to_lms = mat3(
-        vec3(1.0, 0.3963377774, 0.2158037573),
-        vec3(1.0, -0.1055613458, -0.0638541728),
-        vec3(1.0, -0.0894841775, -1.2914855480)
-    );
-    mat3 lms_to_rgb = mat3(
-        vec3(4.0767416621, -3.3077115913, 0.2309699292),
-        vec3(-1.2684380046, 2.6097574011, -0.3413193965),
-        vec3(-0.0041960863, -0.7034186147, 1.7076147010)
-    );
     vec3 lms = color * oklab_to_lms;
     // Multiplication instead of pow(): lms can go negative out of gamut,
     // where pow() is undefined.
@@ -122,8 +122,10 @@ vec4 color_mix(vec4 color1, vec4 color2, float color_ratio) {
 
         float min_hue = min(color1.z, color2.z);
         float max_hue = max(color1.z, color2.z);
-        float path_direct_distance = (max_hue - min_hue) * color_ratio;
-        float path_mod_distance = (360.0 - max_hue + min_hue) * color_ratio;
+        float d_hue = max_hue - min_hue;
+        float d_hue_wrap = 360.0 - d_hue;
+        float path_direct_distance = d_hue * color_ratio;
+        float path_mod_distance = d_hue_wrap * color_ratio;
 
         float path_mod =
             color1.z == min_hue ?
@@ -137,13 +139,13 @@ vec4 color_mix(vec4 color1, vec4 color2, float color_ratio) {
         // shorter
         if (hue_interpolation == 0.0) {
             color_out.z =
-                max_hue - min_hue > 360.0 - max_hue + min_hue ?
+                d_hue > d_hue_wrap ?
                     path_mod :
                     path_direct ;
         // longer
         } else if (hue_interpolation == 1.0) {
             color_out.z =
-                max_hue - min_hue <= 360.0 - max_hue + min_hue ?
+                d_hue <= d_hue_wrap ?
                     path_mod :
                     path_direct ;
         // increasing
@@ -166,6 +168,9 @@ vec4 color_mix(vec4 color1, vec4 color2, float color_ratio) {
 }
 
 vec4 gradient_color(vec2 coords) {
+    if (colorspace == 0.0 && color_from == color_to)
+        return premul_rect(color_from);
+
     coords = coords + grad_offset;
 
     if ((grad_vec.x < 0.0 && 0.0 <= grad_vec.y) || (0.0 <= grad_vec.x && grad_vec.y < 0.0))
@@ -182,30 +187,38 @@ vec4 gradient_color(vec2 coords) {
 
 float niri_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius);
 
+// Knit is an analytic 2.5D material, not a sampled image or a mesh of threads.
+// A course is one row following an inset outline of the window. Two bent yarn
+// legs form each V-shaped stitch; the frontmost local surface owns the pixel.
+// Yarn-local noise and small fibre strokes add thickness, colour and roughness;
+// lighting and coverage make these flat calculations look like raised wool.
+// Courses use logical pixels; knit_leg uses a normalized, stitch-local frame.
 float knit_hash(vec2 value) {
     return fract(sin(dot(value, vec2(127.1, 311.7))) * 43758.5453123);
 }
 
 // Value and analytic derivatives of a smooth fibre field. Anisotropic sampling
 // makes irregular bundles, rather than equally spaced grooves in a smooth cord.
+// Returns (value, dValue/dX, dValue/dY), used for both colour and bump lighting.
 vec3 knit_noise(vec2 p) {
     vec2 cell = floor(p);
     vec2 f = fract(p);
     vec2 blend = f * f * (3.0 - 2.0 * f);
     vec2 derivative = 6.0 * f * (1.0 - f);
-    float a = knit_hash(cell);
-    float b = knit_hash(cell + vec2(1.0, 0.0));
-    float c = knit_hash(cell + vec2(0.0, 1.0));
-    float d = knit_hash(cell + vec2(1.0, 1.0));
+    vec4 dots = (cell.x + vec4(0.0, 1.0, 0.0, 1.0)) * 127.1 + (cell.y + vec4(0.0, 0.0, 1.0, 1.0)) * 311.7;
+    vec4 h = fract(sin(dots) * 43758.5453123);
+    vec2 mix_x = mix(h.xz, h.yw, blend.x);
     return vec3(
-        mix(mix(a, b, blend.x), mix(c, d, blend.x), blend.y),
-        mix(b - a, d - c, blend.y) * derivative.x,
-        mix(c - a, d - b, blend.x) * derivative.y
+        mix(mix_x.x, mix_x.y, blend.y),
+        mix(h.y - h.x, h.w - h.z, blend.y) * derivative.x,
+        mix(h.z - h.x, h.w - h.y, blend.x) * derivative.y
     );
 }
 
 // Box-filtered, finite wool fibres. Random length, slant and spacing keep the
 // pile from turning into the continuous, parallel highlights of synthetic cord.
+// Returns coverage of a bright fibre and its offset shadow. footprint is the
+// pixel footprint in this field's coordinates, so thin strokes fade instead of aliasing.
 vec2 knit_filaments(vec2 p, vec2 footprint) {
     vec2 cell = floor(p);
     vec2 q = fract(p) - 0.5;
@@ -215,37 +228,47 @@ vec2 knit_filaments(vec2 p, vec2 footprint) {
     float half_length = mix(0.20, 0.46, fract(seed * 7.3));
     float radius = mix(0.055, 0.11, fract(seed * 23.1));
     vec2 aa = max(footprint, vec2(0.001));
-    float ends = 1.0 - smoothstep(half_length - aa.y * 0.5, half_length + aa.y * 0.5, abs(q.y));
-    float fibre = clamp((q.x + radius) / aa.x + 0.5, 0.0, 1.0)
-        - clamp((q.x - radius) / aa.x + 0.5, 0.0, 1.0);
-    float shadow = clamp((q.x + radius - 0.14) / aa.x + 0.5, 0.0, 1.0)
-        - clamp((q.x - radius - 0.14) / aa.x + 0.5, 0.0, 1.0);
+    float inv_aax = 1.0 / aa.x;
+    float half_aay = aa.y * 0.5;
+    float ends = 1.0 - smoothstep(half_length - half_aay, half_length + half_aay, abs(q.y));
+    float fibre = clamp((q.x + radius) * inv_aax + 0.5, 0.0, 1.0)
+        - clamp((q.x - radius) * inv_aax + 0.5, 0.0, 1.0);
+    float q_shadow = q.x - 0.14;
+    float shadow = clamp((q_shadow + radius) * inv_aax + 0.5, 0.0, 1.0)
+        - clamp((q_shadow - radius) * inv_aax + 0.5, 0.0, 1.0);
     return vec2(fibre, shadow) * ends * (1.0 - smoothstep(0.8, 2.0, aa.x));
 }
 
 // Elliptical yarn bodies bend towards the loop tip. Unlike constant-width
 // capsules, their ends disappear into the adjoining course instead of making Xs.
+// Returns (approximate signed distance, height, u, t): negative distance is inside;
+// u crosses the yarn in radius units, and t runs from 0 to 1 along this leg.
+// The surface normal is unnormalized; tangent follows the curved centreline.
 vec4 knit_leg(vec2 point, float side, float seed, float radius, out vec3 normal, out vec2 tangent) {
     vec2 start = vec2(side * 0.40, -0.56);
     vec2 axis = vec2(-side * 0.34, 1.12);
-    float axis_squared = dot(axis, axis);
-    float t = clamp(dot(point - start, axis) / axis_squared, 0.0, 1.0);
+    // Project onto the straight axis, then refine once against its bowed centreline.
+    // dot(axis, axis) = (-side * 0.34)^2 + 1.12^2 = 0.1156 + 1.2544 = 1.37 identically.
+    float t = clamp(dot(point - start, axis) * (1.0 / 1.37), 0.0, 1.0);
     float bow = side * (0.035 + 0.012 * seed);
-    vec2 center = start + axis * t + vec2(bow * 4.0 * t * (1.0 - t), 0.0);
-    tangent = axis + vec2(bow * (4.0 - 8.0 * t), 0.0);
+    float bow_4 = bow * 4.0;
+    vec2 center = start + axis * t + vec2(bow_4 * t * (1.0 - t), 0.0);
+    tangent = axis + vec2(bow_4 * (1.0 - 2.0 * t), 0.0);
     t = clamp(t + dot(point - center, tangent) / dot(tangent, tangent), 0.0, 1.0);
-    center = start + axis * t + vec2(bow * 4.0 * t * (1.0 - t), 0.0);
-    tangent = normalize(axis + vec2(bow * (4.0 - 8.0 * t), 0.0));
+    center = start + axis * t + vec2(bow_4 * t * (1.0 - t), 0.0);
+    tangent = normalize(axis + vec2(bow_4 * (1.0 - 2.0 * t), 0.0));
     vec2 across = vec2(tangent.y, -tangent.x);
-    float u = dot(point - center, across) / radius;
+    float inv_radius = 1.0 / radius;
+    float inv_radius_sq = inv_radius * inv_radius;
+    float u = dot(point - center, across) * inv_radius;
     float v = t * 2.0 - 1.0;
     // Include distance past the endpoints; clamping t must not extrude the tips.
     float end_distance = dot(point - center, tangent);
     // Keep a narrow yarn neck at each end: the strand tucks into the next
     // course instead of ending as a separate pointed bead.
-    float ellipse = u * u + v * v * 0.86 + end_distance * end_distance / (radius * radius);
+    float ellipse = u * u + v * v * 0.86 + (end_distance * end_distance) * inv_radius_sq;
     float dome = sqrt(max(1.0 - ellipse, 0.0));
-    normal = vec3(across * u + tangent * (v * radius * 1.46), max(dome / 0.78, 0.08));
+    normal = vec3(across * u + tangent * (v * radius * 1.46), max(dome * (1.0 / 0.78), 0.08));
     return vec4((sqrt(ellipse) - 1.0) * radius, dome * radius, u, t);
 }
 
@@ -255,9 +278,13 @@ vec4 knit_leg(vec2 point, float side, float seed, float radius, out vec3 normal,
 struct KnitCourse {
     vec2 size;
     vec4 radius;
+    vec4 lengths;
+    vec4 inv_lengths;
+    // Per-side stitch counts, not lengths: top, right, bottom, left.
     vec4 edges;
     vec4 bends;
     float depth;
+    float total;
 };
 
 KnitCourse knit_course(float depth, float stitch_width) {
@@ -266,14 +293,19 @@ KnitCourse knit_course(float depth, float stitch_width) {
     course.size = max(geo_size - vec2(2.0 * depth), vec2(0.001));
     // Clockwise, beginning with the corner at the end of the top edge.
     course.radius = max(outer_radius.yzwx - vec4(depth), vec4(0.0));
-    vec4 lengths = max(vec4(course.size.x, course.size.y, course.size.x, course.size.y)
+    course.lengths = max(vec4(course.size.x, course.size.y, course.size.x, course.size.y)
         - course.radius.wxyz - course.radius, vec4(0.0));
-    course.edges = max(floor(lengths / stitch_width + 0.5), vec4(1.0)) * step(0.001, lengths);
-    course.bends = max(floor(course.radius * 1.57079633 / stitch_width + 0.5), vec4(1.0))
+    float inv_stitch_width = 1.0 / stitch_width;
+    course.edges = max(floor(course.lengths * inv_stitch_width + 0.5), vec4(1.0)) * step(0.001, course.lengths);
+    course.bends = max(floor(course.radius * 1.57079633 * inv_stitch_width + 0.5), vec4(1.0))
         * step(0.001, course.radius);
+    course.inv_lengths = 1.0 / max(course.lengths, vec4(0.001));
+    course.total = max(dot(course.edges + course.bends, vec4(1.0)), 1.0);
     return course;
 }
 
+// Clockwise position measured in stitches, not pixels. Integer boundaries delimit
+// cells; knit_course_stitch samples their centres at index + 0.5.
 float knit_course_coordinate(vec2 point, KnitCourse course) {
     vec2 p = point - vec2(course.depth);
     vec2 size = course.size;
@@ -294,24 +326,27 @@ float knit_course_coordinate(vec2 point, KnitCourse course) {
     vec4 distance = vec4(p.y, size.x - p.x, size.y - p.y, p.x);
     float nearest = min(min(distance.x, distance.y), min(distance.z, distance.w));
     if (nearest == distance.x)
-        return clamp((p.x - r.w) / max(size.x - r.w - r.x, 0.001), 0.0, 1.0) * e.x;
+        return clamp((p.x - r.w) * course.inv_lengths.x, 0.0, 1.0) * e.x;
     if (nearest == distance.y)
-        return right + clamp((p.y - r.x) / max(size.y - r.x - r.y, 0.001), 0.0, 1.0) * e.y;
+        return right + clamp((p.y - r.x) * course.inv_lengths.y, 0.0, 1.0) * e.y;
     if (nearest == distance.z)
-        return bottom + clamp((size.x - r.y - p.x) / max(size.x - r.y - r.z, 0.001), 0.0, 1.0) * e.z;
-    return left + clamp((size.y - r.z - p.y) / max(size.y - r.z - r.w, 0.001), 0.0, 1.0) * e.w;
+        return bottom + clamp((size.x - r.y - p.x) * course.inv_lengths.z, 0.0, 1.0) * e.z;
+    return left + clamp((size.y - r.z - p.y) * course.inv_lengths.w, 0.0, 1.0) * e.w;
 }
 
+// Convert a course coordinate to a centre and width in logical pixels plus a unit
+// tangent. Each bend starts its motif at zero; the following edge continues it.
+// stitch_id is (local stitch index, segment): four edge/bend pairs per row.
 void knit_course_stitch(
-    float coordinate, KnitCourse course, KnitCourse motif,
-    out vec2 center, out vec2 tangent, out float width, out float column
+    float coordinate, KnitCourse course,
+    out vec2 center, out vec2 tangent, out float width, out float column, out vec2 stitch_id
 ) {
-    float s = mod(coordinate, max(dot(course.edges + course.bends, vec4(1.0)), 1.0));
-    float motif_start = 0.0;
+    float s = mod(coordinate, course.total);
     center = vec2(0.0);
     tangent = vec2(1.0, 0.0);
     width = max(knit_stitch_size, 1.0);
     column = 0.0;
+    stitch_id = vec2(0.0);
     for (int side = 0; side < 4; side++) {
         vec2 start;
         if (side == 0) {
@@ -328,33 +363,35 @@ void knit_course_stitch(
             tangent = vec2(0.0, -1.0);
         }
         int previous = side == 0 ? 3 : side - 1;
-        float length = (side == 0 || side == 2 ? course.size.x : course.size.y)
-            - course.radius[previous] - course.radius[side];
+        float length = course.lengths[side];
         float edges = course.edges[side];
         float bends = course.bends[side];
         if (s < edges) {
-            float fraction = s / edges;
+            float inv_edges = 1.0 / edges;
+            float fraction = s * inv_edges;
             center = start + tangent * (fraction * length) + vec2(course.depth);
-            width = length / edges;
-            column = floor(motif_start + fraction * motif.edges[side]);
+            width = length * inv_edges;
+            // One colour column per real stitch; resampling skips or duplicates colours.
+            column = knit_motif_bends[previous] + floor(s);
+            stitch_id = vec2(floor(s), float(side) * 2.0);
             return;
         }
         s -= edges;
-        motif_start += motif.edges[side];
         if (s < bends) {
-            float fraction = s / bends;
+            float inv_bends = 1.0 / bends;
+            float fraction = s * inv_bends;
             float angle = fraction * 1.57079633;
             vec2 inward = vec2(-tangent.y, tangent.x);
             float radius = course.radius[side];
             center = start + tangent * length + inward * radius
                 + radius * (tangent * sin(angle) - inward * cos(angle)) + vec2(course.depth);
             tangent = tangent * cos(angle) + inward * sin(angle);
-            width = 2.0 * radius * sin(0.78539816 / bends);
-            column = floor(motif_start + fraction * motif.bends[side]);
+            width = 2.0 * radius * sin(0.78539816 * inv_bends);
+            column = floor(fraction * knit_motif_bends[side]);
+            stitch_id = vec2(floor(s), float(side) * 2.0 + 1.0);
             return;
         }
         s -= bends;
-        motif_start += motif.bends[side];
     }
 }
 
@@ -391,7 +428,10 @@ vec3 knit_border_frame(vec2 point) {
     return vec3(delta / max(radial_distance, 0.001), radius - radial_distance);
 }
 
+// Motifs select a colour per whole stitch; they do not deform the yarn profile.
 float knit_accent_mix(float column, float row) {
+    if (knit_pattern == 0.0)
+        return 0.0;
     if (knit_pattern == 1.0)
         return mod(column, 3.0) < 1.0 ? 1.0 : 0.0;
     if (knit_pattern == 2.0)
@@ -410,12 +450,28 @@ float knit_accent_mix(float column, float row) {
     return 0.0;
 }
 
-vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, KnitCourse motif) {
+// FocusRing adds 0.5 logical pixels to hide corner AA seams. Knit backing
+// must use the actual band width, matching the straight segment geometry.
+float knit_border_width() {
+    return max(border_width - 0.5, 0.0);
+}
+
+const vec3 knit_light = normalize(vec3(-0.45, -0.65, 1.1));
+
+vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color) {
+    float band_width = knit_border_width();
     float relief = clamp(knit_relief, 0.0, 1.0);
     float fuzz = clamp(knit_fuzz, 0.0, 1.0);
+    float pile = 0.18 + fuzz * 0.82;
+    float edge_depth = min(stitch_width * mix(0.10, 0.20, pile), band_width * 0.20);
+    float edge_aa = min(1.0 / max(niri_scale, 0.001), max(band_width * 0.25, 0.001));
+    float resolved = smoothstep(1.0, 3.5, stitch_width * niri_scale);
+    vec4 premul_accent = premul_rect(knit_accent_color);
     float stitch_height = stitch_width * 0.94;
     vec3 frame = knit_border_frame(geometry_coords);
-    float roll = clamp(2.0 * frame.z / max(border_width, 0.001) - 1.0, -1.0, 1.0);
+    // Broad curvature shades the whole band like a soft rounded strip. The
+    // individual yarn normals add the smaller loop relief on top of this shape.
+    float roll = clamp(2.0 * frame.z / max(band_width, 0.001) - 1.0, -1.0, 1.0);
     float slope = roll / sqrt(max(1.0 - roll * roll, 0.20));
     vec3 band_normal = normalize(vec3(frame.xy * slope * 0.38 * relief, 1.0));
     float grid_row = frame.z / stitch_height;
@@ -428,34 +484,97 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
     float yarn_column = 0.0;
     float yarn_width = stitch_width;
     vec2 yarn_tangent = vec2(0.0, 1.0);
+    // The fragment's nearest edge picks the straight segment its candidates
+    // usually live on; per-edge constants are selected without indexing vec4s.
+    vec4 edge_dist = vec4(geometry_coords.y, geo_size.x - geometry_coords.x,
+        geo_size.y - geometry_coords.y, geometry_coords.x);
+    float edge_min = min(min(edge_dist.x, edge_dist.y), min(edge_dist.z, edge_dist.w));
+    int edge = edge_min == edge_dist.y ? 1
+        : edge_min == edge_dist.z ? 2
+        : edge_min == edge_dist.w ? 3 : 0;
 
+
+    // Search two nearby courses and three neighbouring stitches in each. Each
+    // stitch contributes two legs; there is no need to traverse the whole border.
     for (int neighbour = 0; neighbour < 2; neighbour++) {
         float row = base_row + (neighbour == 0 ? 0.0 : (fract(grid_row) < 0.5 ? -1.0 : 1.0));
         float depth = (row + 0.5) * stitch_height;
         if (2.0 * depth >= min(geo_size.x, geo_size.y))
             continue;
         KnitCourse course = knit_course(depth, stitch_width);
+        // Straight-segment constants for the fragment's edge. Candidates that
+        // land inside it skip the side walk; the rest resolve through
+        // knit_course_stitch. Ternary chains keep every index compile-time.
+        vec2 e_start = edge == 0 ? vec2(course.radius.w, 0.0)
+            : edge == 1 ? vec2(course.size.x, course.radius.x)
+            : edge == 2 ? vec2(course.size.x - course.radius.y, course.size.y)
+            : vec2(0.0, course.size.y - course.radius.z);
+        vec2 e_tangent = edge == 0 ? vec2(1.0, 0.0)
+            : edge == 1 ? vec2(0.0, 1.0)
+            : edge == 2 ? vec2(-1.0, 0.0)
+            : vec2(0.0, -1.0);
+        float e_lo = edge == 0 ? 0.0
+            : edge == 1 ? course.edges.x + course.bends.x
+            : edge == 2 ? course.edges.x + course.bends.x + course.edges.y + course.bends.y
+            : course.edges.x + course.bends.x + course.edges.y + course.bends.y
+                + course.edges.z + course.bends.z;
+        float e_count = edge == 0 ? course.edges.x
+            : edge == 1 ? course.edges.y
+            : edge == 2 ? course.edges.z
+            : course.edges.w;
+        float e_w = (edge == 0 ? course.lengths.x
+            : edge == 1 ? course.lengths.y
+            : edge == 2 ? course.lengths.z
+            : course.lengths.w) / max(e_count, 1.0);
+        // |point.x| = |along - s_i| * e_px exactly on this edge, so candidates
+        // provably out of leg reach can be rejected before any stitch math.
+        float e_px = e_w / clamp(e_w, stitch_width * 0.82, stitch_width * 1.18);
+        float e_prev_bends = edge == 0 ? knit_motif_bends.w
+            : edge == 1 ? knit_motif_bends.x
+            : edge == 2 ? knit_motif_bends.y
+            : knit_motif_bends.z;
         float along = knit_course_coordinate(geometry_coords, course);
         float cell = floor(along);
-        for (int adjacent = -1; adjacent <= 1; adjacent++) {
+
+        // Visit the containing stitch first, then the nearer neighbour, so the
+        // early-out below usually kicks in by the time the far stitch is tested.
+        float near = fract(along) < 0.5 ? -1.0 : 1.0;
+        for (int i = 0; i < 3; i++) {
+            int adjacent = i == 0 ? 0 : (i == 1 ? int(near) : -int(near));
             float index = cell + float(adjacent);
             vec2 center;
             vec2 tangent;
             float width;
             float column;
-            knit_course_stitch(index + 0.5, course, motif, center, tangent, width, column);
+            vec2 stitch_id;
+            float s_local = index + 0.5 - e_lo;
+            if (s_local >= 0.0 && s_local < e_count) {
+                // In-edge stitch: |point.x| is bounded exactly, so a candidate
+                // that cannot win is rejected before resolving its geometry.
+                if (best_surface >= 0.0 && abs(along - index - 0.5) * e_px > 0.809)
+                    continue;
+                center = e_start + e_tangent * (s_local * e_w) + vec2(course.depth);
+                tangent = e_tangent;
+                width = e_w;
+                column = e_prev_bends + floor(s_local);
+                stitch_id = vec2(floor(s_local), float(edge) * 2.0);
+            } else {
+                knit_course_stitch(index + 0.5, course, center, tangent, width, column, stitch_id);
+            }
             // Tight inner turns decrease the stitch count, not the yarn diameter.
             width = clamp(width, stitch_width * 0.82, stitch_width * 1.18);
             vec2 inward = vec2(-tangent.y, tangent.x);
             vec2 delta = geometry_coords - center;
+            // Rotate into the stitch frame: x follows the course, y points inward.
+            // Normalizing by stitch dimensions reuses one yarn profile on every side.
             vec2 point = vec2(dot(delta, tangent) / width, dot(delta, inward) / stitch_width);
-            float stitch_id = mod(index, max(dot(course.edges + course.bends, vec4(1.0)), 1.0));
-            float seed = knit_hash(vec2(stitch_id, row));
+            // Local identities keep yarn variation independent of preceding side lengths.
+            float seed = knit_hash(vec2(stitch_id.x, row * 8.0 + stitch_id.y));
             point += vec2(seed - 0.5, fract(seed * 13.73) - 0.5) * vec2(0.018, 0.024);
             float radius = mix(0.225, 0.268, relief) * mix(0.96, 1.04, seed);
             // Legs reach at most ~0.75/0.85 stitch units. Once some yarn
             // covers this pixel (best_surface >= 0), far cells evaluate to a
-            // negative surface and cannot win, so skip the capsule math.
+            // negative surface and cannot win, so skip the yarn profile math.
             if (best_surface >= 0.0 && (abs(point.x) > 0.8 || abs(point.y) > 0.9))
                 continue;
             for (int leg = 0; leg < 2; leg++) {
@@ -465,6 +584,8 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
                 // mirror surfaces with an undefined frontmost normal at the cleft.
                 float leg_radius = radius * mix(0.98, 1.02, fract(seed * 7.17 + float(leg) * 0.5));
                 vec4 candidate = knit_leg(point, leg == 0 ? -1.0 : 1.0, seed, leg_radius, normal, leg_tangent);
+                // Covered legs compete by height. Outside a leg, the distance
+                // penalty keeps a remote strand from taking over this pixel.
                 float surface = candidate.y - max(candidate.x, 0.0);
                 if (surface > best_surface) {
                     best_surface = surface;
@@ -481,80 +602,104 @@ vec4 knit_fabric(vec2 geometry_coords, float stitch_width, vec4 base_color, Knit
             }
         }
     }
+    // Physical pixel footprint in stitch units, for coverage AA and detail filtering.
     float pixel = 1.0 / max(niri_scale * yarn_width, 1.0);
 
+    // These coordinates travel with the visible yarn, so fibres follow its bend
+    // instead of forming a screen-aligned texture. u crosses it; t runs along it.
     float u = strand.z;
     float t = strand.w;
+    // Fade spatial frequencies that a physical pixel cannot resolve.
     float bundle_filter = 1.0 - smoothstep(0.6, 1.6, pixel * 7.2);
     float fibre_filter = 1.0 - smoothstep(0.8, 2.0, pixel * 32.0);
     float nap_filter = 1.0 - smoothstep(0.8, 2.0, pixel * 52.0);
+    // Layer broad bundles, finer fibres and short nap. Their values vary the
+    // thickness and colour; their derivatives perturb the lighting normal.
     vec3 bundles = knit_noise(vec2(u * 1.8 + t * 2.5, t * 0.65) + yarn_seed * vec2(19.0, 31.0));
-    vec3 fibres = fibre_filter > 0.0
-        ? knit_noise(vec2(u * 8.0 + t * 2.8 + bundles.x * 0.8, t * 3.5)
-            + yarn_seed * vec2(43.0, 17.0))
-        : vec3(0.0);
     vec3 nap = nap_filter > 0.0
         ? knit_noise(vec2(u * 13.0 - t * 4.0, t * 9.0) + yarn_seed * vec2(11.0, 53.0))
         : vec3(0.0);
-    float pile = 0.18 + fuzz * 0.82;
-    // knit_filaments fades out by aa.x = 2.0; skip the call entirely past it.
-    vec2 filaments = 13.6 * pixel < 2.0
-        ? knit_filaments(vec2(u * 3.4 + t * 1.6 + bundles.x * 0.3, t * 5.0)
-            + yarn_seed * vec2(29.0, 47.0), vec2(13.6, 4.5) * pixel)
-        : vec2(0.0);
+    float halo_width = 0.018 + pile * 0.065;
     float thickness = (bundles.x - 0.5) * 0.035 * bundle_filter;
     float loose_fibres = (nap.x - 0.5) * 0.045 * pile * nap_filter;
     float distance = strand.x - thickness - loose_fibres;
     float coverage = 1.0 - smoothstep(-pixel * 0.65, pixel * 0.65, distance);
 
-    // The roughness changes the surface normal as well as the colour. Short
-    // fibres scatter light across the shoulders instead of making a shiny rim.
-    vec2 across = vec2(yarn_tangent.y, -yarn_tangent.x);
-    vec2 roughness = across * (bundles.y * 0.42 * bundle_filter + fibres.y * 0.12 * fibre_filter)
-        + yarn_tangent * (bundles.z * 0.055 * bundle_filter + nap.z * 0.07 * pile * nap_filter);
-    vec3 normal = normalize(vec3(
-        (strand_normal.xy + roughness) * relief + band_normal.xy * strand_normal.z,
-        strand_normal.z * band_normal.z
-    ));
-    vec3 light = normalize(vec3(-0.45, -0.65, 1.1));
-    float diffuse = max((dot(normal, light) + 0.20) / 1.20, 0.0);
-    float shoulder = (1.0 - normal.z) * (1.0 - normal.z);
-    float lighting = 0.48 + diffuse * 0.52 + shoulder * (0.10 + pile * 0.05);
-    float tuck = mix(0.74, 1.0, smoothstep(0.02, 0.34, t));
-    float edge_occlusion = mix(0.86, 1.0, smoothstep(0.0, 0.13, strand.y));
-    float tone = mix(0.94, 1.06, yarn_seed)
-        * (1.0 + (bundles.x - 0.5) * 0.34 * bundle_filter
-            + (fibres.x - 0.5) * 0.22 * fibre_filter + (nap.x - 0.5) * 0.16 * pile * nap_filter
-            + (filaments.x - filaments.y) * (0.27 + pile * 0.16));
-    float shade = mix(1.0, lighting * tuck * edge_occlusion, relief) * tone;
+    // Deep gaps between strands have no coverage and no halo: the fabric is
+    // plain ground there, so the fibre detail and shading math is skipped.
     float accent_mix = knit_accent_mix(yarn_column, yarn_row);
-    vec4 yarn = mix(base_color, premul_rect(knit_accent_color), accent_mix);
+    vec4 yarn = mix(base_color, premul_accent, accent_mix);
+    // Spaces below the raised yarn contain shaded fabric, not transparent holes.
+    // Coverage blends that backing with the visible strand; edge cuts come later.
     vec4 ground = mix(base_color, yarn, 0.75);
     ground.rgb *= mix(0.68, 0.42, relief);
-    yarn.rgb = min(yarn.rgb * shade, vec3(yarn.a));
-    vec4 fabric = mix(ground, yarn, coverage);
+    vec4 fabric = ground;
+    if (distance <= pixel * 0.65 + halo_width) {
+        vec3 fibres = fibre_filter > 0.0
+            ? knit_noise(vec2(u * 8.0 + t * 2.8 + bundles.x * 0.8, t * 3.5)
+                + yarn_seed * vec2(43.0, 17.0))
+            : vec3(0.0);
+        // knit_filaments fades out by aa.x = 2.0; skip the call entirely past it.
+        vec2 filaments = 13.6 * pixel < 2.0
+            ? knit_filaments(vec2(u * 3.4 + t * 1.6 + bundles.x * 0.3, t * 5.0)
+                + yarn_seed * vec2(29.0, 47.0), vec2(13.6, 4.5) * pixel)
+            : vec2(0.0);
 
-    // A compact, uneven nap is intrinsic to wool, including at fuzz = 0.
-    // Fuzz extends these short fibres; it does not blur the whole stitch.
-    float halo_width = 0.018 + pile * 0.065;
-    float halo = (1.0 - smoothstep(0.0, halo_width, max(distance, 0.0)))
-        * (1.0 - coverage) * (0.08 + filaments.x * (0.65 + pile * 0.45));
-    vec4 fibre_color = yarn;
-    fibre_color.rgb = min(fibre_color.rgb * (1.06 + shoulder * 0.10), vec3(fibre_color.a));
-    fabric = mix(fabric, fibre_color, halo);
+        // The roughness changes the surface normal as well as the colour. Short
+        // fibres scatter light across the shoulders instead of making a shiny rim.
+        vec2 across = vec2(yarn_tangent.y, -yarn_tangent.x);
+        vec2 roughness = across * (bundles.y * 0.42 * bundle_filter + fibres.y * 0.12 * fibre_filter)
+            + yarn_tangent * (bundles.z * 0.055 * bundle_filter + nap.z * 0.07 * pile * nap_filter);
+        vec3 normal = normalize(vec3(
+            (strand_normal.xy + roughness) * relief + band_normal.xy * strand_normal.z,
+            strand_normal.z * band_normal.z
+        ));
+        // The normal is now in border coordinates, so one upper-left light stays
+        // consistent as stitches rotate around the corners.
+        float diffuse = max((dot(normal, knit_light) + 0.20) * (1.0 / 1.20), 0.0);
+        float one_minus_nz = 1.0 - normal.z;
+        float shoulder = one_minus_nz * one_minus_nz;
+        float lighting = 0.48 + diffuse * 0.52 + shoulder * (0.10 + pile * 0.05);
+        float tuck = mix(0.74, 1.0, smoothstep(0.02, 0.34, t));
+        float edge_occlusion = mix(0.86, 1.0, smoothstep(0.0, 0.13, strand.y));
+        float tone = mix(0.94, 1.06, yarn_seed)
+            * (1.0 + (bundles.x - 0.5) * 0.34 * bundle_filter
+                + (fibres.x - 0.5) * 0.22 * fibre_filter + (nap.x - 0.5) * 0.16 * pile * nap_filter
+                + (filaments.x - filaments.y) * (0.27 + pile * 0.16));
+        float shade = mix(1.0, lighting * tuck * edge_occlusion, relief) * tone;
+        yarn.rgb = min(yarn.rgb * shade, vec3(yarn.a));
+        fabric = mix(ground, yarn, coverage);
 
-    // Break only the subpixel cut edge inside the existing border geometry.
-    float edge = min(frame.z, border_width - frame.z);
-    float edge_pile = (0.25 + pile * 0.65) / max(niri_scale, 0.001);
-    float silhouette = smoothstep(-edge_pile, edge_pile, edge
-        + (bundles.x - 0.5) * edge_pile * 1.4);
-    fabric *= silhouette;
+        // A compact, uneven nap is intrinsic to wool, including at fuzz = 0.
+        // This halo fringes each yarn leg, not the window rectangle. Fuzz extends
+        // these short fibres; it does not blur the whole stitch.
+        float halo = (1.0 - smoothstep(0.0, halo_width, max(distance, 0.0)))
+            * (1.0 - coverage) * (0.08 + filaments.x * (0.65 + pile * 0.45));
+        vec4 fibre_color = yarn;
+        fibre_color.rgb = min(fibre_color.rgb * (1.06 + shoulder * 0.10), vec3(fibre_color.a));
+        fabric = mix(fabric, fibre_color, halo);
+    }
+
+
+    // Cut the outer edge and expose backing under the inner yarn edge.
+    // Noise follows the visible yarn, not screen pixels; unresolved yarn uses its mean.
+    // Limit both the notches and their AA to preserve the centre of thin bands.
+    float edge_noise = mix(0.5, bundles.x, resolved);
+    float edge_inset = edge_depth * mix(0.2, 1.0, edge_noise);
+    float outer_coverage = smoothstep(edge_inset, edge_inset + edge_aa, frame.z);
+    float inner_coverage = smoothstep(edge_inset, edge_inset + edge_aa, band_width - frame.z);
+    // The backing reaches the window; inner notches change material, not coverage.
+    fabric = mix(ground, fabric, inner_coverage);
+
     // Subpixel stitches converge to the material average instead of a moire grid.
-    float resolved = smoothstep(1.0, 3.5, stitch_width * niri_scale);
-    vec4 average = mix(base_color, premul_rect(knit_accent_color),
-        knit_accent_mix(yarn_column, base_row));
-    average.rgb *= mix(0.85, 0.72, relief);
-    return mix(average, fabric, resolved);
+    // Filter inner detail with the yarn, but keep the outer cuts at every LOD.
+    if (resolved < 1.0) {
+        vec4 average = mix(base_color, premul_accent,
+            knit_accent_mix(yarn_column, base_row));
+        average.rgb *= mix(0.85, 0.72, relief);
+        fabric = mix(average, fabric, resolved);
+    }
+    return fabric * outer_coverage;
 }
 
 vec4 knit_color(vec2 geometry_coords, vec4 base_color) {
@@ -563,36 +708,23 @@ vec4 knit_color(vec2 geometry_coords, vec4 base_color) {
     float subpixel_grid = max(niri_scale, 0.001) * 256.0;
     geometry_coords = floor(geometry_coords * subpixel_grid + 0.5) / subpixel_grid;
     float stitch_width = max(knit_stitch_size, 1.0);
-    KnitCourse motif = knit_course(min(border_width * 0.5, min(geo_size.x, geo_size.y) * 0.49), stitch_width);
-    float period = 1.0;
-    if (knit_pattern == 1.0)
-        period = 3.0;
-    else if (knit_pattern == 2.0)
-        period = 4.0;
-    else if (knit_pattern == 3.0 || knit_pattern == 4.0)
-        period = 8.0;
-    else if (knit_pattern == 5.0)
-        period = 6.0;
-    float count = dot(motif.edges + motif.bends, vec4(1.0));
-    float closure = floor(count / period + 0.5) * period - count;
-    if (motif.edges.x >= motif.edges.y)
-        motif.edges.x = max(1.0, motif.edges.x + closure);
-    else
-        motif.edges.y = max(1.0, motif.edges.y + closure);
-    return knit_fabric(geometry_coords, stitch_width, base_color, motif);
+    // Reference bend counts arrive precomputed in knit_motif_bends so colours
+    // align across rows without rebuilding the reference course per pixel.
+    return knit_fabric(geometry_coords, stitch_width, base_color);
 }
 void main() {
     vec3 coords_geo = input_to_geo * vec3(niri_v_coords, 1.0);
 
     float ring_alpha = niri_rounding_alpha(coords_geo.xy, geo_size, outer_radius);
 
-    if (border_width > 0.0) {
-        vec2 inner_coords = coords_geo.xy - vec2(border_width);
-        vec2 inner_geo_size = geo_size - vec2(border_width * 2.0);
+    float width = knit_enabled == 1.0 ? knit_border_width() : border_width;
+    if (width > 0.0) {
+        vec2 inner_coords = coords_geo.xy - vec2(width);
+        vec2 inner_geo_size = geo_size - vec2(width * 2.0);
         if (0.0 <= inner_coords.x && inner_coords.x <= inner_geo_size.x
                 && 0.0 <= inner_coords.y && inner_coords.y <= inner_geo_size.y)
         {
-            vec4 inner_radius = max(outer_radius - vec4(border_width), 0.0);
+            vec4 inner_radius = max(outer_radius - vec4(width), 0.0);
             ring_alpha *= 1.0 - niri_rounding_alpha(inner_coords, inner_geo_size, inner_radius);
         }
     }
