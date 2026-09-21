@@ -456,9 +456,38 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let casts = state.casts.casts.values().cloned().collect();
             Response::Casts(casts)
         }
+        Request::Zoom => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let _ = tx.send_blocking(zoom_state(&state.niri));
+            });
+            let result = rx.recv().await;
+            let states = result.map_err(|_| String::from("error getting zoom info"))?;
+            Response::Zoom(states)
+        }
     };
-
     Ok(response)
+}
+
+/// Reads the current desktop zoom state of every monitor for `Request::Zoom`.
+///
+/// The snapshot is read-only: it does not advance animations, finish
+/// transitions, or change any zoom state.
+pub(crate) fn zoom_state(niri: &crate::niri::Niri) -> Vec<niri_ipc::ZoomState> {
+    niri.layout
+        .monitors()
+        .map(|monitor| {
+            let zoom = monitor.zoom();
+            niri_ipc::ZoomState {
+                output: monitor.output_name().clone(),
+                level: zoom.level(),
+                target_level: zoom.target_level(),
+                effective_level: monitor.effective_zoom_transform().factor(),
+                focal: zoom.focal().into(),
+                locked: zoom.is_locked(),
+            }
+        })
+        .collect()
 }
 
 fn validate_action(action: &Action) -> Result<(), String> {

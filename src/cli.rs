@@ -112,6 +112,8 @@ pub enum Msg {
     OverviewState,
     /// List screencasts.
     Casts,
+    /// Print the desktop zoom state of each output.
+    Zoom,
     /// Send a raw JSON request to the compositor, reading from stdin.
     RawRequest,
 }

@@ -5613,3 +5613,223 @@ fn zoom_pinch_second_device_not_claimed() {
     // While a sequence is routed, no second zoom gesture is claimed.
     assert!(!f.niri_state().can_claim_zoom_pinch(3));
 }
+
+// --- IPC zoom state snapshot ------------------------------------------------
+
+fn ipc_zoom_state(f: &mut Fixture) -> Vec<niri_ipc::ZoomState> {
+    crate::ipc::server::zoom_state(f.niri())
+}
+
+fn ipc_zoom_for(f: &mut Fixture, output: &Output) -> niri_ipc::ZoomState {
+    let name = output.name();
+    ipc_zoom_state(f)
+        .into_iter()
+        .find(|state| state.output == name)
+        .unwrap()
+}
+
+#[test]
+fn zoom_ipc_identity() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+
+    let states = ipc_zoom_state(&mut f);
+    assert_eq!(states.len(), 1);
+
+    let state = &states[0];
+    assert_eq!(state.output, output.name());
+    assert_eq!(state.level, 1.);
+    assert_eq!(state.target_level, 1.);
+    assert_eq!(state.effective_level, 1.);
+    assert_eq!(state.focal, (960., 360.));
+    assert!(!state.locked);
+}
+
+#[test]
+fn zoom_ipc_resting_zoom() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
+
+    let state = ipc_zoom_for(&mut f, &output);
+    assert_eq!(state.level, 2.);
+    assert_eq!(state.target_level, 2.);
+    assert_eq!(state.effective_level, 2.);
+    assert!(!state.locked);
+}
+
+#[test]
+fn zoom_ipc_mid_animation() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((960., 360.)));
+    freeze_clock(&mut f);
+
+    f.niri_state()
+        .do_action(Action::SetZoomLevel(FloatOrInt(4.)), false);
+    advance_clock(&mut f, 50);
+
+    let state = ipc_zoom_for(&mut f, &output);
+    assert!(
+        state.level > 1. && state.level < 4.,
+        "intermediate level: {}",
+        state.level
+    );
+    assert_eq!(state.target_level, 4.);
+    // With the overview closed the effective level is the displayed level.
+    assert_eq!(state.effective_level, state.level);
+}
+
+#[test]
+fn zoom_ipc_gesturing() {
+    let mut f = set_up_with_pinch();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    f.niri_state().update_zoom_pinch(&output, 2.);
+
+    let state = ipc_zoom_for(&mut f, &output);
+    assert_eq!(state.level, 2.);
+    assert_eq!(state.target_level, 2.);
+    assert_eq!(state.effective_level, 2.);
+}
+
+#[test]
+fn zoom_ipc_locked() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
+
+    f.niri()
+        .layout
+        .monitor_for_output_mut(&output)
+        .unwrap()
+        .zoom_mut()
+        .set_locked(true);
+
+    let state = ipc_zoom_for(&mut f, &output);
+    assert!(state.locked);
+    assert_eq!(state.level, 2.);
+    assert_eq!(state.target_level, 2.);
+    assert_eq!(state.effective_level, 2.);
+}
+
+#[test]
+fn zoom_ipc_focal_matches_domain() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    set_zoom(&mut f, &output, 2., Point::from((100., 200.)));
+
+    let state = ipc_zoom_for(&mut f, &output);
+    let domain_focal = zoom_focal(&mut f, &output);
+    assert_eq!(state.focal, (domain_focal.x, domain_focal.y));
+}
+
+#[test]
+fn zoom_ipc_multi_output() {
+    let mut f = set_up();
+    let output1 = f.niri_output(1);
+    f.add_output(2, (1920, 720));
+    let output2 = f.niri_output(2);
+
+    set_zoom(&mut f, &output1, 2., Point::from((960., 360.)));
+    set_zoom(&mut f, &output2, 4., Point::from((960., 360.)));
+    f.niri()
+        .layout
+        .monitor_for_output_mut(&output2)
+        .unwrap()
+        .zoom_mut()
+        .set_locked(true);
+
+    let states = ipc_zoom_state(&mut f);
+    assert_eq!(states.len(), 2);
+
+    let state1 = states.iter().find(|s| s.output == output1.name()).unwrap();
+    assert_eq!(state1.level, 2.);
+    assert!(!state1.locked);
+
+    let state2 = states.iter().find(|s| s.output == output2.name()).unwrap();
+    assert_eq!(state2.level, 4.);
+    assert!(state2.locked);
+}
+
+#[test]
+fn zoom_ipc_output_removal() {
+    let mut f = set_up();
+    let output1 = f.niri_output(1);
+    f.add_output(2, (1920, 720));
+    let output2 = f.niri_output(2);
+    set_zoom(&mut f, &output2, 4., Point::from((960., 360.)));
+
+    f.niri().remove_output(&output2);
+
+    let states = ipc_zoom_state(&mut f);
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].output, output1.name());
+}
+
+#[test]
+fn zoom_ipc_overview_suppression() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
+
+    // Partial overview: the effective level moves towards 1 while the stored
+    // state is untouched.
+    set_overview_progress(&mut f, &output, Some(0.5));
+    let state = ipc_zoom_for(&mut f, &output);
+    assert_eq!(state.level, 4.);
+    assert_eq!(state.target_level, 4.);
+    assert_abs_diff_eq!(state.effective_level, 2., epsilon = EPS);
+
+    // Fully open overview: the desktop scene presents at the identity.
+    set_overview_open(&mut f, &output, true);
+    let state = ipc_zoom_for(&mut f, &output);
+    assert_eq!(state.level, 4.);
+    assert_eq!(state.target_level, 4.);
+    assert_eq!(state.effective_level, 1.);
+    assert!(!state.locked);
+}
+
+#[test]
+fn zoom_ipc_effective_level_is_not_presentation_transform() {
+    // effective_level describes the desktop scene after Overview suppression.
+    // The session lock replaces the whole presentation with the identity, but
+    // that is a separate transform: a stored zoom still reports its level.
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
+
+    let state = ipc_zoom_for(&mut f, &output);
+    assert_eq!(state.level, 4.);
+    assert_eq!(state.effective_level, 4.);
+
+    // The session-lock presentation transform is identity regardless; the IPC
+    // snapshot deliberately does not model it.
+    let effective = effective_zoom_transform(&mut f, &output);
+    assert_eq!(
+        crate::niri::Niri::pointer_transform_for_presentation(true, effective),
+        crate::utils::view::ViewportTransform::identity()
+    );
+}
+
+#[test]
+fn zoom_ipc_query_is_side_effect_free() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((960., 360.)));
+    freeze_clock(&mut f);
+
+    f.niri_state()
+        .do_action(Action::SetZoomLevel(FloatOrInt(4.)), false);
+    advance_clock(&mut f, 50);
+
+    let first = ipc_zoom_state(&mut f);
+    let second = ipc_zoom_state(&mut f);
+    assert_eq!(first, second);
+
+    // The query did not finish the transition or change the target.
+    assert!(zoom_is_animating(&mut f, &output));
+    assert_eq!(zoom_target_level(&mut f, &output), 4.);
+}

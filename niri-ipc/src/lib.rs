@@ -119,6 +119,8 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Request the desktop zoom state of each output.
+    Zoom,
 }
 
 /// Reply from niri to client.
@@ -165,6 +167,8 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+    /// Desktop zoom state of each output.
+    Zoom(Vec<ZoomState>),
 }
 
 /// Overview information.
@@ -181,6 +185,39 @@ pub struct Overview {
 pub struct PickedColor {
     /// Color values as red, green, blue, each ranging from 0.0 to 1.0.
     pub rgb: [f64; 3],
+}
+
+/// Desktop zoom state of a single output.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ZoomState {
+    /// Output name.
+    pub output: String,
+    /// Currently displayed zoom level.
+    ///
+    /// While a zoom transition is in progress this is the current animation
+    /// sample; during a pinch gesture it is the level set by the latest
+    /// gesture update. Otherwise it is the committed zoom level.
+    pub level: f64,
+    /// Zoom level the output is transitioning towards.
+    ///
+    /// Equals [`level`](Self::level) at rest and during a pinch gesture, and
+    /// differs while a zoom animation or restore transition is in progress.
+    pub target_level: f64,
+    /// Desktop scene zoom after Overview suppression.
+    ///
+    /// While the overview is open this is 1; during the overview transition
+    /// it moves between [`level`](Self::level) and 1. This is the zoom of the
+    /// desktop scene itself, not necessarily the transform currently visible
+    /// on screen (for example under the session lock).
+    pub effective_level: f64,
+    /// Fixed point of the current zoom transform in output-local logical
+    /// coordinates.
+    pub focal: (f64, f64),
+    /// Whether the zoom focal point is locked.
+    ///
+    /// This is the desktop zoom focal lock, not the session lock.
+    pub locked: bool,
 }
 
 /// Actions that niri can perform.
@@ -2224,5 +2261,85 @@ mod tests {
             let parsed: Action = serde_json::from_str(&json).unwrap();
             assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
         }
+    }
+
+    #[test]
+    fn zoom_request_round_trip() {
+        let json = serde_json::to_string(&Request::Zoom).unwrap();
+        assert_eq!(json, "\"Zoom\"");
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::Zoom));
+    }
+
+    #[test]
+    fn zoom_response_round_trip() {
+        let response = Response::Zoom(vec![
+            ZoomState {
+                output: String::from("DP-1"),
+                level: 2.,
+                target_level: 4.,
+                effective_level: 1.5,
+                focal: (960., 540.5),
+                locked: false,
+            },
+            ZoomState {
+                output: String::from("HDMI-A-1"),
+                level: 1.,
+                target_level: 1.,
+                effective_level: 1.,
+                focal: (320., 180.),
+                locked: true,
+            },
+        ]);
+
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        let Response::Zoom(states) = parsed else {
+            panic!("expected Zoom response, got {parsed:?}");
+        };
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(
+            states[0],
+            ZoomState {
+                output: String::from("DP-1"),
+                level: 2.,
+                target_level: 4.,
+                effective_level: 1.5,
+                focal: (960., 540.5),
+                locked: false,
+            }
+        );
+        assert_eq!(
+            states[1],
+            ZoomState {
+                output: String::from("HDMI-A-1"),
+                level: 1.,
+                target_level: 1.,
+                effective_level: 1.,
+                focal: (320., 180.),
+                locked: true,
+            }
+        );
+    }
+
+    #[test]
+    fn zoom_state_fields_serialize() {
+        let state = ZoomState {
+            output: String::from("DP-1"),
+            level: 2.5,
+            target_level: 4.,
+            effective_level: 1.25,
+            focal: (100.5, 200.25),
+            locked: true,
+        };
+
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["output"], "DP-1");
+        assert_eq!(json["level"], 2.5);
+        assert_eq!(json["target_level"], 4.);
+        assert_eq!(json["effective_level"], 1.25);
+        assert_eq!(json["focal"], serde_json::json!([100.5, 200.25]));
+        assert_eq!(json["locked"], true);
     }
 }

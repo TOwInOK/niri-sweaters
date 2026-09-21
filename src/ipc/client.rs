@@ -49,6 +49,7 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
         Msg::RequestError => Request::ReturnError,
         Msg::OverviewState => Request::OverviewState,
         Msg::Casts => Request::Casts,
+        Msg::Zoom => Request::Zoom,
         Msg::RawRequest => {
             let mut buf = Vec::new();
             let mut stdin = std::io::stdin().lock();
@@ -566,6 +567,24 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                 println!();
             }
         }
+        Msg::Zoom => {
+            let Response::Zoom(mut states) = response else {
+                bail!("unexpected response: expected Zoom, got {response:?}");
+            };
+
+            if json {
+                let states = serde_json::to_string(&states).context("error formatting response")?;
+                println!("{states}");
+                return Ok(());
+            }
+
+            sort_zoom_states(&mut states);
+
+            for state in states {
+                print_zoom_state(&state);
+                println!();
+            }
+        }
         Msg::RawRequest => {
             let output = serde_json::to_string(&response).context("error formatting response")?;
             println!("{output}");
@@ -809,6 +828,27 @@ fn print_cast(cast: &Cast) {
     }
 }
 
+fn sort_zoom_states(states: &mut [niri_ipc::ZoomState]) {
+    states.sort_by(|a, b| a.output.cmp(&b.output));
+}
+
+fn format_zoom_state(state: &niri_ipc::ZoomState) -> String {
+    format!(
+        "Output \"{}\":\n  Level: {}\n  Target level: {}\n  Effective level: {}\n  Focal: {}, {}\n  Locked: {}",
+        state.output,
+        fmt_rounded(state.level),
+        fmt_rounded(state.target_level),
+        fmt_rounded(state.effective_level),
+        fmt_rounded(state.focal.0),
+        fmt_rounded(state.focal.1),
+        if state.locked { "yes" } else { "no" },
+    )
+}
+
+fn print_zoom_state(state: &niri_ipc::ZoomState) {
+    println!("{}", format_zoom_state(state));
+}
+
 fn fmt_rounded(x: f64) -> String {
     let r = x.round();
     if (r - x).abs() <= 0.005 {
@@ -846,5 +886,48 @@ mod tests {
         assert_snapshot!(fmt_rounded(2.004), @"2");
         assert_snapshot!(fmt_rounded(2.006), @"2.01");
         assert_snapshot!(fmt_rounded(2.1), @"2.10");
+    }
+
+    #[test]
+    fn test_format_zoom_state() {
+        let state = niri_ipc::ZoomState {
+            output: String::from("DP-1"),
+            level: 2.,
+            target_level: 4.,
+            effective_level: 2.,
+            focal: (960., 540.5),
+            locked: false,
+        };
+        assert_snapshot!(format_zoom_state(&state), @r###"
+        Output "DP-1":
+          Level: 2
+          Target level: 4
+          Effective level: 2
+          Focal: 960, 540.50
+          Locked: no
+        "###);
+
+        let locked = niri_ipc::ZoomState {
+            locked: true,
+            ..state
+        };
+        assert_snapshot!(format_zoom_state(&locked).lines().last().unwrap().trim(), @"Locked: yes");
+    }
+
+    #[test]
+    fn test_sort_zoom_states() {
+        let state = |output: &str| niri_ipc::ZoomState {
+            output: String::from(output),
+            level: 1.,
+            target_level: 1.,
+            effective_level: 1.,
+            focal: (0., 0.),
+            locked: false,
+        };
+        let mut states = vec![state("DP-2"), state("DP-1"), state("HDMI-A-1")];
+        sort_zoom_states(&mut states);
+
+        let names: Vec<_> = states.iter().map(|s| s.output.as_str()).collect();
+        assert_eq!(names, ["DP-1", "DP-2", "HDMI-A-1"]);
     }
 }
