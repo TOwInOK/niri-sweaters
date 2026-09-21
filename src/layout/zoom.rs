@@ -53,7 +53,10 @@ enum ZoomLevelTransition {
     /// which keeps an action anchor in place, a restore moves the whole
     /// viewport back to a saved state. The level still animates in `log2`
     /// space between `from_level` and `to_level`, while the focal point
-    /// interpolates linearly between `from_focal` and `to_focal`.
+    /// interpolates linearly between `from_focal` and `to_focal`. When
+    /// restoring to 1x the focal point stays at `from_focal` instead: the
+    /// destination focal point is degenerate at the identity transform, so
+    /// moving it early would only pan the viewport.
     Restore {
         animation: Animation,
         from_level: f64,
@@ -210,9 +213,19 @@ impl OutputZoomState {
             ZoomLevelTransition::Restore {
                 animation,
                 from_focal,
+                to_level,
                 to_focal,
                 ..
             } => {
+                // Restoring to 1x: the destination focal point is visually
+                // degenerate (the transform is the identity), so the focal
+                // point stays at `from_focal` until the transition commits.
+                // Interpolating it early would pan the viewport towards a
+                // point that only matters once the level reaches 1.
+                if *to_level == 1. && !animation.is_clamped_done() {
+                    return Self::clamp_focal(*from_focal, self.view_size);
+                }
+
                 // The focal point interpolates with the clamped progress so
                 // that it never overshoots the restore destination.
                 let p = animation.clamped_value().clamp(0., 1.);
@@ -729,7 +742,10 @@ impl OutputZoomState {
     /// action anchor in place, this moves the whole viewport back to the
     /// saved state: the level animates in `log2` space towards
     /// `snapshot.target_level` while the focal point interpolates towards
-    /// `snapshot.focal`, clamped to the current `view_size`.
+    /// `snapshot.focal`, clamped to the current `view_size`. Restoring to
+    /// 1x keeps the focal point at its current position until completion:
+    /// at the identity transform the saved focal point is degenerate, so
+    /// moving it early would only pan the viewport.
     ///
     /// The restore is a progress animation `0 → 1` using the same config as
     /// regular zoom transitions. The current log-space level velocity is
@@ -2025,6 +2041,51 @@ mod tests {
         advance(&mut state, &mut clock, 5000);
         assert_eq!(state.level(), 2.);
         assert_point_eq(state.focal(), Point::from((400., 300.)));
+    }
+
+    #[test]
+    fn restore_to_one_holds_from_focal() {
+        let view_size = Size::from((1920., 1080.));
+        let output = Rectangle::from_size(view_size);
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+
+        // A saved 1x state whose focal differs from the temporary one.
+        let saved_focal = Point::from((400., 300.));
+        state.focal = saved_focal;
+        let snapshot = snapshot_of(&state);
+        assert_eq!(snapshot.target_level, 1.);
+
+        // The temporary hold-zoom state: 2x around a different focal point.
+        let hold_focal = Point::from((1400., 800.));
+        state.set_level_immediate(2., hold_focal);
+        assert_point_eq(state.focal(), hold_focal);
+
+        state.restore_animated(snapshot, &clock, test_anim_config());
+        assert!(state.is_animating());
+
+        // While the level is still above 1 the focal point must not move
+        // towards the saved one: at 1x the focal point is degenerate, so
+        // interpolating it early pans the viewport for no visual reason.
+        advance(&mut state, &mut clock, 50);
+        assert!(state.is_animating());
+        let level = state.level();
+        assert!(level > 1. && level < 2., "intermediate level: {level}");
+        assert_point_eq(state.focal(), hold_focal);
+
+        // The displayed transform is a pure scale-down around the hold
+        // focal point: a fixed content point only moves along the scale.
+        let content = Point::from((700., 500.));
+        let expected = ViewportTransform::new(hold_focal, level).apply(content);
+        assert_point_eq(state.viewport_transform().apply(content), expected);
+
+        // On completion the saved focal point is restored exactly; at 1x
+        // the transform is the identity, so the focal jump is invisible.
+        advance(&mut state, &mut clock, 5000);
+        assert!(!state.is_animating());
+        assert_eq!(state.level(), 1.);
+        assert_point_eq(state.focal(), saved_focal);
+        assert_point_eq(state.viewport().loc, output.loc);
     }
 
     #[test]
