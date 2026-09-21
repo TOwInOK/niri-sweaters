@@ -456,7 +456,7 @@ fn zoom_window_pixels_2x() {
         "zoom-pixels",
         400,
         300,
-        [0x40, 0x80, 0xc0, 0xff],
+        [0x40404040, 0x80808080, 0xc0c0c0c0, 0xffffffff],
     );
 
     let (size, pixels) = render_output_rgba(f.niri_state(), &output);
@@ -470,13 +470,17 @@ fn zoom_window_pixels_2x() {
     let after = after.expect("window pixels must be visible at level 2");
 
     let before = before.unwrap().to_f64();
-    let expected = Rectangle::new(
+    let zoomed = Rectangle::new(
         Point::from((
             100. + (before.loc.x - 100.) * 2.,
             100. + (before.loc.y - 100.) * 2.,
         )),
         before.size.upscale(2.),
     );
+    // The zoomed window extends past the output; only the on-output part is
+    // visible, so compare against the clipped rectangle.
+    let output_rect = Rectangle::new(Point::from((0., 0.)), size.to_f64());
+    let expected = zoomed.intersection(output_rect).unwrap();
     let after = after.to_f64();
 
     for (actual, expected) in [
@@ -4318,7 +4322,7 @@ fn zoom_color_picker_samples_the_displayed_framebuffer() {
         "zoom-color-picker",
         400,
         300,
-        [0x40, 0x80, 0xc0, 0xff],
+        [0x40404040, 0x80808080, 0xc0c0c0c0, 0xffffffff],
     );
     let output_origin = f
         .niri()
