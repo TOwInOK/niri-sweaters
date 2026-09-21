@@ -3523,8 +3523,11 @@ fn zoom_anim_deadzone_drifts_during_animation() {
     assert_ne!(zoom_focal(&mut f, &output), focal_after_warp);
 
     // The drift completes together with the level animation: the camera is
-    // already at the deadzone edge and no separate follow phase runs.
-    advance_clock(&mut f, 5000);
+    // already at the deadzone edge and no separate follow phase runs. Step
+    // the clock in frame-sized increments like the real per-frame driver.
+    for _ in 0..320 {
+        advance_clock(&mut f, 16);
+    }
     assert_eq!(zoom_level(&mut f, &output), 2.);
     assert_eq!(zoom_focal(&mut f, &output), Point::from((0., 0.)));
     assert!(!zoom_is_animating(&mut f, &output));

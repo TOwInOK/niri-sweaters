@@ -35,13 +35,6 @@ pub struct OutputZoomState {
     view_size: Size<f64, Logical>,
     /// In-progress zoom level transition, if any.
     transition: Option<ZoomLevelTransition>,
-    /// Timestamp of the last deadzone follow evaluation.
-    ///
-    /// Updated on every `update_follow` call and on every commit of an
-    /// active follow, so the distance-driven step always uses the elapsed
-    /// time since the previous evaluation — including the frame a follow is
-    /// created on.
-    last_follow_eval: Option<Duration>,
 }
 
 /// An in-progress zoom level transition.
@@ -105,6 +98,13 @@ enum ZoomLevelTransition {
     Follow {
         /// The clamped focal point the follow converges to.
         to_focal: Point<f64, Logical>,
+        /// Timestamp of the last follow step.
+        ///
+        /// Owned by the follow itself: it is created with the follow and
+        /// dies with it, so a follow can never consume time that elapsed
+        /// before it started — while tracking was suspended, the compositor
+        /// was idle, or a different transition owned the viewport.
+        last_step: Duration,
     },
 }
 
@@ -178,7 +178,6 @@ impl OutputZoomState {
             locked: false,
             view_size,
             transition: None,
-            last_follow_eval: None,
         }
     }
 
@@ -717,15 +716,7 @@ impl OutputZoomState {
         clock: &Clock,
         config: niri_config::Animation,
     ) -> bool {
-        // The evaluation timestamp is updated on every call, including early
-        // returns, so the distance-driven step always measures the elapsed
-        // time since the previous evaluation.
         let now = clock.now_unadjusted();
-        let dt = self
-            .last_follow_eval
-            .map(|last| now.saturating_sub(last).as_secs_f64())
-            .unwrap_or(0.);
-        self.last_follow_eval = Some(now);
 
         if self.locked {
             // A locked camera does not track the pointer: no deadzone drift
@@ -768,18 +759,6 @@ impl OutputZoomState {
             zoom.follow_max_speed,
         );
 
-        // Start a follow if none is active, then apply the distance-driven
-        // step for the elapsed time since the previous evaluation.
-        if !matches!(self.transition, Some(ZoomLevelTransition::Follow { .. })) {
-            self.transition = Some(ZoomLevelTransition::Follow { to_focal: target });
-        }
-        let Some(ZoomLevelTransition::Follow { to_focal }) = &mut self.transition else {
-            unreachable!();
-        };
-
-        // The follow target tracks the live cursor.
-        *to_focal = target;
-
         // The distance-driven step: speed comes from the current displayed
         // overshoot, direction from the remaining path to the target (which
         // is parallel to the overshoot). The step is capped at the target so
@@ -790,6 +769,29 @@ impl OutputZoomState {
             return true;
         };
 
+        // Start a follow if none is active, then apply the distance-driven
+        // step for the elapsed time since the previous step. The timestamp
+        // is owned by the follow: a new follow starts at `dt = 0` and can
+        // never consume time that elapsed before it was created.
+        if !matches!(self.transition, Some(ZoomLevelTransition::Follow { .. })) {
+            self.transition = Some(ZoomLevelTransition::Follow {
+                to_focal: target,
+                last_step: now,
+            });
+        }
+        let Some(ZoomLevelTransition::Follow {
+            to_focal,
+            last_step,
+        }) = &mut self.transition
+        else {
+            unreachable!();
+        };
+
+        // The follow target tracks the live cursor.
+        *to_focal = target;
+
+        let dt = now.saturating_sub(*last_step).as_secs_f64();
+        *last_step = now;
         let distance = input.speed * dt;
         let remaining = target - self.focal;
         let rem_len = (remaining.x * remaining.x + remaining.y * remaining.y).sqrt();
@@ -916,13 +918,26 @@ impl OutputZoomState {
         true
     }
 
-    /// Notes a deadzone follow evaluation timestamp without stepping.
+    /// Suspends deadzone follow activity without moving the camera.
     ///
     /// Called by the per-frame driver for outputs where tracking is
-    /// suspended or the pointer is elsewhere: keeps the evaluation clock
-    /// fresh so a follow started later does not see a stale delta.
-    pub fn note_follow_eval(&mut self, clock: &Clock) {
-        self.last_follow_eval = Some(clock.now_unadjusted());
+    /// suspended or the pointer is elsewhere: commits an active resting
+    /// follow at its current displayed focal point and retires an
+    /// in-transition deadzone drift. The drift's display position is live,
+    /// so dropping it freezes the camera exactly where it is; on resume the
+    /// next evaluation re-seeds the drift from the current geometry instead
+    /// of consuming the suspended time as one step.
+    ///
+    /// Returns `true` if the state changed.
+    pub fn suspend_follow(&mut self) -> bool {
+        let drift = match &mut self.transition {
+            Some(ZoomLevelTransition::Animation { display_follow, .. }) => {
+                display_follow.take().is_some()
+            }
+            _ => false,
+        };
+
+        self.commit_follow_focal() || drift
     }
 
     /// Sets the focal point that the current state should display.
@@ -1211,10 +1226,16 @@ impl OutputZoomState {
 
     /// Restores a previously captured [`snapshot()`](Self::snapshot).
     ///
-    /// Sets `level`, `target_level` and `focal` immediately, without starting
-    /// any transition; a transition in progress is cancelled. The focal point
-    /// is clamped to `view_size` so the viewport stays within the output.
-    /// `locked` is preserved.
+    /// Lands on the same state the animated restore converges to: the saved
+    /// `target_level` and `focal`, without starting a transition; a
+    /// transition in progress is cancelled. The focal point is clamped to
+    /// `view_size` so the viewport stays within the output. `locked` is
+    /// preserved.
+    ///
+    /// The snapshot's `level` is the displayed level at capture time; it is
+    /// validated but not restored: a resting state must satisfy
+    /// `level == target_level`, and the saved target is the user's intent
+    /// the animated restore would have reached.
     ///
     /// # Panics
     ///
@@ -1233,7 +1254,7 @@ impl OutputZoomState {
 
         self.view_size = view_size;
         self.transition = None;
-        self.level = snapshot.level;
+        self.level = snapshot.target_level;
         self.target_level = snapshot.target_level;
         self.focal = Self::clamp_focal(snapshot.focal, view_size);
     }
@@ -1367,6 +1388,9 @@ impl OutputZoomState {
     /// Does nothing unless the current transition is a restore.
     fn convert_restore_to_level_animation(&mut self, focal: ZoomTransitionFocal) {
         let level = self.level();
+        // The displayed focal point is sampled before the restore is taken
+        // apart: afterwards `focal()` would report the stale committed value.
+        let displayed_focal = self.focal();
         let Some(ZoomLevelTransition::Restore {
             animation,
             from_level,
@@ -1377,6 +1401,18 @@ impl OutputZoomState {
         }) = self.transition.take()
         else {
             return;
+        };
+
+        // Zooming out to the identity transform degenerates the anchored
+        // focal solve (it divides by `level - 1`), so an anchor would fly to
+        // a clamped edge as the level approaches 1. Keep the current focal
+        // point fixed instead, like `set_target_level` does for target 1.
+        let focal = if to_level == 1. && matches!(focal, ZoomTransitionFocal::Anchored { .. }) {
+            ZoomTransitionFocal::Fixed {
+                focal: displayed_focal,
+            }
+        } else {
+            focal
         };
 
         let dz = to_level.log2() - from_level.log2();
@@ -3297,6 +3333,270 @@ mod tests {
         assert!(state.is_gesturing());
         assert_finite_point(state.focal());
         assert_viewport_within(state.viewport(), output);
+    }
+
+    #[test]
+    fn follow_does_not_consume_idle_time() {
+        // Regression: the follow step must measure only the time the follow
+        // itself has been active. A shared evaluation timestamp let a follow
+        // started after an idle gap consume the whole gap as its first step,
+        // snapping the camera to the deadzone border instead of gliding.
+        let view_size = Size::from((1920., 1080.));
+        let output = Rectangle::from_size(view_size);
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let config = test_anim_config();
+
+        // An evaluation inside the deadzone, then a long gap with no
+        // evaluations at all (compositor idle, tracking suspended).
+        state.update_follow(Point::from((960., 540.)), zoom, &clock, config);
+        clock.set_unadjusted(clock.now_unadjusted() + Duration::from_secs(10));
+
+        // The cursor reappears outside the deadzone: the follow starts, but
+        // its first step must not consume the idle gap.
+        assert!(state.update_follow(Point::from((0., 0.)), zoom, &clock, config));
+        assert!(state.is_animating());
+        assert_point_eq(state.focal(), Point::from((960., 540.)));
+
+        // The follow then converges normally at the clamped target: the
+        // per-frame driver steps it on each evaluation.
+        advance(&mut state, &mut clock, 5000);
+        assert!(state.update_follow(Point::from((0., 0.)), zoom, &clock, config));
+        assert!(!state.is_animating());
+        assert_point_eq(state.focal(), Point::from((0., 0.)));
+        assert_viewport_within(state.viewport(), output);
+    }
+
+    #[test]
+    fn follow_large_dt_caps_at_target() {
+        // A large frame gap on an active follow must move the camera at most
+        // to its clamped target: no overshoot past the deadzone border, no
+        // NaN, and the follow terminates there.
+        let view_size = Size::from((1920., 1080.));
+        let output = Rectangle::from_size(view_size);
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let config = test_anim_config();
+        let cursor = Point::from((100., 540.));
+
+        // Start the follow, then jump the clock far past any real frame.
+        assert!(state.update_follow(cursor, zoom, &clock, config));
+        clock.set_unadjusted(clock.now_unadjusted() + Duration::from_secs(60));
+
+        assert!(state.update_follow(cursor, zoom, &clock, config));
+        assert_finite_point(state.focal());
+        assert_viewport_within(state.viewport(), output);
+
+        // The step capped exactly at the target: the follow is done.
+        assert!(!state.is_animating());
+        let target = state.focal();
+        assert!(!state.update_follow(cursor, zoom, &clock, config));
+        assert_point_eq(state.focal(), target);
+    }
+
+    #[test]
+    fn follow_refresh_rate_equivalent() {
+        // The follow is time-driven: the same wall time in different frame
+        // slices must land within a few percent of each other. The speed is
+        // re-evaluated from the live overshoot each step, so finer slices
+        // integrate the easing slightly differently — equal results are not
+        // expected bit-for-bit.
+        let view_size = Size::from((1920., 1080.));
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let config = test_anim_config();
+        let cursor = Point::from((100., 540.));
+
+        let run = |step_ms: u64, steps: usize| {
+            let mut state = state_at(2., Point::from((960., 540.)), view_size);
+            let mut clock = test_clock();
+            state.update_follow(cursor, zoom, &clock, config);
+            for _ in 0..steps {
+                clock.set_unadjusted(clock.now_unadjusted() + Duration::from_millis(step_ms));
+                state.update_follow(cursor, zoom, &clock, config);
+            }
+            state.focal()
+        };
+
+        // 32ms of wall time as 1x32, 2x16 and 4x8.
+        let a = run(32, 1);
+        let b = run(16, 2);
+        let c = run(8, 4);
+
+        assert_abs_diff_eq!(a.x, b.x, epsilon = 2.);
+        assert_abs_diff_eq!(a.x, c.x, epsilon = 2.);
+        assert_abs_diff_eq!(a.y, b.y, epsilon = 2.);
+        assert_abs_diff_eq!(a.y, c.y, epsilon = 2.);
+    }
+
+    #[test]
+    fn suspended_drift_resumes_without_jump() {
+        // Regression: while tracking is suspended the per-frame driver calls
+        // the suspend path, which must retire the in-transition deadzone
+        // drift. A drift left behind keeps a stale timestamp, so the first
+        // evaluation after resume consumes the whole suspension as one step
+        // and snaps the camera to the deadzone border.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        // A long easing keeps the level animation alive across the
+        // suspension so the drift marker survives into the resume.
+        let config = easing_config(5000);
+        let cursor = Point::from((200., 540.));
+
+        state.set_target_level(2., Point::from((960., 540.)), &clock, config);
+        advance(&mut state, &mut clock, 50);
+
+        // The cursor leaves the deadzone: the anchor's display position
+        // starts drifting during the level animation.
+        assert!(state.update_follow(cursor, zoom, &clock, config));
+        advance(&mut state, &mut clock, 16);
+        assert!(state.update_follow(cursor, zoom, &clock, config));
+
+        // Tracking is suspended mid-animation (session lock, Overview, MRU,
+        // screenshot UI, pointer on another output): the driver suspends
+        // follow activity without moving the camera.
+        state.suspend_follow();
+
+        // The suspension lasts 2s; the level animation keeps running.
+        advance(&mut state, &mut clock, 2000);
+        assert!(state.is_animating());
+
+        // On resume the drift restarts from the live displayed position: the
+        // first evaluation must not move the camera.
+        let display_before = state.viewport_transform().apply(cursor);
+        assert!(state.update_follow(cursor, zoom, &clock, config));
+        let display_after = state.viewport_transform().apply(cursor);
+        assert_point_eq(display_after, display_before);
+    }
+
+    #[test]
+    fn restore_takeover_to_one_keeps_focal() {
+        // Regression: pointer tracking taking over a restore towards 1x must
+        // keep the focal point fixed, like a regular zoom-out to 1x. An
+        // anchored conversion divides by `level - 1`, so the focal point
+        // degenerates to a clamped corner and the camera pans away as the
+        // level approaches 1.
+        let view_size = Size::from((1920., 1080.));
+        let output = Rectangle::from_size(view_size);
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let config = test_anim_config();
+
+        state.set_target_level(3., Point::from((400., 300.)), &clock, config);
+        advance(&mut state, &mut clock, 5000);
+        assert_eq!(state.level(), 3.);
+
+        let snapshot = ZoomSnapshot {
+            level: 1.,
+            target_level: 1.,
+            focal: view_size.to_point().downscale(2.),
+        };
+        state.restore_animated(snapshot, &clock, config);
+        advance(&mut state, &mut clock, 50);
+        assert!(state.level() > 1. && state.level() < 3.);
+
+        // The cursor is outside the deadzone: tracking converts the restore
+        // into a level animation.
+        let cursor = Point::from((1500., 900.));
+        assert!(state.update_focal_for_cursor(cursor, zoom, &clock, config));
+
+        // As the level approaches 1 the focal point must stay near the
+        // takeover camera, never degenerating to a clamped corner.
+        while state.level() > 1. {
+            advance(&mut state, &mut clock, 16);
+            let focal = state.focal();
+            assert_finite_point(focal);
+            assert!(
+                focal.x > 0. && focal.y > 0. && focal.x < view_size.w && focal.y < view_size.h,
+                "focal {focal:?} degenerated to a clamped edge at level {}",
+                state.level()
+            );
+            assert_viewport_within(state.viewport(), output);
+        }
+        assert_eq!(state.level(), 1.);
+    }
+
+    #[test]
+    fn restore_immediate_lands_on_target_level() {
+        // Regression: an immediate restore must land on the same state the
+        // animated restore converges to — the saved `target_level`, not the
+        // mid-flight displayed `level`. Restoring the displayed level while
+        // keeping the saved target leaves a resting state where
+        // `level != target_level`, which no other path can produce: the IPC
+        // target reports a level that was never reached and incremental zoom
+        // actions compute from it.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+
+        state.set_target_level(2., Point::from((960., 540.)), &clock, test_anim_config());
+        advance(&mut state, &mut clock, 50);
+        assert!(state.level() > 1. && state.level() < 2.);
+
+        let snapshot = state.snapshot();
+        state.restore_immediate(snapshot, view_size);
+
+        assert_eq!(state.level(), 2.);
+        assert_eq!(state.target_level(), 2.);
+        assert!(state.transition.is_none());
+    }
+
+    #[test]
+    fn gesture_through_one_stays_bounded() {
+        // A pinch sweeping through 1x must keep the focal point finite and
+        // inside the output on every intermediate frame: the anchored solve
+        // divides by `level - 1`, so near-1 levels produce huge values that
+        // must clamp to the output bounds without a visible camera jump.
+        let view_size = Size::from((1920., 1080.));
+        let output = Rectangle::from_size(view_size);
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((700., 400.)));
+
+        // Sweep the cumulative scale from 1 down through the 1x crossing.
+        let mut prev_display = state.viewport_transform().apply(Point::from((700., 400.)));
+        for i in 1..=100 {
+            let scale = 1. - i as f64 / 200.;
+            state.update_gesture(scale, 10.);
+            let level = state.level();
+            assert!(level >= 1.);
+            assert_finite_point(state.focal());
+            assert_viewport_within(state.viewport(), output);
+
+            // The displayed anchor moves continuously: no teleport between
+            // frames as the level crosses 1.
+            let display = state.viewport_transform().apply(Point::from((700., 400.)));
+            let d = display - prev_display;
+            let jump = (d.x * d.x + d.y * d.y).sqrt();
+            assert!(
+                jump < 200.,
+                "displayed anchor jumped {jump}px at level {level}"
+            );
+            prev_display = display;
+        }
+
+        state.end_gesture();
+        assert_eq!(state.level(), 1.);
+        assert_eq!(state.target_level(), 1.);
     }
 
     proptest! {

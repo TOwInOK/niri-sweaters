@@ -2243,17 +2243,17 @@ impl<W: LayoutElement> Monitor<W> {
         self.zoom.update_follow(cursor, zoom, &clock, config)
     }
 
-    /// Commits an active deadzone follow's current displayed focal point.
+    /// Suspends deadzone follow activity without moving the camera.
     ///
     /// Used by the per-frame driver for outputs that do not own the pointer
-    /// or where tracking is suspended: the camera freezes where it actually
-    /// is instead of snapping back to the stale committed focal point.
+    /// or where tracking is suspended: commits an active resting follow at
+    /// its current displayed focal point and retires an in-transition
+    /// deadzone drift, so a later resume re-seeds from the live geometry
+    /// instead of consuming the suspended time as one step.
     ///
-    /// Returns `true` if a follow was committed.
+    /// Returns `true` if the zoom state changed.
     pub fn commit_zoom_follow(&mut self) -> bool {
-        let clock = self.clock.clone();
-        self.zoom.note_follow_eval(&clock);
-        self.zoom.commit_follow_focal()
+        self.zoom.suspend_follow()
     }
 
     pub fn layout_config(&self) -> Option<&niri_config::LayoutPart> {
