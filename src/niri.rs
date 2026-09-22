@@ -3322,13 +3322,21 @@ impl Niri {
     /// While the session is locked the lock surface is the authoritative
     /// presentation: it is drawn in raw screen space, so the pointer must be
     /// presented at its canonical position with the identity transform.
-    /// Otherwise the pointer follows the desktop zoom presentation. When the
-    /// output has no monitor the transform is identity.
+    /// While the Overview is visible the pointer stays in screen space: the
+    /// Overview handoff residual applies to the scene only, never to the
+    /// pointer. Otherwise the pointer follows the desktop zoom presentation.
+    /// When the output has no monitor the transform is identity.
     pub(crate) fn pointer_presentation_transform(&self, output: &Output) -> ViewportTransform {
         let zoom = self
             .layout
             .monitor_for_output(output)
-            .map(|mon| mon.zoom().viewport_transform())
+            .map(|mon| {
+                if mon.overview_active() {
+                    ViewportTransform::identity()
+                } else {
+                    mon.zoom().viewport_transform()
+                }
+            })
             .unwrap_or_else(ViewportTransform::identity);
         Self::pointer_transform_for_presentation(self.is_locked(), zoom)
     }
@@ -3344,6 +3352,65 @@ impl Niri {
         } else {
             zoom
         }
+    }
+
+    /// The transform applied to the desktop scene on `output`.
+    ///
+    /// While an Overview handoff residual is alive — during entry, while the
+    /// Overview is open, during closing, and during the post-close camera
+    /// tail — the scene is drawn through it instead of the desktop zoom
+    /// transform (the zoom session is terminated on entry, so the desktop
+    /// zoom is identity then anyway). At all other times this is the desktop
+    /// zoom transform, identity at level 1.
+    ///
+    /// The residual is selected by factor rather than by overview state
+    /// because it outlives `overview_progress`: a cancelled or reversed
+    /// handoff keeps animating the camera after the Overview state is gone.
+    pub(crate) fn scene_presentation_transform(&self, output: &Output) -> ViewportTransform {
+        let Some(mon) = self.layout.monitor_for_output(output) else {
+            return ViewportTransform::identity();
+        };
+
+        let handoff = mon.overview_handoff_transform();
+        if handoff.factor() != 1. {
+            handoff
+        } else {
+            mon.zoom().viewport_transform()
+        }
+    }
+
+    /// Maps a canonical output-local position into scene coordinates.
+    ///
+    /// Scene-space hit testing (workspaces, windows, layer surfaces, insert
+    /// and DnD targets) must see the position in the same space the scene
+    /// geometry is expressed in: the canonical position mapped through the
+    /// pointer presentation, then through the inverse of the scene
+    /// presentation. Under the desktop zoom both transforms are the zoom
+    /// transform and this is the identity; under an Overview handoff the
+    /// pointer stays in screen space while the scene is drawn through the
+    /// residual, so this applies the inverse residual.
+    pub(crate) fn scene_position_within_output(
+        &self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        let displayed = self
+            .pointer_presentation_transform(output)
+            .apply(pos_within_output);
+        self.scene_presentation_transform(output)
+            .apply_inverse(displayed)
+    }
+
+    /// The scale factor converting pointer-domain deltas into scene-domain
+    /// deltas on `output`.
+    ///
+    /// This is the delta counterpart of [`Self::scene_position_within_output`]:
+    /// a delta is a difference of positions, so only the factor ratio applies,
+    /// never the focal point. It is 1 whenever the pointer and the scene share
+    /// the presentation transform (normal zoom, no zoom, no handoff).
+    pub(crate) fn scene_delta_scale(&self, output: &Output) -> f64 {
+        self.pointer_presentation_transform(output).factor()
+            / self.scene_presentation_transform(output).factor()
     }
 
     /// Maps a canonical global content position to its current global displayed
@@ -3431,6 +3498,11 @@ impl Niri {
         // The ordering here must be consistent with the ordering in render() so that input is
         // consistent with the visuals.
 
+        // Layer surfaces are part of the transformed scene, so they are
+        // tested in scene coordinates. The hot corner below stays in screen
+        // space and keeps using the unmapped position.
+        let scene_pos = self.scene_position_within_output(output, pos_within_output);
+
         // Check if some layer-shell surface is on top.
         let layers = layer_map_for_output(output);
         let layer_surface_under = |layer, popup| {
@@ -3449,7 +3521,7 @@ impl Niri {
                     } else {
                         WindowSurfaceType::TOPLEVEL
                     } | WindowSurfaceType::SUBSURFACE;
-                    layer.surface_under(pos_within_output - layer_pos_within_output, surface_type)
+                    layer.surface_under(scene_pos - layer_pos_within_output, surface_type)
                 })
                 .is_some()
         };
@@ -3486,6 +3558,10 @@ impl Niri {
             return false;
         }
 
+        // The workspace-moving layers are part of the transformed scene, so
+        // they are tested in scene coordinates.
+        let scene_pos = self.scene_position_within_output(output, pos_within_output);
+
         // Check if some layer-shell surface is on top.
         let layers = layer_map_for_output(output);
         let layer_popup_under = |layer| {
@@ -3504,12 +3580,11 @@ impl Niri {
 
                     // Background and bottom layers move together with the workspaces.
                     let mon = self.layout.monitor_for_output(output)?;
-                    let (_, geo) = mon.workspace_under(pos_within_output)?;
+                    let (_, geo) = mon.workspace_under(scene_pos)?;
                     layer_pos_within_output += geo.loc;
 
                     let surface_type = WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE;
-                    layer_surface
-                        .surface_under(pos_within_output - layer_pos_within_output, surface_type)
+                    layer_surface.surface_under(scene_pos - layer_pos_within_output, surface_type)
                 })
                 .is_some()
         };
@@ -3543,9 +3618,11 @@ impl Niri {
             return None;
         }
 
-        let ws = self
-            .layout
-            .workspace_under(extended_bounds, output, pos_within_output)?;
+        let ws = self.layout.workspace_under(
+            extended_bounds,
+            output,
+            self.scene_position_within_output(output, pos_within_output),
+        )?;
         Some((output.clone(), ws))
     }
 
@@ -3576,10 +3653,10 @@ impl Niri {
             return None;
         }
 
-        if let Some((window, _loc)) = self
-            .layout
-            .interactive_moved_window_under(output, pos_within_output)
-        {
+        if let Some((window, _loc)) = self.layout.interactive_moved_window_under(
+            output,
+            self.scene_position_within_output(output, pos_within_output),
+        ) {
             return Some(window);
         }
 
@@ -3587,7 +3664,10 @@ impl Niri {
             return None;
         }
 
-        let (window, _loc) = self.layout.window_under(output, pos_within_output)?;
+        let (window, _loc) = self.layout.window_under(
+            output,
+            self.scene_position_within_output(output, pos_within_output),
+        )?;
         Some(window)
     }
 
@@ -3649,6 +3729,11 @@ impl Niri {
             return rv;
         }
 
+        // Scene-space position for hit testing the transformed scene. The
+        // lock surface above and the hot corner below are screen-space and
+        // keep using the unmapped position.
+        let scene_pos = self.scene_position_within_output(output, pos_within_output);
+
         let layers = layer_map_for_output(output);
         let layer_surface_under = |layer, popup| {
             layers
@@ -3667,7 +3752,7 @@ impl Niri {
                     // Background and bottom layers move together with the workspaces.
                     if matches!(layer, Layer::Background | Layer::Bottom) {
                         let mon = self.layout.monitor_for_output(output)?;
-                        let (_, geo) = mon.workspace_under(pos_within_output)?;
+                        let (_, geo) = mon.workspace_under(scene_pos)?;
                         layer_pos_within_output += geo.loc;
                         // Don't need to deal with zoom here because in the overview background and
                         // bottom layers don't receive input.
@@ -3678,9 +3763,8 @@ impl Niri {
                     } else {
                         WindowSurfaceType::TOPLEVEL
                     } | WindowSurfaceType::SUBSURFACE;
-
                     layer_surface
-                        .surface_under(pos_within_output - layer_pos_within_output, surface_type)
+                        .surface_under(scene_pos - layer_pos_within_output, surface_type)
                         .map(|(surface, pos_within_layer)| {
                             (
                                 (surface, pos_within_layer.to_f64() + layer_pos_within_output),
@@ -3699,10 +3783,7 @@ impl Niri {
             let surface_and_pos = if let HitType::Input { win_pos } = hit {
                 let win_pos_within_output = win_pos;
                 window
-                    .surface_under(
-                        pos_within_output - win_pos_within_output,
-                        WindowSurfaceType::ALL,
-                    )
+                    .surface_under(scene_pos - win_pos_within_output, WindowSurfaceType::ALL)
                     .map(|(s, pos_within_window)| {
                         (s, pos_within_window.to_f64() + win_pos_within_output)
                     })
@@ -3714,12 +3795,12 @@ impl Niri {
 
         let interactive_moved_window_under = || {
             self.layout
-                .interactive_moved_window_under(output, pos_within_output)
+                .interactive_moved_window_under(output, scene_pos)
                 .map(mapped_hit_data)
         };
         let window_under = || {
             self.layout
-                .window_under(output, pos_within_output)
+                .window_under(output, scene_pos)
                 .map(mapped_hit_data)
         };
 
@@ -3774,6 +3855,12 @@ impl Niri {
         };
 
         if let Some((_, surface_pos)) = &mut surface_and_pos {
+            // The surface origin was computed in scene coordinates. The
+            // pointer position it is subtracted from is canonical, so shift
+            // the origin by the same canonical-to-scene correction applied
+            // to the hit position: the result stays the surface-local
+            // coordinate of the hit.
+            *surface_pos += pos_within_output - scene_pos;
             *surface_pos += output_pos_in_global_space.to_f64();
         }
 
@@ -4699,14 +4786,6 @@ impl Niri {
             push
         };
 
-        // Desktop zoom transform for the desktop scene below. At level 1 it is
-        // the identity.
-        let desktop_zoom = self
-            .layout
-            .monitor_for_output(output)
-            .map(|mon| mon.zoom().viewport_transform())
-            .unwrap_or_else(ViewportTransform::identity);
-
         // The pointer goes on the top. Its presentation follows the pointer transform:
         if include_pointer && self.pointer_visibility.is_visible() {
             let pointer_transform = self.pointer_presentation_transform(output);
@@ -4798,10 +4877,15 @@ impl Niri {
         let mon = self.layout.monitor_for_output(output).unwrap();
         let zoom = mon.overview_zoom();
 
-        // The desktop zoom transform was computed above; at level 1 elements are pushed
-        // without a wrapper.
-        let zoom_origin = desktop_zoom.focal().to_physical_precise_round(output_scale);
-        let zoom_level = desktop_zoom.factor();
+        // The scene transform for the desktop below: the Overview handoff
+        // residual while it is alive (entry, open, closing, and the
+        // post-close camera tail), the desktop zoom transform otherwise.
+        // Identity means elements are pushed without a wrapper.
+        let scene_transform = self.scene_presentation_transform(output);
+        let scene_origin = scene_transform
+            .focal()
+            .to_physical_precise_round(output_scale);
+        let scene_scale = scene_transform.factor();
 
         // The zoom debug overlay is screen-space UI: it goes above the
         // desktop scene but below the MRU, hotkey overlay, notifications,
@@ -4886,15 +4970,17 @@ impl Niri {
             }};
         }
 
-        // Pushes a desktop scene element, applying the desktop zoom transform when the
-        // committed zoom level is above 1. At level 1 the element is pushed unchanged.
+        // Pushes a desktop scene element, applying the scene transform when it
+        // is not the identity: the desktop zoom normally, the Overview handoff
+        // residual while it is alive. At factor 1 the element is pushed
+        // unchanged.
         macro_rules! push_desktop {
             ($elem:expr) => {{
                 let elem = $elem;
-                if zoom_level == 1. {
+                if scene_scale == 1. {
                     push(elem.into());
                 } else {
-                    let elem = RescaleRenderElement::from_element(elem, zoom_origin, zoom_level);
+                    let elem = RescaleRenderElement::from_element(elem, scene_origin, scene_scale);
                     push(elem.into());
                 }
             }};

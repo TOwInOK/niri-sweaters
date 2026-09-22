@@ -4628,6 +4628,387 @@ fn exit_overview(f: &mut Fixture) {
 }
 
 #[test]
+fn zoom_overview_handoff_has_one_scale_trajectory() {
+    let mut f = set_up_with_config(&format!(
+        "{ANIMATED_CONFIG}\noverview {{ zoom 0.5; }}\nanimations {{\n overview-open-close {{ duration-ms 300; curve \"linear\"; }}\n}}\n"
+    ));
+    let output = f.niri_output(1);
+    freeze_clock(&mut f);
+    set_zoom(&mut f, &output, 2., Point::from((700., 200.)));
+    f.niri_state().toggle_overview();
+    for step in 0..=6 {
+        if step != 0 {
+            advance_clock(&mut f, 50);
+        }
+        let mon = f.niri().layout.monitor_for_output(&output).unwrap();
+        let correction = mon.overview_handoff_transform();
+        let total = correction.factor() * mon.overview_zoom();
+        assert_abs_diff_eq!(total, 2. - f64::from(step) * 0.25, epsilon = 0.001);
+        let geometry = mon
+            .workspaces_render_geo()
+            .nth(mon.active_workspace_idx())
+            .unwrap();
+        let origin = correction.apply(geometry.loc);
+        let progress = f64::from(step) / 6.;
+        let center = mon.view_size().to_point().downscale(2.);
+        let expected =
+            Point::from((-700., -200.)).upscale(1. - progress) + center.upscale(0.5 * progress);
+        assert_abs_diff_eq!(origin.x, expected.x, epsilon = 1.);
+        assert_abs_diff_eq!(origin.y, expected.y, epsilon = 1.);
+        if step == 4 {
+            assert!(
+                origin.x.abs() > 1. || origin.y.abs() > 1.,
+                "crossing scale 1 must retain translation"
+            );
+        }
+    }
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+}
+
+#[test]
+fn zoom_overview_handoff_zero_motion_gesture_cancel() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    golden_scene(&mut f);
+    f.niri_complete_animations();
+    freeze_clock(&mut f);
+    let (_, desktop) = render_output_rgba(f.niri_state(), &output);
+    set_zoom(&mut f, &output, 2., Point::from((700., 200.)));
+    let (_, zoomed) = render_output_rgba(f.niri_state(), &output);
+    f.niri().layout.overview_gesture_begin();
+    f.niri().terminate_zoom_for_overview();
+    assert!(f.niri().layout.overview_gesture_end());
+    let (_, cancelled) = render_output_rgba(f.niri_state(), &output);
+    assert!(
+        zoomed == cancelled,
+        "zero-motion cancellation must not drop the camera"
+    );
+    advance_clock(&mut f, 30);
+    let correction = f
+        .niri()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .overview_handoff_transform();
+    assert!(correction.factor() > 1. && correction.factor() < 2.);
+    f.niri_state().do_action(Action::ZoomIn, false);
+    assert_eq!(
+        zoom_target_level(&mut f, &output),
+        1.,
+        "Overview must own the camera until its cancellation tail finishes"
+    );
+    f.niri_complete_animations();
+    let (_, restored) = render_output_rgba(f.niri_state(), &output);
+    assert!(
+        desktop == restored,
+        "cancel must end at ordinary desktop, not old Zoom"
+    );
+    assert!(!f.niri().layout.is_overview_open());
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    f.niri_state().do_action(Action::ZoomIn, false);
+    f.niri_complete_animations();
+    assert!(zoom_level(&mut f, &output) > 1.);
+}
+
+#[test]
+fn zoom_overview_handoff_outputs_are_independent() {
+    let mut f = set_up_animated();
+    golden_scene(&mut f);
+    f.add_output(2, (1920, 720));
+    let first = f.niri_output(1);
+    let second = f.niri_output(2);
+    f.niri_focus_output(2);
+    golden_scene(&mut f);
+    f.niri_complete_animations();
+    freeze_clock(&mut f);
+    set_zoom(&mut f, &first, 2., Point::from((600., 200.)));
+    set_zoom(&mut f, &second, 4., Point::from((1000., 400.)));
+    let (_, before_first) = render_output_rgba(f.niri_state(), &first);
+    let (_, before_second) = render_output_rgba(f.niri_state(), &second);
+    f.niri_state().toggle_overview();
+    let (_, after_first) = render_output_rgba(f.niri_state(), &first);
+    let (_, after_second) = render_output_rgba(f.niri_state(), &second);
+    assert!(before_first == after_first);
+    assert!(before_second == after_second);
+    advance_clock(&mut f, 30);
+    f.add_output(3, (1280, 720));
+    let third = f.niri_output(3);
+    let correction = f
+        .niri()
+        .layout
+        .monitor_for_output(&third)
+        .unwrap()
+        .overview_handoff_transform();
+    assert_eq!(correction.factor(), 1.);
+    f.niri().remove_output(&second);
+    assert!(
+        f.niri()
+            .layout
+            .monitor_for_output(&first)
+            .unwrap()
+            .overview_handoff_transform()
+            .factor()
+            > 1.
+    );
+    exit_overview(&mut f);
+    for output in [&first, &third] {
+        assert_eq!(
+            f.niri()
+                .layout
+                .monitor_for_output(output)
+                .unwrap()
+                .overview_handoff_transform()
+                .factor(),
+            1.
+        );
+        assert_eq!(zoom_level(&mut f, output), 1.);
+    }
+}
+
+#[test]
+fn zoom_overview_handoff_reversal_preserves_frame() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    golden_scene(&mut f);
+    f.niri_complete_animations();
+    freeze_clock(&mut f);
+    set_zoom(&mut f, &output, 3., Point::from((700., 200.)));
+    f.niri_state().toggle_overview();
+    advance_clock(&mut f, 60);
+    let (_, before) = render_output_rgba(f.niri_state(), &output);
+    f.niri_state().toggle_overview();
+    let (_, closing) = render_output_rgba(f.niri_state(), &output);
+    assert!(
+        before == closing,
+        "closing must start from the displayed frame"
+    );
+    advance_clock(&mut f, 30);
+    let (_, before) = render_output_rgba(f.niri_state(), &output);
+    f.niri_state().toggle_overview();
+    let (_, reopening) = render_output_rgba(f.niri_state(), &output);
+    assert!(
+        before == reopening,
+        "reopening must preserve the closing presentation"
+    );
+    f.niri_state().do_action(Action::OpenOverview, false);
+    let (_, repeated) = render_output_rgba(f.niri_state(), &output);
+    assert!(
+        reopening == repeated,
+        "repeated open must not restart the handoff"
+    );
+    exit_overview(&mut f);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+}
+
+#[test]
+fn zoom_overview_handoff_samples_live_animation() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    golden_scene(&mut f);
+    f.niri_complete_animations();
+    freeze_clock(&mut f);
+    let focal = Point::from((700., 200.));
+    set_zoom(&mut f, &output, 2., focal);
+    f.niri()
+        .layout
+        .monitor_for_output_mut(&output)
+        .unwrap()
+        .zoom_to(4., focal);
+    advance_clock(&mut f, 40);
+    let sampled = zoom_level(&mut f, &output);
+    assert!(sampled > 2. && sampled < 4.);
+    let (_, before) = render_output_rgba(f.niri_state(), &output);
+    f.niri_state().toggle_overview();
+    let (_, after) = render_output_rgba(f.niri_state(), &output);
+    assert!(
+        before == after,
+        "capture displayed animation value, not command target"
+    );
+    assert!(!zoom_is_animating(&mut f, &output));
+}
+
+#[test]
+fn zoom_overview_handoff_drag_keeps_pointer_anchor() {
+    let mut f = set_up_with_config(&format!("{ANIMATED_CONFIG}\nanimations {{\n window-movement {{ off; }}\n overview-open-close {{ duration-ms 1000; curve \"linear\"; }}\n}}\n"));
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    open_window(
+        &mut f,
+        id,
+        "handoff-drag",
+        960,
+        720,
+        [0xffffffff, 0, 0, 0xffffffff],
+    );
+    f.niri_complete_animations();
+    freeze_clock(&mut f);
+    set_zoom(&mut f, &output, 2., Point::from((800., 360.)));
+    f.niri_state().toggle_overview();
+    advance_clock(&mut f, 30);
+    let (size, pixels) = render_output_rgba(f.niri_state(), &output);
+    let bbox = color_bbox(&pixels, size, [255, 0, 0]).unwrap();
+    let point = Point::from((f64::from(bbox.loc.x + bbox.size.w - 16), 360.));
+    f.niri_state().move_cursor(point);
+    let client = f.client(id);
+    let pointer = client
+        .state
+        .virtual_pointer_manager
+        .as_ref()
+        .unwrap()
+        .create_virtual_pointer(None, &client.qh, ());
+    pointer.button(0, 0x110, wl_pointer::ButtonState::Pressed.into());
+    pointer.frame();
+    f.roundtrip(id);
+    pointer.motion(0, -600., 0.);
+    pointer.frame();
+    f.roundtrip(id);
+    assert!(f
+        .niri()
+        .layout
+        .interactive_move_is_moving_above_output(&output));
+    let mut initial_margin = None;
+    for ms in [0, 100, 100] {
+        advance_clock(&mut f, ms);
+        f.niri_state().refresh_pointer_contents();
+        let (size, pixels) = render_output_rgba(f.niri_state(), &output);
+        let cursor = pointer_location(&mut f);
+        let start = cursor.y.round() as usize * size.w as usize * 4;
+        let row = &pixels[start..start + size.w as usize * 4];
+        let right = row
+            .chunks_exact(4)
+            .rposition(|p| p[0] > p[1].saturating_add(100) && p[0] > p[2].saturating_add(100))
+            .unwrap()
+            + 1;
+        let mon = f.niri().layout.monitor_for_output(&output).unwrap();
+        let scale = mon.overview_handoff_transform().factor() * mon.overview_zoom();
+        let margin = (right as f64 - cursor.x) / scale;
+        let expected = *initial_margin.get_or_insert(margin);
+        assert_abs_diff_eq!(margin, expected, epsilon = 2.);
+    }
+    release_left(&mut f, id);
+}
+
+#[test]
+fn zoom_overview_handoff_hit_testing_matches_pixels() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    open_window(
+        &mut f,
+        id,
+        "handoff-red",
+        960,
+        720,
+        [0xffffffff, 0, 0, 0xffffffff],
+    );
+    let red = f.niri().layout.windows().next().unwrap().1.window.clone();
+    open_window(
+        &mut f,
+        id,
+        "handoff-green",
+        960,
+        720,
+        [0, 0xffffffff, 0, 0xffffffff],
+    );
+    let green = f
+        .niri()
+        .layout
+        .windows()
+        .find(|(_, w)| w.window != red)
+        .unwrap()
+        .1
+        .window
+        .clone();
+    f.niri_complete_animations();
+    freeze_clock(&mut f);
+    f.niri_state().move_cursor(Point::from((800., 360.)));
+    set_zoom(&mut f, &output, 2., Point::from((800., 360.)));
+    let pointer = displayed_pointer_location(&mut f);
+    f.niri_state().toggle_overview();
+    advance_clock(&mut f, 60);
+    let (size, pixels) = render_output_rgba(f.niri_state(), &output);
+    for (color, expected) in [([255, 0, 0], red.clone()), ([0, 255, 0], green)] {
+        let bbox = color_bbox(&pixels, size, color).expect("window must be visible during handoff");
+        let point = Point::<f64, Logical>::from((
+            f64::from(bbox.loc.x + bbox.size.w - 8),
+            f64::from(bbox.loc.y) + f64::from(bbox.size.h) / 2.,
+        ));
+        let actual = f.niri().window_under(point).map(|w| w.window.clone());
+        assert_eq!(
+            actual,
+            Some(expected),
+            "hit test must match the rendered window at {point:?}"
+        );
+    }
+    assert_eq!(displayed_pointer_location(&mut f), pointer);
+    move_pointer(&mut f, id, 20., 10.);
+    assert_eq!(pointer_location(&mut f), pointer + Point::from((20., 10.)));
+    let bbox = color_bbox(&pixels, size, [255, 0, 0]).unwrap();
+    let point = Point::from((
+        f64::from(bbox.loc.x + bbox.size.w - 8),
+        f64::from(bbox.loc.y) + f64::from(bbox.size.h) / 2.,
+    ));
+    f.niri_state().move_cursor(point);
+    click_left(&mut f, id);
+    release_left(&mut f, id);
+    assert_eq!(f.niri().layout.focus().map(|w| w.window.clone()), Some(red));
+    assert!(!f.niri().layout.is_overview_open());
+}
+
+#[test]
+fn zoom_overview_handoff_fullscreen_preserves_first_frame() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_fullscreen(None);
+    window.commit();
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer_with_color(0xffffffff, 0, 0, 0xffffffff);
+    window.set_size(1920, 720);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    add_top_layer_with_color(&mut f, id, 50, [0, 0, 0xffffffff, 0xffffffff]);
+    f.niri_complete_animations();
+    freeze_clock(&mut f);
+    set_zoom(&mut f, &output, 2., Point::from((700., 0.)));
+    let (_, before) = render_output_rgba(f.niri_state(), &output);
+    f.niri_state().toggle_overview();
+    let (_, after) = render_output_rgba(f.niri_state(), &output);
+    assert!(
+        before == after,
+        "fullscreen/top-layer ordering must not jump on entry"
+    );
+}
+
+#[test]
+fn zoom_overview_handoff_preserves_first_frame() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    let id = golden_scene(&mut f);
+    add_top_layer_with_color(&mut f, id, 50, [0, 0, 0xffffffff, 0xffffffff]);
+    f.niri_complete_animations();
+    freeze_clock(&mut f);
+    f.niri_state().move_cursor(Point::from((800., 200.)));
+    set_zoom(&mut f, &output, 2.5, Point::from((700., 150.)));
+    let pointer = displayed_pointer_location(&mut f);
+    let (size, before) = render_output_rgba(f.niri_state(), &output);
+
+    f.niri_state().toggle_overview();
+
+    let (after_size, after) = render_output_rgba(f.niri_state(), &output);
+    assert_eq!(size, after_size);
+    assert!(
+        before == after,
+        "Overview entry must preserve the displayed scene at time zero"
+    );
+    assert_eq!(displayed_pointer_location(&mut f), pointer);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+}
+
+#[test]
 fn zoom_overview_entry_preserves_displayed_pointer() {
     // The main regression: entering the Overview must not visually move the
     // pointer even though the zoom presentation transform disappears.
@@ -4980,25 +5361,41 @@ fn zoom_overview_entry_pointer_stays_on_output() {
 }
 
 #[test]
-fn zoom_overview_render_targets_use_identity() {
-    let mut f = set_up();
+fn zoom_overview_handoff_render_targets_match_scene() {
+    let mut f = set_up_animated();
     let output = f.niri_output(1);
-    let id = f.add_client();
-    open_window(&mut f, id, "overview-render", 400, 300, [0xff, 0, 0, 0xff]);
-    add_top_layer(&mut f, id, 50);
-    set_zoom(&mut f, &output, 4., Point::from((100., 100.)));
-
-    enter_overview(&mut f);
-    for target in [
-        RenderTarget::Output,
-        RenderTarget::Screencast,
-        RenderTarget::ScreenCapture,
-    ] {
-        let elements = render_elements(f.niri_state(), &output, target);
-        assert!(
-            elements.iter().all(|element| !is_zoomed(element)),
-            "the Overview must render the desktop at the identity for {target:?}"
-        );
+    let id = golden_scene(&mut f);
+    add_top_layer_with_color(&mut f, id, 50, [0, 0, 0xffffffff, 0xffffffff]);
+    f.niri_complete_animations();
+    freeze_clock(&mut f);
+    set_zoom(&mut f, &output, 2.5, Point::from((700., 150.)));
+    f.niri_state().toggle_overview();
+    for ms in [0, 60, 2000] {
+        advance_clock(&mut f, ms);
+        let (size, expected) = render_output_rgba(f.niri_state(), &output);
+        for target in [RenderTarget::Screencast, RenderTarget::ScreenCapture] {
+            let elements = render_elements(f.niri_state(), &output, target);
+            let pixels = f
+                .niri_state()
+                .backend
+                .headless()
+                .with_primary_renderer(|renderer| {
+                    crate::render_helpers::render_to_vec(
+                        renderer,
+                        size,
+                        Scale::from(output.current_scale().fractional_scale()),
+                        output.current_transform(),
+                        smithay::reexports::gbm::Format::Abgr8888,
+                        elements.iter().rev(),
+                    )
+                    .unwrap()
+                })
+                .unwrap();
+            assert!(
+                pixels == expected,
+                "{target:?} must match output during and after handoff"
+            );
+        }
     }
 }
 

@@ -77,6 +77,12 @@ impl TouchOverviewGrab {
             return true;
         };
 
+        // Gesture deltas feed scene-space state (view offset, workspace
+        // index, interactive move), so convert them from pointer space into
+        // scene space. The scale is 1 whenever the pointer and the scene
+        // share the presentation transform.
+        let scene_scale = data.niri.scene_delta_scale(&self.output);
+
         let layout = &mut data.niri.layout;
 
         // Check if we should become interactive move.
@@ -146,19 +152,22 @@ impl TouchOverviewGrab {
         let ongoing = match self.gesture {
             GestureState::Recognizing => unreachable!(),
             GestureState::ViewOffset => layout
-                .view_offset_gesture_update(-delta.x, timestamp, false)
+                .view_offset_gesture_update(-delta.x * scene_scale, timestamp, false)
                 .is_some(),
             GestureState::WorkspaceSwitch => layout
-                .workspace_switch_gesture_update(-delta.y, timestamp, false)
+                .workspace_switch_gesture_update(-delta.y * scene_scale, timestamp, false)
                 .is_some(),
             GestureState::InteractiveMove => {
                 let window = self.window.as_ref().unwrap();
                 if let Some((output, pos_within_output)) = data.niri.output_under(self.new_location)
                 {
                     let output = output.clone();
+                    let pos_within_output = data
+                        .niri
+                        .scene_position_within_output(&output, pos_within_output);
                     data.niri.layout.interactive_move_update(
                         window,
-                        delta,
+                        delta.upscale(data.niri.scene_delta_scale(&output)),
                         output,
                         pos_within_output,
                     )

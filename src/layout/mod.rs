@@ -69,6 +69,7 @@ use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{BakedBuffer, RenderCtx};
 use crate::rubber_band::RubberBand;
 use crate::utils::transaction::{Transaction, TransactionBlocker};
+use crate::utils::view::ViewportTransform;
 use crate::utils::{
     ensure_min_max_size_maybe_zero, output_matches_name, output_size,
     round_logical_in_physical_max1, ResizeEdge,
@@ -431,7 +432,13 @@ struct InteractiveMoveData<W: LayoutElement> {
     pub(self) tile: Tile<W>,
     /// Output where the window is currently located/rendered.
     pub(self) output: Output,
-    /// Current pointer position within output.
+    /// Current pointer position within output, in screen space.
+    ///
+    /// Stored in screen (displayed) coordinates rather than scene
+    /// coordinates because the screen position is invariant under the
+    /// overview handoff residual: while the residual evolves the pointer
+    /// stays put, so a scene-space value would go stale between motion
+    /// events. Convert back with the monitor's `overview_handoff_transform`.
     pub(self) pointer_pos_within_output: Point<f64, Logical>,
     /// Window column width.
     pub(self) width: ColumnWidth,
@@ -459,7 +466,11 @@ struct InteractiveMoveData<W: LayoutElement> {
 pub struct DndData<W: LayoutElement> {
     /// Output where the pointer is currently located.
     output: Output,
-    /// Current pointer position within output.
+    /// Current pointer position within output, in screen space.
+    ///
+    /// Same screen-space domain as
+    /// [`InteractiveMoveData::pointer_pos_within_output`]: invariant under
+    /// the evolving overview handoff residual.
     pointer_pos_within_output: Point<f64, Logical>,
     /// Ongoing DnD hold to activate something.
     hold: Option<DndHold<W>>,
@@ -608,14 +619,21 @@ impl<W: LayoutElement> InteractiveMoveState<W> {
 }
 
 impl<W: LayoutElement> InteractiveMoveData<W> {
-    fn tile_render_location(&self, zoom: f64) -> Point<f64, Logical> {
+    /// The tile's scene-space render location.
+    ///
+    /// `handoff` is the output's current [`Monitor::overview_handoff_transform`]:
+    /// the stored pointer position is screen-space, so it is mapped back into
+    /// scene space before the tile position is derived from it.
+    ///
+    /// [`Monitor::overview_handoff_transform`]: monitor::Monitor::overview_handoff_transform
+    fn tile_render_location(&self, zoom: f64, handoff: ViewportTransform) -> Point<f64, Logical> {
         let scale = Scale::from(self.output.current_scale().fractional_scale());
         let window_size = self.tile.window_size();
         let pointer_offset_within_window = Point::from((
             window_size.w * self.pointer_ratio_within_window.0,
             window_size.h * self.pointer_ratio_within_window.1,
         ));
-        let pos = self.pointer_pos_within_output
+        let pos = handoff.apply_inverse(self.pointer_pos_within_output)
             - (pointer_offset_within_window + self.tile.window_loc() - self.tile.render_offset())
                 .upscale(zoom);
         // Round to physical pixels.
@@ -1456,7 +1474,9 @@ impl<W: LayoutElement> Layout<W> {
                 let mut target = Rectangle::from_size(Size::from((width, height)));
                 // FIXME: ideally this shouldn't include the tile render offset, but the code
                 // duplication would be a bit annoying for this edge case.
-                target.loc.y -= move_.tile_render_location(1.).y;
+                target.loc.y -= move_
+                    .tile_render_location(1., self.interactive_move_scene_transform())
+                    .y;
                 target.loc.y -= move_.tile.window_loc().y;
                 return target;
             }
@@ -2331,9 +2351,10 @@ impl<W: LayoutElement> Layout<W> {
     ) -> Option<(&W, HitType)> {
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.output == *output {
+                let transform = self.interactive_move_scene_transform();
                 if self.overview_progress.is_some() {
                     let zoom = self.overview_zoom();
-                    let tile_pos = move_.tile_render_location(zoom);
+                    let tile_pos = move_.tile_render_location(zoom, transform);
                     let pos_within_tile = (pos_within_output - tile_pos).downscale(zoom);
                     // During the overview animation, we cannot do input hits because we cannot
                     // really represent scaled windows properly.
@@ -2341,7 +2362,7 @@ impl<W: LayoutElement> Layout<W> {
                         HitType::hit_tile(&move_.tile, Point::from((0., 0.)), pos_within_tile)?;
                     Some((win, hit.to_activate()))
                 } else {
-                    let tile_pos = move_.tile_render_location(1.);
+                    let tile_pos = move_.tile_render_location(1., transform);
                     HitType::hit_tile(&move_.tile, tile_pos, pos_within_output)
                 }
             } else {
@@ -2436,7 +2457,8 @@ impl<W: LayoutElement> Layout<W> {
                          base options adjusted for output scale"
                     );
 
-                    let tile_pos = move_.tile_render_location(zoom);
+                    let tile_pos =
+                        move_.tile_render_location(zoom, self.interactive_move_scene_transform());
                     let rounded_pos = tile_pos.to_physical_precise_round(scale).to_logical(scale);
 
                     // Tile position must be rounded to physical pixels.
@@ -2639,6 +2661,12 @@ impl<W: LayoutElement> Layout<W> {
             if let Some(mon) = self.monitor_for_output_mut(&output) {
                 let mut scrolled = false;
 
+                // The stored pointer position is screen-space; map it back to
+                // scene space under the current handoff residual.
+                let pos_within_output = mon
+                    .overview_handoff_transform()
+                    .apply_inverse(pos_within_output);
+
                 let zoom = mon.overview_zoom();
                 scrolled |= mon.dnd_scroll_gesture_scroll(pos_within_output, 1. / zoom);
 
@@ -2796,9 +2824,10 @@ impl<W: LayoutElement> Layout<W> {
         self.update_render_elements_time = self.clock.now();
 
         let zoom = self.overview_zoom();
+        let move_transform = self.interactive_move_scene_transform();
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if output.is_none_or(|output| move_.output == *output) {
-                let pos_within_output = move_.tile_render_location(zoom);
+                let pos_within_output = move_.tile_render_location(zoom, move_transform);
 
                 // We're not on any specific workspace so we can't compute a "workspace view" rect.
                 // Let's instead compute a rect relative to the output.
@@ -2881,13 +2910,15 @@ impl<W: LayoutElement> Layout<W> {
 
         if let Some(mon) = self.monitor_for_output_mut(&move_.output) {
             let zoom = mon.overview_zoom();
-            let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
+            let pointer_pos = mon
+                .overview_handoff_transform()
+                .apply_inverse(move_.pointer_pos_within_output);
+            let (insert_ws, geo) = mon.insert_position(pointer_pos);
             match insert_ws {
                 InsertWorkspace::Existing(ws_id) => {
                     let idx = mon.idx_of_ws(ws_id).unwrap();
                     let ws = &mut mon.workspaces[idx];
-                    let pos_within_workspace =
-                        (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
+                    let pos_within_workspace = (pointer_pos - geo.loc).downscale(zoom);
                     let position = if move_.is_floating {
                         InsertPosition::Floating
                     } else {
@@ -3744,6 +3775,11 @@ impl<W: LayoutElement> Layout<W> {
         self.overview_open = true;
 
         let value = self.overview_progress.take().map_or(0., |p| p.value());
+
+        // Capture the zoom geometry before the gesture progress replaces the
+        // current overview state: the handoff rebases on the displayed frame.
+        self.gesture_overview_handoffs(value);
+
         let gesture = OverviewGesture {
             tracker: SwipeTracker::new(),
             start: value,
@@ -3798,9 +3834,17 @@ impl<W: LayoutElement> Layout<W> {
             OVERVIEW_GESTURE_RUBBER_BAND.clamp_derivative(0., 1., gesture.start + current_pos);
 
         self.overview_open = new_value == 1.;
+
+        // Rebase the handoff onto the gesture's final segment before the
+        // animation replaces the gesture progress. A zero-delta cancel
+        // produces a degenerate segment (gesture.value == new_value), which
+        // the monitor resolves with its own residual animation.
+        let gesture_value = gesture.value;
+        self.rebase_overview_handoffs(gesture_value, new_value);
+
         self.overview_progress = Some(OverviewProgress::Animation(Animation::new(
             self.clock.clone(),
-            gesture.value,
+            gesture_value,
             new_value,
             velocity,
             self.options.animations.overview_open_close.0,
@@ -4020,10 +4064,18 @@ impl<W: LayoutElement> Layout<W> {
                     tile.hold_alpha_animation_after_done();
                 }
 
+                // Store the pointer in screen space: the scene-space argument
+                // goes stale while the handoff residual evolves between motion
+                // events.
+                let handoff = self
+                    .monitor_for_output(&output)
+                    .map(|mon| mon.overview_handoff_transform())
+                    .unwrap_or_else(ViewportTransform::identity);
+
                 let mut data = InteractiveMoveData {
                     tile,
                     output,
-                    pointer_pos_within_output,
+                    pointer_pos_within_output: handoff.apply(pointer_pos_within_output),
                     width,
                     is_full_width,
                     is_floating,
@@ -4033,7 +4085,7 @@ impl<W: LayoutElement> Layout<W> {
                 };
 
                 if let Some((tile_pos, zoom)) = tile_pos {
-                    let new_tile_pos = data.tile_render_location(zoom);
+                    let new_tile_pos = data.tile_render_location(zoom, handoff);
                     data.tile
                         .animate_move_from((tile_pos - new_tile_pos).downscale(zoom));
                 }
@@ -4048,7 +4100,12 @@ impl<W: LayoutElement> Layout<W> {
 
                 let mut ws_id = None;
                 if let Some(mon) = self.monitor_for_output(&output) {
-                    let (insert_ws, _) = mon.insert_position(move_.pointer_pos_within_output);
+                    // The stored pointer position is screen-space; map it back
+                    // to scene space under the current handoff residual.
+                    let pointer_pos = mon
+                        .overview_handoff_transform()
+                        .apply_inverse(move_.pointer_pos_within_output);
+                    let (insert_ws, _) = mon.insert_position(pointer_pos);
                     if let InsertWorkspace::Existing(id) = insert_ws {
                         ws_id = Some(id);
                     }
@@ -4090,7 +4147,11 @@ impl<W: LayoutElement> Layout<W> {
                     move_.tile.update_config(view_size, scale, Rc::new(options));
                 }
 
-                move_.pointer_pos_within_output = pointer_pos_within_output;
+                move_.pointer_pos_within_output = self
+                    .monitor_for_output(&output)
+                    .map(|mon| mon.overview_handoff_transform())
+                    .unwrap_or_else(ViewportTransform::identity)
+                    .apply(pointer_pos_within_output);
 
                 self.interactive_move = Some(InteractiveMoveState::Moving(move_));
             }
@@ -4180,57 +4241,65 @@ impl<W: LayoutElement> Layout<W> {
                 active_monitor_idx,
                 ..
             } => {
-                let (mon, insert_ws, position, offset, zoom) =
-                    if let Some(mon) = monitors.iter_mut().find(|mon| mon.output == move_.output) {
-                        let zoom = mon.overview_zoom();
+                let (mon, insert_ws, position, offset, zoom) = if let Some(mon) =
+                    monitors.iter_mut().find(|mon| mon.output == move_.output)
+                {
+                    let zoom = mon.overview_zoom();
 
-                        let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
-                        let (position, offset) = match insert_ws {
-                            InsertWorkspace::Existing(ws_id) => {
-                                let ws_idx = mon.idx_of_ws(ws_id).unwrap();
+                    // The stored pointer position is screen-space; map it
+                    // back to scene space under the current handoff
+                    // residual.
+                    let pointer_pos = mon
+                        .overview_handoff_transform()
+                        .apply_inverse(move_.pointer_pos_within_output);
 
-                                let position = if move_.is_floating {
-                                    InsertPosition::Floating
-                                } else {
-                                    let pos_within_workspace =
-                                        (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
-                                    let ws = &mut mon.workspaces[ws_idx];
-                                    ws.scrolling_insert_position(pos_within_workspace)
-                                };
+                    let (insert_ws, geo) = mon.insert_position(pointer_pos);
+                    let (position, offset) = match insert_ws {
+                        InsertWorkspace::Existing(ws_id) => {
+                            let ws_idx = mon.idx_of_ws(ws_id).unwrap();
 
-                                (position, Some(geo.loc))
-                            }
-                            InsertWorkspace::NewAt(_) => {
-                                let position = if move_.is_floating {
-                                    InsertPosition::Floating
-                                } else {
-                                    InsertPosition::NewColumn(0)
-                                };
+                            let position = if move_.is_floating {
+                                InsertPosition::Floating
+                            } else {
+                                let pos_within_workspace = (pointer_pos - geo.loc).downscale(zoom);
+                                let ws = &mut mon.workspaces[ws_idx];
+                                ws.scrolling_insert_position(pos_within_workspace)
+                            };
 
-                                (position, None)
-                            }
-                        };
+                            (position, Some(geo.loc))
+                        }
+                        InsertWorkspace::NewAt(_) => {
+                            let position = if move_.is_floating {
+                                InsertPosition::Floating
+                            } else {
+                                InsertPosition::NewColumn(0)
+                            };
 
-                        (mon, insert_ws, position, offset, zoom)
-                    } else {
-                        let mon = &mut monitors[*active_monitor_idx];
-                        let zoom = mon.overview_zoom();
-                        // No point in trying to use the pointer position on the wrong output.
-                        let ws = &mon.workspaces[0];
-                        let ws_geo = mon.workspaces_render_geo().next().unwrap();
-
-                        let position = if move_.is_floating {
-                            InsertPosition::Floating
-                        } else {
-                            ws.scrolling_insert_position(Point::from((0., 0.)))
-                        };
-
-                        let insert_ws = InsertWorkspace::Existing(ws.id());
-                        (mon, insert_ws, position, Some(ws_geo.loc), zoom)
+                            (position, None)
+                        }
                     };
 
+                    (mon, insert_ws, position, offset, zoom)
+                } else {
+                    let mon = &mut monitors[*active_monitor_idx];
+                    let zoom = mon.overview_zoom();
+                    // No point in trying to use the pointer position on the wrong output.
+                    let ws = &mon.workspaces[0];
+                    let ws_geo = mon.workspaces_render_geo().next().unwrap();
+
+                    let position = if move_.is_floating {
+                        InsertPosition::Floating
+                    } else {
+                        ws.scrolling_insert_position(Point::from((0., 0.)))
+                    };
+
+                    let insert_ws = InsertWorkspace::Existing(ws.id());
+                    (mon, insert_ws, position, Some(ws_geo.loc), zoom)
+                };
+
                 let win_id = move_.tile.window().id().clone();
-                let tile_render_loc = move_.tile_render_location(zoom);
+                let tile_render_loc =
+                    move_.tile_render_location(zoom, mon.overview_handoff_transform());
 
                 let ws_idx = match insert_ws {
                     InsertWorkspace::Existing(ws_id) => mon.idx_of_ws(ws_id).unwrap(),
@@ -4365,6 +4434,21 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// The scene transform of the output the interactive move is on.
+    ///
+    /// [`InteractiveMoveData::pointer_pos_within_output`] is stored in screen
+    /// space; this is the transform that maps it back to scene space. It is
+    /// the identity whenever no overview handoff is active.
+    fn interactive_move_scene_transform(&self) -> ViewportTransform {
+        let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move else {
+            return ViewportTransform::identity();
+        };
+
+        self.monitor_for_output(&move_.output)
+            .map(|mon| mon.overview_handoff_transform())
+            .unwrap_or_else(ViewportTransform::identity)
+    }
+
     pub fn interactive_move_is_moving_above_output(&self, output: &Output) -> bool {
         let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move else {
             return false;
@@ -4375,6 +4459,14 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn dnd_update(&mut self, output: Output, pointer_pos_within_output: Point<f64, Logical>) {
         let begin_gesture = self.dnd.is_none();
+
+        // Store the pointer in screen space: the scene-space argument goes
+        // stale while the handoff residual evolves between motion events.
+        let pointer_pos_within_output = self
+            .monitor_for_output(&output)
+            .map(|mon| mon.overview_handoff_transform())
+            .unwrap_or_else(ViewportTransform::identity)
+            .apply(pointer_pos_within_output);
 
         self.dnd = Some(DndData {
             output,
@@ -4639,6 +4731,11 @@ impl<W: LayoutElement> Layout<W> {
         let from = self.overview_progress.take().map_or(0., |p| p.value());
         let to = if self.overview_open { 1. } else { 0. };
 
+        // Capture the zoom geometry before the new progress replaces the old
+        // overview state: the handoff rebases on the displayed frame, so a
+        // reversal mid-animation stays continuous.
+        self.rebase_overview_handoffs(from, to);
+
         self.overview_progress = Some(OverviewProgress::Animation(Animation::new(
             self.clock.clone(),
             from,
@@ -4648,6 +4745,36 @@ impl<W: LayoutElement> Layout<W> {
         )));
 
         self.set_monitors_overview_state();
+    }
+
+    /// Rebases every monitor's zoom→overview handoff onto the progress
+    /// segment `from → to`.
+    ///
+    /// Must be called while the monitors still hold the progress the
+    /// displayed frame was rendered at, before the new
+    /// [`OverviewProgress`] replaces it. Each monitor captures its own zoom
+    /// geometry — the live level and focal point — so the first frame of the
+    /// new segment is pixel-identical to the last.
+    fn rebase_overview_handoffs(&mut self, from: f64, to: f64) {
+        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+            return;
+        };
+
+        for mon in monitors {
+            mon.rebase_overview_handoff(from, to);
+        }
+    }
+
+    /// Captures every monitor's zoom→overview handoff for a gesture starting
+    /// at progress `start`.
+    fn gesture_overview_handoffs(&mut self, start: f64) {
+        let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set else {
+            return;
+        };
+
+        for mon in monitors {
+            mon.gesture_overview_handoff(start);
+        }
     }
 
     pub fn open_overview(&mut self) -> bool {
@@ -4700,10 +4827,11 @@ impl<W: LayoutElement> Layout<W> {
         let _span = tracy_client::span!("Layout::store_unmap_snapshot");
 
         let zoom = self.overview_zoom();
+        let move_transform = self.interactive_move_scene_transform();
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {
-                let pos_within_output = move_.tile_render_location(zoom);
+                let pos_within_output = move_.tile_render_location(zoom, move_transform);
 
                 // Computation matches update_render_elements().
                 let view_rect =
@@ -4794,13 +4922,14 @@ impl<W: LayoutElement> Layout<W> {
         let _span = tracy_client::span!("Layout::start_close_animation_for_window");
 
         let zoom = self.overview_zoom();
+        let move_transform = self.interactive_move_scene_transform();
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {
                 let Some(snapshot) = move_.tile.take_unmap_snapshot() else {
                     return;
                 };
-                let tile_pos = move_.tile_render_location(zoom);
+                let tile_pos = move_.tile_render_location(zoom, move_transform);
                 let tile_size = move_.tile.tile_size();
 
                 let output = move_.output.clone();
@@ -4808,6 +4937,9 @@ impl<W: LayoutElement> Layout<W> {
                 let Some(mon) = self.monitor_for_output_mut(&output) else {
                     return;
                 };
+                let pointer_pos_within_output = mon
+                    .overview_handoff_transform()
+                    .apply_inverse(pointer_pos_within_output);
                 let Some((ws, ws_geo)) = mon.workspace_under(pointer_pos_within_output) else {
                     return;
                 };
@@ -4862,7 +4994,8 @@ impl<W: LayoutElement> Layout<W> {
 
         let scale = Scale::from(move_.output.current_scale().fractional_scale());
         let zoom = self.overview_zoom();
-        let pos_in_backdrop = move_.tile_render_location(zoom);
+        let pos_in_backdrop =
+            move_.tile_render_location(zoom, self.interactive_move_scene_transform());
         let xray_pos = XrayPos::new(pos_in_backdrop, zoom);
 
         move_

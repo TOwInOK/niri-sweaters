@@ -2915,6 +2915,9 @@ impl State {
         if is_dnd_grab {
             if let Some((output, pos_within_output)) = self.niri.output_under(new_pos) {
                 let output = output.clone();
+                let pos_within_output = self
+                    .niri
+                    .scene_position_within_output(&output, pos_within_output);
                 self.niri.layout.dnd_update(output, pos_within_output);
             }
         }
@@ -3013,6 +3016,9 @@ impl State {
         if is_dnd_grab {
             if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
                 let output = output.clone();
+                let pos_within_output = self
+                    .niri
+                    .scene_position_within_output(&output, pos_within_output);
                 self.niri.layout.dnd_update(output, pos_within_output);
             }
         }
@@ -3225,7 +3231,11 @@ impl State {
                     let edges = self
                         .niri
                         .layout
-                        .resize_edges_under(output, pos_within_output)
+                        .resize_edges_under(
+                            output,
+                            self.niri
+                                .scene_position_within_output(output, pos_within_output),
+                        )
                         .unwrap_or(ResizeEdge::empty());
 
                     if !edges.is_empty() {
@@ -4008,6 +4018,9 @@ impl State {
                             && under.output.is_some()
                         {
                             let (output, pos_within_output) = self.niri.output_under(pos).unwrap();
+                            let pos_within_output = self
+                                .niri
+                                .scene_position_within_output(output, pos_within_output);
                             let output = output.clone();
 
                             let mut matched_narrow = true;
@@ -4694,9 +4707,15 @@ impl State {
             .niri
             .tablet_cursor_location
             .map(|pos| self.niri.display_position_for_content(pos));
+
+        // Only a real closed → open transition ends the zoom session and
+        // rebases the pointer. A repeated open while the Overview is already
+        // open — or while it is closing and reopens — must not reset the
+        // handoff or rebase again.
+        let was_open = self.niri.layout.is_overview_open();
         let result = open(self);
 
-        if !self.niri.layout.is_overview_open() {
+        if was_open || !self.niri.layout.is_overview_open() {
             return result;
         }
 
@@ -5408,6 +5427,9 @@ impl State {
                 && under.output.is_some()
             {
                 let (output, pos_within_output) = self.niri.output_under(pos).unwrap();
+                let pos_within_output = self
+                    .niri
+                    .scene_position_within_output(output, pos_within_output);
                 let output = output.clone();
 
                 let mut matched_narrow = true;
@@ -5542,6 +5564,9 @@ impl State {
         if is_dnd_grab {
             if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
                 let output = output.clone();
+                let pos_within_output = self
+                    .niri
+                    .scene_position_within_output(&output, pos_within_output);
                 self.niri.layout.dnd_update(output, pos_within_output);
             }
         }

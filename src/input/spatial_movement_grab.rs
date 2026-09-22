@@ -79,6 +79,12 @@ impl SpatialMovementGrab {
             .unwrap_or(self.new_location - self.last_location);
         self.last_location = self.new_location;
 
+        // Gesture deltas feed scene-space state (view offset, workspace
+        // index), so convert them from pointer space into scene space. The
+        // scale is 1 whenever the pointer and the scene share the
+        // presentation transform.
+        let scene_scale = data.niri.scene_delta_scale(&self.output);
+
         let layout = &mut data.niri.layout;
         let res = match self.gesture {
             GestureState::Recognizing => {
@@ -91,7 +97,11 @@ impl SpatialMovementGrab {
                         if let Some((ws_idx, ws)) = layout.find_workspace_by_id(self.workspace_id) {
                             if ws.current_output() == Some(&self.output) {
                                 layout.view_offset_gesture_begin(&self.output, Some(ws_idx), false);
-                                layout.view_offset_gesture_update(-c.x, timestamp, false)
+                                layout.view_offset_gesture_update(
+                                    -c.x * scene_scale,
+                                    timestamp,
+                                    false,
+                                )
                             } else {
                                 None
                             }
@@ -101,17 +111,17 @@ impl SpatialMovementGrab {
                     } else {
                         self.gesture = GestureState::WorkspaceSwitch;
                         layout.workspace_switch_gesture_begin(&self.output, false);
-                        layout.workspace_switch_gesture_update(-c.y, timestamp, false)
+                        layout.workspace_switch_gesture_update(-c.y * scene_scale, timestamp, false)
                     }
                 } else {
                     Some(None)
                 }
             }
             GestureState::ViewOffset => {
-                layout.view_offset_gesture_update(-delta.x, timestamp, false)
+                layout.view_offset_gesture_update(-delta.x * scene_scale, timestamp, false)
             }
             GestureState::WorkspaceSwitch => {
-                layout.workspace_switch_gesture_update(-delta.y, timestamp, false)
+                layout.workspace_switch_gesture_update(-delta.y * scene_scale, timestamp, false)
             }
         };
 

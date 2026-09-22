@@ -54,6 +54,12 @@ impl MoveGrab {
     ) -> Option<Self> {
         let location = start_data.location();
         let (output, pos_within_output) = state.niri.output_under(location)?;
+        // The start position feeds scene-space state (the interactive move
+        // pointer offset), so convert it from canonical into scene
+        // coordinates.
+        let pos_within_output = state
+            .niri
+            .scene_position_within_output(output, pos_within_output);
 
         Some(Self {
             last_location: location,
@@ -227,6 +233,15 @@ impl MoveGrab {
                 };
                 let output = output.clone();
 
+                // Interactive move state lives in scene coordinates: map the
+                // pointer position and the delta through the scene
+                // correction (identity unless an Overview handoff residual
+                // is alive).
+                let pos_within_output = data
+                    .niri
+                    .scene_position_within_output(&output, pos_within_output);
+                let delta = delta.upscale(data.niri.scene_delta_scale(&output));
+
                 // Interactive move always uses absolute delta since the window must remain pinned
                 // to the cursor even when it's clamped to monitor bounds.
                 let ongoing = data.niri.layout.interactive_move_update(
@@ -243,7 +258,7 @@ impl MoveGrab {
             }
             GestureState::ViewOffset => {
                 let res = data.niri.layout.view_offset_gesture_update(
-                    -relative_delta.x,
+                    -relative_delta.x * data.niri.scene_delta_scale(&self.start_output),
                     timestamp,
                     false,
                 );
@@ -271,7 +286,9 @@ impl MoveGrab {
                 return false;
             };
             let output = output.clone();
-
+            let pos_within_output = data
+                .niri
+                .scene_position_within_output(&output, pos_within_output);
             if !self.begin_move(data) {
                 return false;
             }
@@ -279,7 +296,8 @@ impl MoveGrab {
             // Apply the delta accumulated during recognizing.
             let ongoing = data.niri.layout.interactive_move_update(
                 &self.window,
-                self.last_location - self.start_data.location(),
+                (self.last_location - self.start_data.location())
+                    .upscale(data.niri.scene_delta_scale(&output)),
                 output,
                 pos_within_output,
             );

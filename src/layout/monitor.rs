@@ -30,6 +30,7 @@ use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
 use crate::utils::transaction::Transaction;
+use crate::utils::view::ViewportTransform;
 use crate::utils::{
     output_size, round_logical_in_physical, round_logical_in_physical_max1, ResizeEdge,
 };
@@ -82,6 +83,16 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
     overview_progress: Option<OverviewProgress>,
+    /// Camera handoff between the desktop zoom and the Overview.
+    ///
+    /// Created by the layout at explicit overview transition events when the
+    /// displayed scene scale differs from the plain overview presentation —
+    /// that is, when a desktop zoom session is being terminated on entry or
+    /// a previous handoff is rebased mid-flight. Drives the residual outer
+    /// transform reported by [`overview_handoff_transform`].
+    ///
+    /// [`overview_handoff_transform`]: Self::overview_handoff_transform
+    overview_handoff: Option<OverviewHandoff>,
     /// Desktop zoom state for this output.
     zoom: OutputZoomState,
     /// Clock for driving animations.
@@ -284,6 +295,165 @@ impl OverviewProgress {
         }
     }
 }
+/// Per-output camera handoff between the desktop zoom and the Overview.
+///
+/// The Overview's own presentation scales the workspace layout by
+/// `compute_overview_zoom(progress)`; the handoff owns the residual outer
+/// transform that keeps the total displayed scale continuous across the
+/// transition. The total scale is driven by a single normalized segment
+/// parameter `t` over the overview progress `u`:
+///
+/// - `S(u) = lerp(from_scale, to_scale, t(u))` is the desired total scale, where `from_scale` is
+///   the displayed total scale captured at the transition event (the zoom level times the base
+///   overview zoom, or the previous handoff's live value) and `to_scale` is the endpoint's base
+///   overview zoom — `1` when closing to the desktop.
+/// - The residual factor is `S(u) / B(u)` around the captured focal point, so the composition `B(u)
+///   * residual` reproduces `S(u)` exactly: the total scale interpolates linearly between the
+///   endpoints without a multiplicative bounce, and crossing `1` never divides by the focal
+///   geometry.
+///
+/// The payload is created and rebased only by explicit overview transition
+/// operations in the layout (toggle, gesture begin/end), never reconstructed
+/// per frame; it is retired when its driver completes.
+#[derive(Debug)]
+struct OverviewHandoff {
+    /// Zoom focal in desktop coordinates. Map it through the centered base
+    /// overview transform so scale and translation share the same trajectory.
+    /// Keep this reference across rebases to preserve the displayed frame.
+    focal: Point<f64, Logical>,
+    /// The scene's stacking order captured at handoff start.
+    ///
+    /// While the handoff is alive the monitor keeps rendering the workspace
+    /// above the top layer exactly as it did on the last desktop frame, so
+    /// the first handoff frame is pixel-identical to the pre-transition
+    /// scene. The ordering flips back to normal when the payload completes —
+    /// at the open end the shrunken workspace no longer covers the panel, so
+    /// the flip is invisible.
+    above_top_layer: bool,
+    /// What drives the normalized segment progress.
+    driver: OverviewHandoffDriver,
+}
+
+/// The normalized segment driver of an [`OverviewHandoff`].
+///
+/// Every variant produces the total displayed scale `s` for the current
+/// frame; the residual factor is `s / B(u)` where `B` is the base overview
+/// zoom. The driver is explicit about its normalized segment rather than
+/// dividing by `(to - from)` of the overview progress, so a degenerate
+/// progress segment — a zero-delta gesture cancellation — still animates the
+/// residual camera back to the endpoint instead of snapping or producing a
+/// `0/0`.
+#[derive(Debug)]
+enum OverviewHandoffDriver {
+    /// Driven by the overview progress `u` along the segment `from → to`.
+    ///
+    /// `t = (u - from) / (to - from)` is extrapolated rather than clamped so
+    /// that a spring overshoot of the overview animation carries the camera
+    /// along instead of pinning the total scale while the layout overshoots.
+    Segment {
+        from: f64,
+        to: f64,
+        from_scale: f64,
+        to_scale: f64,
+    },
+    /// Driven by the live gesture value.
+    ///
+    /// The gesture has no committed direction until it ends, so the scale is
+    /// piecewise: above the start progress it interpolates towards the open
+    /// overview zoom, below it towards the plain desktop scale. Dragging the
+    /// overview fully closed returns the camera to 1x, which is what makes a
+    /// zero-delta cancel land on the ordinary desktop.
+    Gesture {
+        /// Overview progress where the gesture started.
+        start: f64,
+        /// Total displayed scale captured at gesture start.
+        from_scale: f64,
+    },
+    /// Driven by its own animation over `t: 0 → 1`.
+    ///
+    /// Used when the overview progress segment is degenerate (`from == to`),
+    /// i.e. a gesture that cancels without moving: the overview progress
+    /// cannot drive the residual, so the handoff animates the camera back to
+    /// the endpoint scale on the overview open/close animation config.
+    Animation {
+        anim: Animation,
+        from_scale: f64,
+        to_scale: f64,
+    },
+}
+
+impl OverviewHandoff {
+    /// The desired total displayed scale for overview progress `u`.
+    ///
+    /// `overview_zoom` is the endpoint overview zoom (`B(1)`), needed by the
+    /// gesture driver. `u` may be `None` once the overview progress is gone;
+    /// only the animation driver outlives that state.
+    fn total_scale(&self, u: Option<f64>, overview_zoom: f64) -> f64 {
+        let u = u.unwrap_or(0.);
+        let s = match &self.driver {
+            OverviewHandoffDriver::Segment {
+                from,
+                to,
+                from_scale,
+                to_scale,
+            } => {
+                let t = if from == to {
+                    1.
+                } else {
+                    (u - from) / (to - from)
+                };
+                from_scale + (to_scale - from_scale) * t
+            }
+            OverviewHandoffDriver::Gesture { start, from_scale } => {
+                if u >= *start {
+                    let t = ((u - start) / (1. - start).max(1e-9)).clamp(0., 1.);
+                    from_scale + (overview_zoom - from_scale) * t
+                } else if *start > 0. {
+                    let t = (u / start).clamp(0., 1.);
+                    1. + (from_scale - 1.) * t
+                } else {
+                    // A gesture that started at the closed end has no lower
+                    // leg; extrapolate the upper leg so a downward rubberband
+                    // stays continuous instead of snapping to 1x.
+                    from_scale + (overview_zoom - from_scale) * u
+                }
+            }
+            OverviewHandoffDriver::Animation {
+                anim,
+                from_scale,
+                to_scale,
+            } => from_scale + (to_scale - from_scale) * anim.value(),
+        };
+        // Keep the residual factor positive and finite for
+        // `ViewportTransform::new` even under extreme spring overshoot.
+        s.max(0.0001)
+    }
+
+    /// Whether the payload still has a live driver under `progress`.
+    ///
+    /// Segment and gesture drivers die with the overview progress: a segment
+    /// completes when the progress is gone (closed) or resting open at its
+    /// `to == 1` end. The animation driver owns its own clock and completes
+    /// when the animation is done, regardless of the progress state.
+    fn is_done(&self, progress: Option<&OverviewProgress>) -> bool {
+        match (&self.driver, progress) {
+            (OverviewHandoffDriver::Animation { anim, .. }, _) => anim.is_done(),
+            (OverviewHandoffDriver::Gesture { .. }, Some(OverviewProgress::Value(_))) => false,
+            (OverviewHandoffDriver::Gesture { .. }, _) => true,
+            (OverviewHandoffDriver::Segment { to, .. }, Some(OverviewProgress::Open)) => *to == 1.,
+            (OverviewHandoffDriver::Segment { .. }, Some(_)) => false,
+            (OverviewHandoffDriver::Segment { .. }, None) => true,
+        }
+    }
+
+    /// Whether the driver animation is still running.
+    fn is_animating(&self) -> bool {
+        match &self.driver {
+            OverviewHandoffDriver::Animation { anim, .. } => !anim.is_done(),
+            _ => false,
+        }
+    }
+}
 
 impl From<&super::OverviewProgress> for OverviewProgress {
     fn from(value: &super::OverviewProgress) -> Self {
@@ -348,6 +518,7 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
+            overview_handoff: None,
             zoom: OutputZoomState::new(view_size),
             workspace_switch: None,
             clock,
@@ -1086,10 +1257,16 @@ impl<W: LayoutElement> Monitor<W> {
                 .as_ref()
                 .is_some_and(|progress| matches!(progress, OverviewProgress::Open));
 
+        let handoff_animation = self
+            .overview_handoff
+            .as_ref()
+            .is_some_and(OverviewHandoff::is_animating);
+
         self.workspace_switch
             .as_ref()
             .is_some_and(|s| s.is_animation_ongoing())
             || zoom_visible_animation
+            || handoff_animation
             || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
     }
 
@@ -1252,6 +1429,19 @@ impl<W: LayoutElement> Monitor<W> {
         self.working_area = compute_working_area(&self.output);
         self.zoom.update_view_size(self.view_size);
 
+        // Keep the handoff's fixed point inside the resized output, matching
+        // the zoom state's own focal clamp.
+        if let Some(handoff) = &mut self.overview_handoff {
+            let output_geo = Rectangle::from_size(self.view_size);
+            let focal = &mut handoff.focal;
+            focal.x = focal
+                .x
+                .clamp(output_geo.loc.x, output_geo.loc.x + output_geo.size.w);
+            focal.y = focal
+                .y
+                .clamp(output_geo.loc.y, output_geo.loc.y + output_geo.size.h);
+        }
+
         for ws in &mut self.workspaces {
             ws.update_output_size();
         }
@@ -1395,10 +1585,10 @@ impl<W: LayoutElement> Monitor<W> {
     /// Returns whether this monitor is participating in an Overview presentation.
     ///
     /// This remains true throughout opening, gestures, the resting open state, and
-    /// closing. It follows presentation progress rather than the Overview intent flag,
-    /// which is already false during closing.
+    /// closing, including a handoff tail after a zero-motion gesture cancellation.
+    /// Presentation ownership, not the intent flag, gates new Zoom operations.
     pub fn overview_active(&self) -> bool {
-        self.overview_progress.is_some()
+        self.overview_progress.is_some() || self.overview_handoff.is_some()
     }
 
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
@@ -1414,6 +1604,150 @@ impl<W: LayoutElement> Monitor<W> {
                 // FIXME: maintain velocity.
                 *anim = anim.restarted(prev_render_idx, anim.to(), 0.);
             }
+        }
+
+        // Retire a completed handoff: the residual is the identity from here
+        // on, so the payload must not survive into the next transition.
+        if self
+            .overview_handoff
+            .as_ref()
+            .is_some_and(|handoff| handoff.is_done(self.overview_progress.as_ref()))
+        {
+            self.overview_handoff = None;
+        }
+    }
+
+    /// The residual outer transform of the zoom→overview camera handoff.
+    ///
+    /// The Overview's own presentation scales the workspace layout by
+    /// [`overview_zoom`](Self::overview_zoom); this returns the remaining
+    /// correction that composes on top of it so the total displayed scale
+    /// interpolates continuously between the captured desktop zoom and the
+    /// endpoint overview scale. Returns the identity when no handoff is
+    /// active: with no payload, or once the residual has fully decayed.
+    ///
+    /// The residual can outlive the overview progress itself — a zero-delta
+    /// gesture cancel animates it back while the progress is already gone —
+    /// so callers must select it by `factor() != 1`, not by
+    /// [`overview_active`](Self::overview_active).
+    pub fn overview_handoff_transform(&self) -> ViewportTransform {
+        let Some(handoff) = &self.overview_handoff else {
+            return ViewportTransform::identity();
+        };
+
+        let u = self.overview_progress.as_ref().map(|p| p.value());
+        let base = compute_overview_zoom(&self.options, u);
+        let endpoint_zoom = compute_overview_zoom(&self.options, Some(1.));
+        let scale = handoff.total_scale(u, endpoint_zoom);
+
+        let center = self.view_size.to_point().downscale(2.);
+        let focal = center + (handoff.focal - center).upscale(base);
+        ViewportTransform::new(focal, scale / base)
+    }
+
+    /// The desktop zoom transform for the actual zoom session.
+    ///
+    /// Unlike [`overview_handoff_transform`](Self::overview_handoff_transform)
+    /// this is the zoom state's own transform; while the Overview owns the
+    /// presentation the zoom session is terminated and this is the identity.
+    pub fn desktop_zoom_transform(&self) -> ViewportTransform {
+        self.zoom.viewport_transform()
+    }
+
+    /// Captures or rebases the handoff for an overview progress segment
+    /// `from → to`.
+    ///
+    /// Called by the layout at every explicit transition event — toggle and
+    /// gesture end — before the new progress replaces the old, so `from` is
+    /// the progress the displayed frame was rendered at. The captured total
+    /// scale is the live presentation: the previous handoff's value when one
+    /// is active, otherwise the zoom level times the base overview zoom.
+    ///
+    /// A degenerate segment (`from == to`, e.g. a zero-delta gesture cancel)
+    /// cannot drive the residual through the progress, so it gets its own
+    /// animation over the normalized segment parameter.
+    pub(super) fn rebase_overview_handoff(&mut self, from: f64, to: f64) {
+        let base_from = compute_overview_zoom(&self.options, Some(from));
+        let to_scale = compute_overview_zoom(&self.options, Some(to));
+
+        let (from_scale, focal, above_top_layer) = self.handoff_capture(base_from);
+
+        // No residual at the segment start means there is nothing to hand
+        // off: the plain overview animation already produces the displayed
+        // frame. This keeps the no-zoom path completely unchanged.
+        if self.overview_handoff.is_none() && from_scale == base_from {
+            return;
+        }
+
+        let driver = if from == to {
+            OverviewHandoffDriver::Animation {
+                anim: Animation::new(
+                    self.clock.clone(),
+                    0.,
+                    1.,
+                    0.,
+                    self.options.animations.overview_open_close.0,
+                ),
+                from_scale,
+                to_scale,
+            }
+        } else {
+            OverviewHandoffDriver::Segment {
+                from,
+                to,
+                from_scale,
+                to_scale,
+            }
+        };
+
+        self.overview_handoff = Some(OverviewHandoff {
+            focal,
+            above_top_layer,
+            driver,
+        });
+    }
+
+    /// Captures or rebases the handoff for an overview gesture starting at
+    /// progress `start`.
+    ///
+    /// The gesture has no committed direction, so the driver interpolates
+    /// towards the open overview zoom above `start` and back towards the
+    /// plain desktop scale below it.
+    pub(super) fn gesture_overview_handoff(&mut self, start: f64) {
+        let base_from = compute_overview_zoom(&self.options, Some(start));
+        let (from_scale, focal, above_top_layer) = self.handoff_capture(base_from);
+
+        if self.overview_handoff.is_none() && from_scale == base_from {
+            return;
+        }
+
+        self.overview_handoff = Some(OverviewHandoff {
+            focal,
+            above_top_layer,
+            driver: OverviewHandoffDriver::Gesture { start, from_scale },
+        });
+    }
+
+    /// The displayed total scale, desktop focal reference and scene stacking
+    /// order at the current frame.
+    ///
+    /// `base_from` is `B(from)`: the base overview zoom at the progress the
+    /// displayed frame was rendered at. With a live handoff its driver
+    /// already reproduces the displayed scale; without one the scene is the
+    /// desktop zoom transform on top of the base overview zoom.
+    fn handoff_capture(&self, base_from: f64) -> (f64, Point<f64, Logical>, bool) {
+        if let Some(handoff) = &self.overview_handoff {
+            let u = self.overview_progress.as_ref().map(|p| p.value());
+            let endpoint_zoom = compute_overview_zoom(&self.options, Some(1.));
+            let scale = handoff.total_scale(u, endpoint_zoom);
+            (scale, handoff.focal, handoff.above_top_layer)
+        } else {
+            (
+                self.zoom.level() * base_from,
+                self.zoom.focal(),
+                self.workspace_switch.is_none()
+                    && self.workspaces[self.active_workspace_idx].render_above_top_layer(),
+            )
         }
     }
 
@@ -1668,7 +2002,21 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn render_above_top_layer(&self) -> bool {
         // Render above the top layer only if the view is stationary.
-        if self.workspace_switch.is_some() || self.overview_progress.is_some() {
+        if self.workspace_switch.is_some() {
+            return false;
+        }
+
+        // During a zoom→overview handoff the scene keeps the stacking order
+        // captured at the transition start: the residual transform preserves
+        // the displayed frame exactly, so a fullscreen window must stay above
+        // the top layer until the payload completes. At the open end the
+        // shrunken workspace no longer covers the panel, so the flip back is
+        // invisible.
+        if let Some(handoff) = &self.overview_handoff {
+            return handoff.above_top_layer;
+        }
+
+        if self.overview_progress.is_some() {
             return false;
         }
 
