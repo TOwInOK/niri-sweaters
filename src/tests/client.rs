@@ -68,10 +68,6 @@ pub struct State {
 
     /// Output names each surface is currently entered on.
     pub surface_outputs: HashMap<ObjectId, Vec<String>>,
-    /// Last preferred buffer scale received per surface.
-    pub surface_scales: HashMap<ObjectId, i32>,
-    /// Last preferred buffer transform received per surface.
-    pub surface_transforms: HashMap<ObjectId, wl_output::Transform>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
@@ -203,8 +199,6 @@ impl Client {
             pointer: None,
             pointer_enter_serial: None,
             surface_outputs: HashMap::new(),
-            surface_scales: HashMap::new(),
-            surface_transforms: HashMap::new(),
             windows: Vec::new(),
             layers: Vec::new(),
         };
@@ -315,15 +309,6 @@ impl Client {
             .unwrap_or_default()
     }
 
-    /// Last preferred buffer scale received on the surface.
-    pub fn surface_scale(&mut self, surface: &WlSurface) -> Option<i32> {
-        self.state.surface_scales.get(&surface.id()).copied()
-    }
-
-    /// Last preferred buffer transform received on the surface.
-    pub fn surface_transform(&mut self, surface: &WlSurface) -> Option<wl_output::Transform> {
-        self.state.surface_transforms.get(&surface.id()).copied()
-    }
 }
 
 impl State {
@@ -728,14 +713,6 @@ impl Dispatch<WlSurface, ()> for State {
                     if let Some(name) = state.outputs.get(&output) {
                         outputs.retain(|n| n != name);
                     }
-                }
-            }
-            wl_surface::Event::PreferredBufferScale { factor } => {
-                state.surface_scales.insert(surface.id(), factor);
-            }
-            wl_surface::Event::PreferredBufferTransform { transform } => {
-                if let WEnum::Value(transform) = transform {
-                    state.surface_transforms.insert(surface.id(), transform);
                 }
             }
             _ => unreachable!(),
