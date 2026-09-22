@@ -135,10 +135,9 @@ pub enum ZoomCommandState {
 
 /// A zoom command of a locked output.
 ///
-/// The locked anchor is always the viewport center: the user-facing
-/// invariant while locked is that the content displayed at the center stays
-/// centered. `ToIdentity` keeps the focal point fixed like the unlocked
-/// variant.
+/// The anchor is fixed throughout the command: the pointer for incremental
+/// commands and locking presets, or the viewport center for absolute commands.
+/// `ToIdentity` keeps the focal point fixed like the unlocked variant.
 #[derive(Debug, Clone)]
 pub enum LockedCommandState {
     /// A `zoom-in` command towards `target`.
@@ -210,11 +209,10 @@ pub struct FlexibleAnchor {
     display: Point<f64, Logical>,
 }
 
-/// The anchor of a locked zoom command: the viewport center.
+/// The fixed anchor of a locked zoom command.
 ///
-/// `display` is the output-local center snapshotted at command creation and
-/// `content` is the content point displayed there, so the viewed content
-/// stays centered while the level animates.
+/// `display` is the output-local position snapshotted at command creation and
+/// `content` is the content point displayed there. Neither follows the pointer.
 #[derive(Debug, Clone, Copy)]
 pub struct LockedAnchor {
     content: Point<f64, Logical>,
@@ -223,7 +221,7 @@ pub struct LockedAnchor {
 
 /// A viewport restore driven by an [`Animation`] over progress `0 → 1`.
 ///
-/// Used to return from a `hold-zoom` override: unlike a command, which keeps
+/// Used to return from a `zoom hold=true` override: unlike a command, which keeps
 /// an action anchor in place, a restore moves the whole viewport back to a
 /// saved state. The level still animates in `log2` space between
 /// `from_level` and `to_level`, while the focal point interpolates linearly
@@ -635,7 +633,7 @@ impl OutputZoomState {
     /// The level that incremental zoom actions operate on.
     ///
     /// This is the current user intent: the level `zoom-in`/`zoom-out` and
-    /// `toggle-zoom` base their next target on. It coincides with
+    /// `zoom` base their next target on. It coincides with
     /// [`target_level()`](Self::target_level): during a gesture it is the
     /// level set by the latest update, during a restore the saved target.
     pub fn intent_level(&self) -> f64 {
@@ -858,24 +856,33 @@ impl OutputZoomState {
 
     /// Transitions the state machine into its locked counterpart.
     fn lock(&mut self) {
-        // The displayed camera position and the center anchor are derived
-        // from the current state, so sample them before taking it apart.
-        let current_focal = self.focal();
         let center = self.view().view_size.to_point().downscale(2.);
         let center_content = self.viewport_transform().apply_inverse(center);
+        self.lock_at(center_content, center);
+    }
+
+    /// Locks with a fixed content/display anchor instead of enabling follow.
+    fn lock_at(
+        &mut self,
+        anchor_content: Point<f64, Logical>,
+        anchor_display: Point<f64, Logical>,
+    ) {
+        let current_focal = self.focal();
         let displayed_level = self.level();
 
         *self = match self.take() {
             Self::Idle(view) | Self::Follow { view, .. } | Self::Locked(view) => Self::Locked(view),
             Self::Zooming { view, zooming } => {
                 let command = match zooming {
-                    ZoomingState::Command(c) => Self::lock_command(c, center_content, center),
+                    ZoomingState::Command(c) => {
+                        Self::lock_command(c, anchor_content, anchor_display)
+                    }
                     ZoomingState::Restore(r) => Self::restore_to_locked_command(
                         r,
                         displayed_level,
                         current_focal,
-                        center_content,
-                        center,
+                        anchor_content,
+                        anchor_display,
                     ),
                 };
                 Self::LockedZooming {
@@ -887,8 +894,8 @@ impl OutputZoomState {
                 view,
                 zooming: LockedZoomingState::Command(Self::lock_command(
                     zooming,
-                    center_content,
-                    center,
+                    anchor_content,
+                    anchor_display,
                 )),
             },
             Self::Gesture { view, gesture } => Self::LockedGesture {
@@ -904,11 +911,16 @@ impl OutputZoomState {
                 },
             },
             Self::LockedZooming { view, zooming } => {
-                // Already locked: re-anchor on the current center content.
+                // Already locked: replace the fixed anchor without restarting.
                 let zooming = match zooming {
-                    LockedZoomingState::Command(c) => LockedZoomingState::Command(
-                        Self::reanchor_locked_command(c, current_focal, center_content, center),
-                    ),
+                    LockedZoomingState::Command(c) => {
+                        LockedZoomingState::Command(Self::reanchor_locked_command(
+                            c,
+                            current_focal,
+                            anchor_content,
+                            anchor_display,
+                        ))
+                    }
                 };
                 Self::LockedZooming { view, zooming }
             }
@@ -926,8 +938,7 @@ impl OutputZoomState {
 
     /// Converts an unlocked command into its locked counterpart.
     ///
-    /// The animation is moved over unchanged; only the anchor is replaced by
-    /// the viewport-center anchor.
+    /// The animation is moved over unchanged; only the fixed anchor is replaced.
     fn lock_command(
         c: ZoomCommandState,
         center_content: Point<f64, Logical>,
@@ -1187,6 +1198,21 @@ impl OutputZoomState {
         self.start_command(level, anchor, clock, config, CommandDirection::Value);
     }
 
+    /// Activates a pointer-anchored preset and locks its camera immediately.
+    /// No intermediate unlocked state is presented.
+    pub fn set_target_level_and_lock(
+        &mut self,
+        level: f64,
+        anchor: Point<f64, Logical>,
+        clock: &Clock,
+        config: niri_config::Animation,
+    ) {
+        let display = self.viewport_transform().apply(anchor);
+        self.unlock(anchor);
+        self.set_target_level(level, anchor, clock, config);
+        self.lock_at(anchor, display);
+    }
+
     /// Starts a `zoom-in` command towards `target`.
     ///
     /// `target` is the level resolved from the current intent by the caller
@@ -1267,7 +1293,15 @@ impl OutputZoomState {
         }
 
         if config.off {
+            let pointer_anchored_lock = self.is_locked()
+                && matches!(direction, CommandDirection::In | CommandDirection::Out);
+            if pointer_anchored_lock {
+                self.unlock(anchor);
+            }
             self.set_level_immediate(target, anchor);
+            if pointer_anchored_lock {
+                self.lock();
+            }
             return;
         }
 
@@ -1282,10 +1316,17 @@ impl OutputZoomState {
         );
 
         if self.is_locked() {
-            // A locked camera does not track the pointer: zoom around the
-            // viewport center so the viewed content stays centered.
-            let center = self.view().view_size.to_point().downscale(2.);
-            let center_content = self.viewport_transform().apply_inverse(center);
+            // Incremental commands capture the pointer; absolute commands
+            // and restores retain their viewport-center policy.
+            let (content, display) = match direction {
+                CommandDirection::In | CommandDirection::Out => {
+                    (anchor, self.viewport_transform().apply(anchor))
+                }
+                CommandDirection::Value => {
+                    let center = self.view().view_size.to_point().downscale(2.);
+                    (self.viewport_transform().apply_inverse(center), center)
+                }
+            };
             let view = *self.view();
 
             let command = if target == 1. {
@@ -1302,10 +1343,7 @@ impl OutputZoomState {
             } else {
                 let payload = LockedZoomCommand {
                     animation,
-                    anchor: LockedAnchor {
-                        content: center_content,
-                        display: center,
-                    },
+                    anchor: LockedAnchor { content, display },
                 };
                 match direction {
                     CommandDirection::In => LockedCommandState::In { target, payload },
@@ -4018,7 +4056,7 @@ mod tests {
         let snapshot = snapshot_of(&state);
         assert_eq!(snapshot.target_level, 1.);
 
-        // The temporary hold-zoom state: 2x around a different focal point.
+        // The temporary zoom hold state: 2x around a different focal point.
         let hold_focal = Point::from((1400., 800.));
         state.set_level_immediate(2., hold_focal);
         assert_point_eq(state.focal(), hold_focal);

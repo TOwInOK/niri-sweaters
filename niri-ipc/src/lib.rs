@@ -1013,17 +1013,17 @@ pub enum Action {
     ///
     /// Zooms the output under the pointer, or the focused output if the pointer is not on any
     /// output. If the target zoom level is above 1, resets it to 1; otherwise sets it to `level`.
-    ToggleZoom {
+    Zoom {
         /// Zoom level to toggle to, must be greater than 1.
         #[cfg_attr(feature = "clap", arg(allow_hyphen_values = true))]
         level: f64,
         /// Lock the viewport while zoomed in.
         ///
-        /// Zooming in also locks the zoomed viewport so it does not follow the pointer; toggling
-        /// back to 1 unlocks it.
+        /// Zooming in is anchored at the pointer and immediately locks the viewport so it
+        /// does not follow pointer movement; toggling back to 1 unlocks it.
         #[cfg_attr(feature = "clap", arg(long))]
         #[serde(default)]
-        hold: bool,
+        lock: bool,
     },
 }
 
@@ -2262,13 +2262,13 @@ mod tests {
             Action::SetZoomLevel { level: 2.5 },
             Action::ResetZoom {},
             Action::ZoomLock {},
-            Action::ToggleZoom {
+            Action::Zoom {
                 level: 2.,
-                hold: false,
+                lock: false,
             },
-            Action::ToggleZoom {
+            Action::Zoom {
                 level: 2.,
-                hold: true,
+                lock: true,
             },
         ] {
             let json = serde_json::to_string(&action).unwrap();

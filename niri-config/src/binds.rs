@@ -398,18 +398,14 @@ pub enum Action {
     SetZoomLevel(#[knuffel(argument)] FloatOrInt<1, { i32::MAX }>),
     ResetZoom,
     ZoomLock(#[knuffel(property(name = "hold"), default)] bool),
-    ToggleZoom(
+    Zoom(
         #[knuffel(argument)] ZoomLevelPreset,
         #[knuffel(property(name = "hold"), default)] bool,
-    ),
-    HoldZoom(
-        #[knuffel(argument)] ZoomLevelPreset,
-        #[knuffel(property(name = "hold"), default)] bool,
+        #[knuffel(property(name = "lock"), default)] bool,
     ),
 }
 
-/// A zoom level preset for `toggle-zoom` and `hold-zoom`: a finite number
-/// strictly greater than 1.
+/// A zoom level preset for `zoom`: a finite number strictly greater than 1.
 ///
 /// A preset of 1 would make activation a no-op, so unlike [`FloatOrInt`] the
 /// lower bound is exclusive. Values above `zoom.max-zoom` are allowed here and
@@ -782,8 +778,8 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::SetZoomLevel { level } => Self::SetZoomLevel(FloatOrInt(level)),
             niri_ipc::Action::ResetZoom {} => Self::ResetZoom,
             niri_ipc::Action::ZoomLock {} => Self::ZoomLock(false),
-            niri_ipc::Action::ToggleZoom { level, hold } => {
-                Self::ToggleZoom(ZoomLevelPreset(level), hold)
+            niri_ipc::Action::Zoom { level, lock } => {
+                Self::Zoom(ZoomLevelPreset(level), false, lock)
             }
         }
     }
@@ -1001,7 +997,7 @@ where
 
                     // Scroll triggers have no release event, so a hold bound to
                     // one could never end.
-                    let needs_release = matches!(action, Action::HoldZoom(..))
+                    let needs_release = matches!(action, Action::Zoom(_, true, _))
                         || matches!(action, Action::ZoomLock(true));
                     if needs_release
                         && matches!(
@@ -1245,17 +1241,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_toggle_and_hold_zoom() {
+    fn parse_zoom_level_action() {
         let config = crate::Config::parse_mem(
             r#"
             binds {
-                Mod+Z { toggle-zoom 2.0; }
-                Mod+Shift+Z { toggle-zoom 4; }
-                Mod+Alt+Z { toggle-zoom 2.0 hold=true; }
-                Mod+X { hold-zoom 2.0; }
-                Mod+MouseBack { hold-zoom 3; }
-                Mod+TabletStylusButton1 { hold-zoom 1.5; }
-                Mod+Alt+X { hold-zoom 2.0 hold=true; }
+                Mod+Z { zoom 2.0; }
+                Mod+Shift+Z { zoom 4; }
+                Mod+Alt+Z { zoom 2.0 lock=true; }
+                Mod+X { zoom 2.0 hold=true; }
+                Mod+MouseBack { zoom 3 hold=true; }
+                Mod+TabletStylusButton1 { zoom 1.5 hold=true; }
+                Mod+Alt+X { zoom 2.0 hold=true lock=true; }
                 Mod+L { zoom-lock; }
                 Mod+Alt+L { zoom-lock hold=true; }
             }
@@ -1267,13 +1263,13 @@ mod tests {
         assert_eq!(
             actions,
             [
-                &Action::ToggleZoom(ZoomLevelPreset(2.), false),
-                &Action::ToggleZoom(ZoomLevelPreset(4.), false),
-                &Action::ToggleZoom(ZoomLevelPreset(2.), true),
-                &Action::HoldZoom(ZoomLevelPreset(2.), false),
-                &Action::HoldZoom(ZoomLevelPreset(3.), false),
-                &Action::HoldZoom(ZoomLevelPreset(1.5), false),
-                &Action::HoldZoom(ZoomLevelPreset(2.), true),
+                &Action::Zoom(ZoomLevelPreset(2.), false, false),
+                &Action::Zoom(ZoomLevelPreset(4.), false, false),
+                &Action::Zoom(ZoomLevelPreset(2.), false, true),
+                &Action::Zoom(ZoomLevelPreset(2.), true, false),
+                &Action::Zoom(ZoomLevelPreset(3.), true, false),
+                &Action::Zoom(ZoomLevelPreset(1.5), true, false),
+                &Action::Zoom(ZoomLevelPreset(2.), true, true),
                 &Action::ZoomLock(false),
                 &Action::ZoomLock(true),
             ]
@@ -1285,14 +1281,14 @@ mod tests {
         // Presets must be finite and strictly greater than 1; 1x is not a
         // meaningful activation level.
         for action in [
-            "toggle-zoom 1",
-            "toggle-zoom 1.0",
-            "toggle-zoom 0.5",
-            "toggle-zoom 0",
-            "toggle-zoom -1",
-            "hold-zoom 1",
-            "hold-zoom 0.5",
-            "hold-zoom -2",
+            "zoom 1",
+            "zoom 1.0",
+            "zoom 0.5",
+            "zoom 0",
+            "zoom -1",
+            "zoom 1 hold=true",
+            "zoom 0.5 lock=true",
+            "zoom -2 hold=true lock=true",
         ] {
             let text = format!("binds {{ Mod+Z {{ {action}; }} }}");
             assert!(
@@ -1303,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_hold_zoom_rejects_scroll_triggers() {
+    fn parse_zoom_hold_rejects_scroll_triggers() {
         // Scroll triggers have no release event, so a hold bound to one could
         // never end.
         for trigger in [
@@ -1316,7 +1312,7 @@ mod tests {
             "TouchpadScrollLeft",
             "TouchpadScrollRight",
         ] {
-            for action in ["hold-zoom 2.0", "zoom-lock hold=true"] {
+            for action in ["zoom 2.0 hold=true", "zoom-lock hold=true"] {
                 let text = format!("binds {{\n    Mod+{trigger} {{ {action}; }}\n}}");
                 assert!(
                     crate::Config::parse_mem(&text).is_err(),
@@ -1326,7 +1322,7 @@ mod tests {
         }
 
         // Press-only actions stay valid on scroll triggers.
-        for action in ["toggle-zoom 2.0", "zoom-lock"] {
+        for action in ["zoom 2.0", "zoom 2.0 lock=true", "zoom-lock"] {
             let text = format!("binds {{\n    Mod+WheelScrollUp {{ {action}; }}\n}}");
             assert!(crate::Config::parse_mem(&text).is_ok());
         }

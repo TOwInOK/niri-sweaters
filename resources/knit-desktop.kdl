@@ -170,8 +170,8 @@ binds {
     Alt+Shift+E { quit skip-confirmation=true; }
     Alt+Space { toggle-window-floating; }
 
-    Alt+Z repeat=false { toggle-zoom 2.0 hold=false; }
-    Alt+X repeat=false { hold-zoom 4.0 hold=false; }
+    Alt+Z repeat=false { zoom 2.0; }
+    Alt+X repeat=false { zoom 4.0 hold=true; }
 
     Alt+WheelScrollUp   { zoom-in; }
     Alt+WheelScrollDown { zoom-out; }

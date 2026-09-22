@@ -74,7 +74,7 @@ With `--json`, the response is a list of objects with the following fields:
 
 - `output`: the output name.
 - `level`: the currently displayed zoom level. While a zoom transition is in progress this is the current animation sample; during a pinch gesture it is the level set by the latest gesture update.
-- `target_level`: the zoom level the output is transitioning towards. It equals `level` at rest and during a pinch gesture, and differs while a zoom animation or a `hold-zoom` restore is in progress.
+- `target_level`: the zoom level the output is transitioning towards. It equals `level` at rest and during a pinch gesture, and differs while a zoom animation or a `zoom hold=true` restore is in progress.
 - `effective_level`: currently the same as `level`.
 - `focal`: the fixed point of the current zoom transform in output-local logical coordinates, as `[x, y]`.
 - `locked`: whether the zoom lock is enabled.

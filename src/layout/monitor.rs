@@ -2509,6 +2509,14 @@ impl<W: LayoutElement> Monitor<W> {
         self.zoom.set_target_level(level, anchor, &clock, config);
     }
 
+    /// Activates a pointer-anchored zoom preset with tracking locked immediately.
+    pub fn zoom_to_and_lock(&mut self, level: f64, anchor: Point<f64, Logical>) {
+        let clock = self.clock.clone();
+        let config = self.options.animations.zoom.0;
+        self.zoom
+            .set_target_level_and_lock(level, anchor, &clock, config);
+    }
+
     /// Starts an animated zoom-in transition of the desktop zoom level
     /// towards `target`, keeping `anchor` at its displayed position where
     /// possible.
@@ -2541,7 +2549,7 @@ impl<W: LayoutElement> Monitor<W> {
     /// `snapshot` state: the level animates towards `snapshot.target_level`
     /// while the focal point interpolates towards `snapshot.focal`.
     ///
-    /// Used to end a `hold-zoom` session. Uses the current `animations.zoom`
+    /// Used to end a `zoom hold=true` session. Uses the current `animations.zoom`
     /// config; when it is `off` the snapshot is restored immediately.
     pub fn zoom_restore(&mut self, snapshot: ZoomSnapshot) {
         let clock = self.clock.clone();

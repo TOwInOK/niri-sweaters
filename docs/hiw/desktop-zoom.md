@@ -8,18 +8,18 @@ User controls are documented in [Accessibility](../wiki/Accessibility.md) and [k
 
 Paths below are relative to the repository root.
 
-| Area | Source | Responsibility |
-| --- | --- | --- |
-| Zoom domain | `src/layout/zoom.rs` | Per-output FSM, commands, follow physics, restore and gesture viewport ownership |
-| Output integration | `src/layout/monitor.rs` | Owns `OutputZoomState`, Overview handoff payload and output geometry |
-| Overview lifecycle | `src/layout/mod.rs` | Captures/rebases handoffs before replacing Overview progress; workspace and drag geometry |
-| Input | `src/input/mod.rs` | Actions, hold sessions, pinch protocol routing, Overview entry and pointer rebasing |
-| Presentation | `src/niri.rs` | Separate scene/pointer transforms, hit testing, rendering and per-frame tracking |
-| Geometry primitive | `src/utils/view.rs` | `ViewportTransform` and inverse mapping |
-| Grabs | `src/input/{move_grab,spatial_movement_grab,touch_overview_grab}.rs` | Convert pointer positions and deltas to scene coordinates |
-| Diagnostics | `src/ui/zoom_debug.rs` | Passive screen-space overlay |
-| Public interfaces | `niri-config`, `niri-ipc`, `src/ipc/server.rs` | Configuration/actions and derived IPC state |
-| Regression coverage | `src/tests/zoom.rs` | Rendered frames, input protocols and lifecycle integration |
+| Area                | Source                                                               | Responsibility                                                                            |
+| ------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Zoom domain         | `src/layout/zoom.rs`                                                 | Per-output FSM, commands, follow physics, restore and gesture viewport ownership          |
+| Output integration  | `src/layout/monitor.rs`                                              | Owns `OutputZoomState`, Overview handoff payload and output geometry                      |
+| Overview lifecycle  | `src/layout/mod.rs`                                                  | Captures/rebases handoffs before replacing Overview progress; workspace and drag geometry |
+| Input               | `src/input/mod.rs`                                                   | Actions, hold sessions, pinch protocol routing, Overview entry and pointer rebasing       |
+| Presentation        | `src/niri.rs`                                                        | Separate scene/pointer transforms, hit testing, rendering and per-frame tracking          |
+| Geometry primitive  | `src/utils/view.rs`                                                  | `ViewportTransform` and inverse mapping                                                   |
+| Grabs               | `src/input/{move_grab,spatial_movement_grab,touch_overview_grab}.rs` | Convert pointer positions and deltas to scene coordinates                                 |
+| Diagnostics         | `src/ui/zoom_debug.rs`                                               | Passive screen-space overlay                                                              |
+| Public interfaces   | `niri-config`, `niri-ipc`, `src/ipc/server.rs`                       | Configuration/actions and derived IPC state                                               |
+| Regression coverage | `src/tests/zoom.rs`                                                  | Rendered frames, input protocols and lifecycle integration                                |
 
 Desktop Zoom magnifies the rendered desktop, not client DPI. Clients keep their scale; magnification does not request higher-resolution client buffers. Use output/UI scaling for permanent UI sizing.
 
@@ -27,16 +27,16 @@ Desktop Zoom magnifies the rendered desktop, not client DPI. Clients keep their 
 
 `Monitor` owns one `OutputZoomState` per output. It is an enum with **eight** variants, not a struct of independent flags:
 
-| Variant | Payload / owner |
-| --- | --- |
-| `Idle(ZoomView)` | Resting unlocked view; may be above 1× |
-| `Follow { view, follow }` | `FollowState` moves the focal at a resting level |
-| `Zooming { view, zooming }` | `ZoomingState::Command` or `ZoomingState::Restore` |
-| `ZoomingFollow { view, zooming, follow }` | `ZoomCommandState` plus `CombinedFollow` |
-| `Gesture { view, gesture }` | `GesturePayload` directly owns the level |
-| `Locked(ZoomView)` | Resting locked view |
-| `LockedZooming { view, zooming }` | `LockedZoomingState::Command(LockedCommandState)` |
-| `LockedGesture { view, gesture }` | `LockedGesturePayload` directly owns the level |
+| Variant                                   | Payload / owner                                    |
+| ----------------------------------------- | -------------------------------------------------- |
+| `Idle(ZoomView)`                          | Resting unlocked view; may be above 1×             |
+| `Follow { view, follow }`                 | `FollowState` moves the focal at a resting level   |
+| `Zooming { view, zooming }`               | `ZoomingState::Command` or `ZoomingState::Restore` |
+| `ZoomingFollow { view, zooming, follow }` | `ZoomCommandState` plus `CombinedFollow`           |
+| `Gesture { view, gesture }`               | `GesturePayload` directly owns the level           |
+| `Locked(ZoomView)`                        | Resting locked view                                |
+| `LockedZooming { view, zooming }`         | `LockedZoomingState::Command(LockedCommandState)`  |
+| `LockedGesture { view, gesture }`         | `LockedGesturePayload` directly owns the level     |
 
 `ZoomView` contains committed `level`, `focal`, and `view_size`. Payload fields are private; callers use domain operations rather than constructing or mutating payloads.
 
@@ -120,7 +120,9 @@ Resting `FollowState` moves the focal; `CombinedFollow` moves `FlexibleAnchor.di
 
 ### Lock anchoring
 
-Autonomous locked commands preserve the content at the viewport center. Locking samples the current presentation, drops combined follow, and changes anchor policy without a jump. Locking during Restore abandons its focal destination and converts it to a center-anchored command.
+Locked `zoom-in` and `zoom-out` capture the canonical pointer and its displayed position at each command. That anchor stays fixed during the animation even if the pointer moves; bounds clamping and the fixed-focal `ToIdentity` case still apply. Absolute locked commands and Restore retain viewport-center anchoring. Standalone locking samples the current presentation, drops combined follow, and changes anchor policy without a jump. Locking during Restore abandons its focal destination and converts it to a center-anchored command.
+
+`zoom <LEVEL> lock=true` activation also uses a pointer anchor: `set_target_level_and_lock` anchors the transition on the canonical pointer at its current displayed position and locks tracking immediately, so no unlocked frame or deadzone drift is presented. This covers both the toggle's zoom-in and a `hold=true` press; pressed while already locked it re-anchors on the pointer rather than the center. The toggle back to 1× runs as a `ToIdentity` command that keeps its fixed focal across the unlock, so the zoom-out does not re-anchor on the pointer.
 
 Unlocking an autonomous command re-anchors it on the **canonical pointer**, using its currently displayed position. It does not restore an old follow. `ToIdentity` retains its fixed-focal special case.
 
@@ -128,7 +130,7 @@ Gesture lock semantics are different: a gesture begun locked has a center anchor
 
 ### Hold session and Restore
 
-Hold sessions live outside the viewport FSM. Press records the owning output and a `ZoomSnapshot` of displayed level, derived target and focal, then issues the requested command. Release targets that output even if the pointer has moved elsewhere.
+Hold sessions live outside the viewport FSM. Press records the owning output and a `ZoomSnapshot` of displayed level, derived target and focal, then issues the requested command. A `lock=true` press additionally captures the pre-press lock state for the release to restore, and issues the command through `set_target_level_and_lock`: pointer-anchored and locked from the first frame.
 
 Unlocked Restore animates progress 0→1: level interpolates in log space towards the saved **target**, focal towards the saved focal. At destination 1×, the source focal stays fixed until completion. A snapshot's sampled level is not the resting restore destination.
 
@@ -207,22 +209,22 @@ The debug overlay is a passive reader: deadzone outline and focal marker, screen
 
 - `zoom-in` / `zoom-out` multiply/divide derived intent by `increment-factor`, clamp to `[1, max-zoom]`, and snap near identity using `ZOOM_SNAP_TO_ONE_EPSILON`.
 - `set-zoom-level` validates the requested level; `reset-zoom` requests identity.
-- `toggle-zoom` uses intent, not the sampled animation level. Its `hold=true` option also locks while zoomed and unlocks on toggling back.
-- `zoom-lock hold=true` temporarily inverts lock state; release restores it. `hold-zoom` restores the previous view, with optional temporary locking.
+- `zoom` uses intent, not the sampled animation level. Its `lock=true` option activates pointer-anchored and locked from the first frame, and unlocks on toggling back.
+- `zoom-lock hold=true` temporarily inverts lock state; release restores it. `zoom hold=true` restores the previous view, with optional pointer-anchored locking via `lock=true`.
 - Hold actions requiring a physical release are bind-only, not IPC actions. Wheel triggers cannot provide that lifecycle.
 - The target is the output under the canonical pointer, falling back to the active output. Hold release uses its session's owning output.
 - Reducing `max-zoom` on config reload clamps existing Zoom state immediately, including locked outputs.
 
 `niri msg zoom` returns per-output `ZoomState` through `src/ipc/server.rs`:
 
-| Field | Current source / meaning |
-| --- | --- |
-| `output` | Output name |
-| `level` | `zoom.level()`: current Zoom presentation sample |
-| `target_level` | `zoom.target_level()`: derived intent |
-| `effective_level` | Currently also `zoom.level()` |
-| `focal` | `zoom.focal()` in output-local logical coordinates |
-| `locked` | `zoom.is_locked()` |
+| Field             | Current source / meaning                           |
+| ----------------- | -------------------------------------------------- |
+| `output`          | Output name                                        |
+| `level`           | `zoom.level()`: current Zoom presentation sample   |
+| `target_level`    | `zoom.target_level()`: derived intent              |
+| `effective_level` | Currently also `zoom.level()`                      |
+| `focal`           | `zoom.focal()` in output-local logical coordinates |
+| `locked`          | `zoom.is_locked()`                                 |
 
 After Overview entry, these Zoom levels are 1 and lock is false, even while the visible scene is still magnified by the handoff. **IPC does not expose the total Overview camera scale or residual transform.** Do not infer rendered scene geometry from `effective_level` alone. The IPC schema remains separate from internal FSM payloads.
 
@@ -239,7 +241,7 @@ Relevant existing coverage:
 
 Run from the repository root:
 
-~~~sh
+```sh
 cargo test --lib zoom_overview_handoff
 cargo test --lib zoom
 cargo test --lib
@@ -248,7 +250,7 @@ cargo test -p niri-ipc
 cargo check --workspace
 cargo test --all --exclude niri-visual-tests
 cargo +nightly fmt --all -- --check
-~~~
+```
 
 These are verification commands, not a claim that every visual configuration has been covered. For presentation changes, also build and launch an isolated nested compositor from an existing Wayland session, using a dedicated config and its own IPC socket. Exercise zoomed entry, early reversal, repeated open, pointer motion and drag; compare intermediate frames, not only endpoints. Do not restart the user's main compositor or update golden images merely to hide a discrepancy.
 

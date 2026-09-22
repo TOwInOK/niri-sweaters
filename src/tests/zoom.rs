@@ -731,7 +731,7 @@ fn zoom_debug_hold_restore_focal() {
     set_zoom(&mut f, &output, 1., Point::from((0., 0.)));
     let stored = zoom_focal(&mut f, &output);
 
-    // A hold-zoom to 2x anchors at the cursor: the marker follows it in the
+    // A zoom hold to 2x anchors at the cursor: the marker follows it in the
     // active style.
     f.niri_state().move_cursor(Point::from((1200., 500.)));
     let trigger = key_trigger(30);
@@ -1963,7 +1963,7 @@ fn zoom_action_zoom_out_snaps_to_one() {
 }
 
 #[test]
-fn zoom_action_locked_zooms_around_viewport_center() {
+fn zoom_action_locked_zooms_around_pointer() {
     let mut f = set_up();
     let output = f.niri_output(1);
     f.niri_state().move_cursor(Point::from((150., 100.)));
@@ -1978,12 +1978,12 @@ fn zoom_action_locked_zooms_around_viewport_center() {
 
     assert_abs_diff_eq!(zoom_level(&mut f, &output), 1.2, epsilon = EPS);
     let focal = zoom_focal(&mut f, &output);
-    assert_abs_diff_eq!(focal.x, 960., epsilon = EPS);
-    assert_abs_diff_eq!(focal.y, 360., epsilon = EPS);
+    assert_abs_diff_eq!(focal.x, 150., epsilon = EPS);
+    assert_abs_diff_eq!(focal.y, 100., epsilon = EPS);
 }
 
 #[test]
-fn zoom_action_locked_keeps_viewport_center_fixed() {
+fn zoom_action_locked_set_level_keeps_viewport_center_fixed() {
     let mut f = set_up();
     let output = f.niri_output(1);
 
@@ -2004,7 +2004,8 @@ fn zoom_action_locked_keeps_viewport_center_fixed() {
         .unwrap()
         .zoom_mut()
         .set_locked(true, Point::from((960., 360.)));
-    f.niri_state().do_action(Action::ZoomIn, false);
+    f.niri_state()
+        .do_action(Action::SetZoomLevel(FloatOrInt(2.4)), false);
 
     let center_after = crate::utils::center_f64(
         f.niri()
@@ -2018,6 +2019,58 @@ fn zoom_action_locked_keeps_viewport_center_fixed() {
     assert_abs_diff_eq!(center_after.y, center_before.y, epsilon = EPS);
     // The focal point moved to keep the viewport center fixed.
     assert_ne!(zoom_focal(&mut f, &output), Point::from((100., 100.)));
+}
+
+#[test]
+fn zoom_locked_incremental_commands_capture_pointer_anchor() {
+    for animated in [false, true] {
+        let mut f = if animated {
+            set_up_animated()
+        } else {
+            set_up()
+        };
+        let output = f.niri_output(1);
+        freeze_clock(&mut f);
+        set_zoom(&mut f, &output, 2., Point::from((500., 300.)));
+        f.niri_state().do_action(Action::ZoomLock(false), false);
+
+        for (action, pointer, expected) in [
+            (Action::ZoomIn, Point::from((700., 350.)), 2.4),
+            (Action::ZoomOut, Point::from((800., 400.)), 2.),
+        ] {
+            f.niri_state().move_cursor(pointer);
+            let display = displayed_pointer_location(&mut f);
+            f.niri_state().do_action(action, false);
+            for _ in 0..5 {
+                advance_clock(&mut f, 40);
+                let mapped = f
+                    .niri()
+                    .layout
+                    .monitor_for_output(&output)
+                    .unwrap()
+                    .zoom()
+                    .viewport_transform()
+                    .apply(pointer);
+                assert_abs_diff_eq!(mapped.x, display.x, epsilon = EPS);
+                assert_abs_diff_eq!(mapped.y, display.y, epsilon = EPS);
+                assert!(zoom_locked(&mut f, &output));
+                // Motion after the command must not move its captured anchor.
+                f.niri_state().move_cursor(Point::from((900., 450.)));
+            }
+            advance_clock(&mut f, 5000);
+            assert_abs_diff_eq!(zoom_level(&mut f, &output), expected, epsilon = EPS);
+            let mapped = f
+                .niri()
+                .layout
+                .monitor_for_output(&output)
+                .unwrap()
+                .zoom()
+                .viewport_transform()
+                .apply(pointer);
+            assert_abs_diff_eq!(mapped.x, display.x, epsilon = EPS);
+            assert_abs_diff_eq!(mapped.y, display.y, epsilon = EPS);
+        }
+    }
 }
 
 #[test]
@@ -2094,7 +2147,7 @@ fn zoom_action_reset_zoom() {
 }
 
 #[test]
-fn zoom_action_toggle_zoom_lock() {
+fn zoom_action_zoom_lock() {
     let mut f = set_up();
     let output = f.niri_output(1);
     f.niri_state().move_cursor(Point::from((150., 100.)));
@@ -2404,22 +2457,22 @@ fn reload_with_animated(f: &mut Fixture, extra: &str) {
     f.niri_state().reload_config(Ok(config));
 }
 
-// --- toggle-zoom / hold-zoom ---
+// --- zoom ---
 
-/// Simulates a `hold-zoom` bind press: the resolved bind is dispatched with
-/// the physical trigger identity, exactly as the input handlers do.
+/// Simulates a `zoom hold=true` bind press: the resolved bind is dispatched
+/// with the physical trigger identity, exactly as the input handlers do.
 fn hold_press(f: &mut Fixture, trigger: ZoomHoldTrigger, level: f64) {
-    hold_press_locked(f, trigger, level, false);
+    hold_press_locking(f, trigger, level, false);
 }
 
-/// Simulates a `hold-zoom hold=true` bind press.
-fn hold_press_locked(f: &mut Fixture, trigger: ZoomHoldTrigger, level: f64, hold: bool) {
+/// Simulates a `zoom hold=true lock=true` bind press.
+fn hold_press_locking(f: &mut Fixture, trigger: ZoomHoldTrigger, level: f64, lock: bool) {
     let bind = Bind {
         key: Key {
             trigger: Trigger::Keysym(Keysym::x),
             modifiers: Modifiers::COMPOSITOR,
         },
-        action: Action::HoldZoom(ZoomLevelPreset(level), hold),
+        action: Action::Zoom(ZoomLevelPreset(level), true, lock),
         repeat: true,
         cooldown: None,
         allow_when_locked: false,
@@ -2456,30 +2509,30 @@ fn key_trigger(code: u32) -> ZoomHoldTrigger {
 }
 
 #[test]
-fn zoom_action_toggle_zoom() {
+fn zoom_action_zoom() {
     let mut f = set_up();
     let output = f.niri_output(1);
     f.niri_state().move_cursor(Point::from((150., 100.)));
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, false), false);
     assert_eq!(zoom_level(&mut f, &output), 2.);
     assert_eq!(zoom_target_level(&mut f, &output), 2.);
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, false), false);
     assert_eq!(zoom_level(&mut f, &output), 1.);
     assert_eq!(zoom_target_level(&mut f, &output), 1.);
 }
 
 #[test]
-fn zoom_action_toggle_zoom_after_manual_zoom() {
+fn zoom_action_zoom_after_manual_zoom() {
     let mut f = set_up();
     let output = f.niri_output(1);
     f.niri_state().move_cursor(Point::from((150., 100.)));
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, false), false);
     assert_eq!(zoom_level(&mut f, &output), 2.);
 
     f.niri_state().do_action(Action::ZoomIn, false);
@@ -2488,16 +2541,16 @@ fn zoom_action_toggle_zoom_after_manual_zoom() {
     // The preset is an entry level, not a pinned session: toggling off any
     // active zoom returns to 1.
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, false), false);
     assert_eq!(zoom_level(&mut f, &output), 1.);
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, false), false);
     assert_eq!(zoom_level(&mut f, &output), 2.);
 }
 
 #[test]
-fn zoom_action_toggle_zoom_uses_target_level() {
+fn zoom_action_zoom_uses_target_level() {
     let mut f = set_up_with_config(ANIMATED_CONFIG);
     let output = f.niri_output(1);
     f.niri_state().move_cursor(Point::from((150., 100.)));
@@ -2511,7 +2564,7 @@ fn zoom_action_toggle_zoom_uses_target_level() {
     assert_eq!(zoom_target_level(&mut f, &output), 1.);
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(3.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(3.), false, false), false);
     assert_eq!(zoom_target_level(&mut f, &output), 3.);
 
     advance_clock(&mut f, 5000);
@@ -2519,19 +2572,19 @@ fn zoom_action_toggle_zoom_uses_target_level() {
 }
 
 #[test]
-fn zoom_action_toggle_zoom_clamps_to_max() {
+fn zoom_action_zoom_clamps_to_max() {
     let mut f = set_up_with_zoom("zoom { max-zoom 3; }");
     let output = f.niri_output(1);
     f.niri_state().move_cursor(Point::from((150., 100.)));
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(8.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(8.), false, false), false);
     assert_eq!(zoom_level(&mut f, &output), 3.);
     assert_eq!(zoom_target_level(&mut f, &output), 3.);
 }
 
 #[test]
-fn zoom_action_toggle_zoom_targets_pointer_output() {
+fn zoom_action_zoom_targets_pointer_output() {
     let mut f = set_up();
     let output1 = f.niri_output(1);
     f.add_output(2, (1920, 720));
@@ -2543,30 +2596,30 @@ fn zoom_action_toggle_zoom_targets_pointer_output() {
     f.niri_state().move_cursor(Point::from((150., 100.)));
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, false), false);
 
     assert_eq!(zoom_level(&mut f, &output1), 2.);
     assert_eq!(zoom_level(&mut f, &output2), 1.);
 }
 
 #[test]
-fn zoom_action_toggle_zoom_ipc_parse() {
+fn zoom_action_zoom_ipc_parse() {
     use clap::Parser;
 
-    let action = niri_ipc::Action::try_parse_from(["niri msg action", "toggle-zoom", "2.0"])
-        .expect("toggle-zoom must parse from CLI");
-    let niri_ipc::Action::ToggleZoom { level, hold } = action else {
-        panic!("expected ToggleZoom, got {action:?}");
+    let action = niri_ipc::Action::try_parse_from(["niri msg action", "zoom", "2.0"])
+        .expect("zoom must parse from CLI");
+    let niri_ipc::Action::Zoom { level, lock } = action else {
+        panic!("expected Zoom, got {action:?}");
     };
     assert_eq!(level, 2.);
-    assert!(!hold);
+    assert!(!lock);
 
     // The IPC action converts into the config action.
-    let action = Action::from(niri_ipc::Action::ToggleZoom {
+    let action = Action::from(niri_ipc::Action::Zoom {
         level: 2.5,
-        hold: false,
+        lock: false,
     });
-    assert_eq!(action, Action::ToggleZoom(ZoomLevelPreset(2.5), false));
+    assert_eq!(action, Action::Zoom(ZoomLevelPreset(2.5), false, false));
 }
 
 #[test]
@@ -2753,7 +2806,7 @@ fn zoom_hold_survives_config_reload() {
             skip-at-startup
         }
         binds {
-            Mod+X { hold-zoom 2.0; }
+            Mod+X { zoom 2.0 hold=true; }
         }
         "#,
     );
@@ -2808,8 +2861,8 @@ fn zoom_hold_is_not_repeatable() {
             trigger: Trigger::Keysym(Keysym::x),
             modifiers: Modifiers::COMPOSITOR,
         },
-        action: Action::HoldZoom(ZoomLevelPreset(2.), false),
-        // Even with the default repeatable flag, hold-zoom must not arm the
+        action: Action::Zoom(ZoomLevelPreset(2.), true, false),
+        // Even with the default repeatable flag, a zoom hold must not arm the
         // key repeat timer.
         repeat: true,
         cooldown: None,
@@ -2844,7 +2897,7 @@ fn zoom_hold_press_on_cooldown_starts_no_session() {
             trigger: Trigger::Keysym(Keysym::x),
             modifiers: Modifiers::COMPOSITOR,
         },
-        action: Action::HoldZoom(ZoomLevelPreset(2.), false),
+        action: Action::Zoom(ZoomLevelPreset(2.), true, false),
         repeat: true,
         cooldown: Some(Duration::from_secs(60)),
         allow_when_locked: false,
@@ -2910,15 +2963,15 @@ fn zoom_hold_toggle_and_reset_during_hold_then_restore() {
     hold_press(&mut f, trigger, 3.);
     assert_eq!(zoom_level(&mut f, &output), 3.);
 
-    // toggle-zoom during a hold does not end the session; it changes the
+    // A zoom toggle during a hold does not end the session; it changes the
     // hold-overridden zoom like a regular action.
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, false), false);
     assert_eq!(zoom_level(&mut f, &output), 1.);
     assert!(f.niri().zoom_hold.is_some());
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, false), false);
     assert_eq!(zoom_level(&mut f, &output), 2.);
 
     // reset-zoom during a hold is momentary too.
@@ -2944,7 +2997,7 @@ fn zoom_hold_pointer_button() {
             skip-at-startup
         }
         binds {
-            MouseBack { hold-zoom 2.0; }
+            MouseBack { zoom 2.0 hold=true; }
         }
         "#,
     );
@@ -3070,19 +3123,131 @@ fn zoom_hold_release_without_session_is_noop() {
 }
 
 #[test]
-fn zoom_toggle_locks_and_unlocks() {
+fn zoom_lock_flag_locks_and_unlocks() {
     let mut f = set_up();
     let output = f.niri_output(1);
     f.niri_state().move_cursor(Point::from((150., 100.)));
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), true), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, true), false);
     assert_eq!(zoom_level(&mut f, &output), 2.);
     assert!(zoom_locked(&mut f, &output));
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), true), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, true), false);
     assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert!(!zoom_locked(&mut f, &output));
+}
+
+#[test]
+fn zoom_lock_flag_anchors_on_pointer() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    // `zoom lock=true` zooms around the canonical pointer at its displayed
+    // position and locks from the start, so the focal point lands on the
+    // cursor, not the viewport center.
+    f.niri_state()
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, true), false);
+
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert!(zoom_locked(&mut f, &output));
+    let focal = zoom_focal(&mut f, &output);
+    assert_abs_diff_eq!(focal.x, 150., epsilon = EPS);
+    assert_abs_diff_eq!(focal.y, 100., epsilon = EPS);
+    assert_eq!(
+        displayed_pointer_location(&mut f),
+        Point::from((150., 100.))
+    );
+}
+
+#[test]
+fn zoom_lock_flag_suppresses_follow() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state()
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, true), false);
+    assert!(zoom_locked(&mut f, &output));
+
+    // Locked from the start: a pointer move clamps to the viewport instead
+    // of starting a deadzone follow, so the focal point stays put.
+    move_pointer(&mut f, id, 2000., 0.);
+    assert_eq!(pointer_location(&mut f), Point::from((1035., 100.)));
+    assert_eq!(zoom_focal(&mut f, &output), Point::from((150., 100.)));
+}
+
+#[test]
+fn zoom_hold_lock_anchors_on_pointer() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    // A `zoom hold=true lock=true` press anchors on the pointer like the
+    // toggle activation.
+    let trigger = key_trigger(30);
+    hold_press_locking(&mut f, trigger, 2., true);
+
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert!(zoom_locked(&mut f, &output));
+    let focal = zoom_focal(&mut f, &output);
+    assert_abs_diff_eq!(focal.x, 150., epsilon = EPS);
+    assert_abs_diff_eq!(focal.y, 100., epsilon = EPS);
+}
+
+#[test]
+fn zoom_hold_lock_anchors_displayed_pointer_position() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+
+    // Zoomed in, the canonical pointer and its displayed position diverge:
+    // at 1.5x around (960, 360) the cursor at (700, 400) is displayed at
+    // (570, 420). The locking hold anchors on that displayed position.
+    f.niri_state().move_cursor(Point::from((700., 400.)));
+    set_zoom(&mut f, &output, 1.5, Point::from((960., 360.)));
+    assert_eq!(
+        displayed_pointer_location(&mut f),
+        Point::from((570., 420.))
+    );
+
+    let trigger = key_trigger(30);
+    hold_press_locking(&mut f, trigger, 3., true);
+    assert_eq!(zoom_level(&mut f, &output), 3.);
+    assert!(zoom_locked(&mut f, &output));
+
+    // Keeping content (700, 400) displayed at (570, 420) at level 3 solves
+    // to focal (765, 390): neither the viewport center nor the canonical
+    // position as display.
+    let focal = zoom_focal(&mut f, &output);
+    assert_abs_diff_eq!(focal.x, 765., epsilon = EPS);
+    assert_abs_diff_eq!(focal.y, 390., epsilon = EPS);
+    assert_eq!(
+        displayed_pointer_location(&mut f),
+        Point::from((570., 420.))
+    );
+}
+
+#[test]
+fn zoom_hold_lock_release_restores_prior_view() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    // A non-center pre-hold view: the release restores it exactly, together
+    // with the unlocked state.
+    set_zoom(&mut f, &output, 1.5, Point::from((300., 200.)));
+    let focal = zoom_focal(&mut f, &output);
+
+    let trigger = key_trigger(30);
+    hold_press_locking(&mut f, trigger, 2., true);
+    assert!(zoom_locked(&mut f, &output));
+
+    hold_release(&mut f, trigger);
+    assert_eq!(zoom_level(&mut f, &output), 1.5);
+    assert_eq!(zoom_focal(&mut f, &output), focal);
     assert!(!zoom_locked(&mut f, &output));
 }
 
@@ -3093,7 +3258,7 @@ fn zoom_hold_lock_restores_lock_state() {
     f.niri_state().move_cursor(Point::from((150., 100.)));
 
     let trigger = key_trigger(30);
-    hold_press_locked(&mut f, trigger, 2., true);
+    hold_press_locking(&mut f, trigger, 2., true);
     assert_eq!(zoom_level(&mut f, &output), 2.);
     assert!(zoom_locked(&mut f, &output));
 
@@ -3113,7 +3278,7 @@ fn zoom_hold_lock_preserves_prior_lock() {
     assert!(zoom_locked(&mut f, &output));
 
     let trigger = key_trigger(30);
-    hold_press_locked(&mut f, trigger, 2., true);
+    hold_press_locking(&mut f, trigger, 2., true);
     assert_eq!(zoom_level(&mut f, &output), 2.);
     assert!(zoom_locked(&mut f, &output));
 
@@ -3286,34 +3451,195 @@ fn zoom_anim_zoom_out_to_one_keeps_focal_stable() {
 }
 
 #[test]
-fn zoom_anim_toggle_zoom_hold_round_trip_keeps_focal_stable() {
+fn zoom_anim_zoom_lock_round_trip_keeps_focal_stable() {
     let mut f = set_up_animated();
     let output = f.niri_output(1);
     f.niri_state().move_cursor(Point::from((150., 100.)));
     freeze_clock(&mut f);
 
-    // First press: locked zoom-in around the viewport center.
+    // First press: locked zoom-in anchored on the canonical pointer at its
+    // displayed position, not on the viewport center.
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), true), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, true), false);
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 2.);
     assert!(zoom_locked(&mut f, &output));
     let focal = zoom_focal(&mut f, &output);
-    assert_abs_diff_eq!(focal.x, 960., epsilon = EPS);
-    assert_abs_diff_eq!(focal.y, 360., epsilon = EPS);
+    assert_abs_diff_eq!(focal.x, 150., epsilon = EPS);
+    assert_abs_diff_eq!(focal.y, 100., epsilon = EPS);
 
-    // Second press: the zoom-out must stay locked (centered) and the focal
-    // point must not fly to a clamped corner.
+    // Second press: the zoom-out unlocks and pivots around the same fixed
+    // focal point; it must not fly to a clamped corner.
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), true), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, true), false);
     for _ in 0..10 {
         advance_clock(&mut f, 20);
         let focal = zoom_focal(&mut f, &output);
-        assert_abs_diff_eq!(focal.x, 960., epsilon = EPS);
-        assert_abs_diff_eq!(focal.y, 360., epsilon = EPS);
+        assert_abs_diff_eq!(focal.x, 150., epsilon = EPS);
+        assert_abs_diff_eq!(focal.y, 100., epsilon = EPS);
     }
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert!(!zoom_locked(&mut f, &output));
+}
+
+#[test]
+fn zoom_anim_lock_flag_anchors_on_pointer() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+    freeze_clock(&mut f);
+
+    // `zoom lock=true` locks from the start and anchors the transition on
+    // the canonical pointer at its displayed position: the cursor content
+    // stays displayed at (150, 100) for the whole animation.
+    f.niri_state()
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, true), false);
+    assert!(zoom_locked(&mut f, &output));
+    assert!(zoom_is_animating(&mut f, &output));
+
+    for _ in 0..10 {
+        advance_clock(&mut f, 20);
+        let focal = zoom_focal(&mut f, &output);
+        assert_abs_diff_eq!(focal.x, 150., epsilon = EPS);
+        assert_abs_diff_eq!(focal.y, 100., epsilon = EPS);
+        let displayed = displayed_pointer_location(&mut f);
+        assert_abs_diff_eq!(displayed.x, 150., epsilon = EPS);
+        assert_abs_diff_eq!(displayed.y, 100., epsilon = EPS);
+    }
+
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert!(zoom_locked(&mut f, &output));
+}
+
+#[test]
+fn zoom_anim_lock_flag_suppresses_follow() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+    freeze_clock(&mut f);
+
+    f.niri_state()
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, true), false);
+    advance_clock(&mut f, 50);
+    assert!(zoom_is_animating(&mut f, &output));
+
+    // Locked from the start: a pointer move during the level animation
+    // clamps to the animated viewport instead of starting a deadzone drift,
+    // so the focal point stays on the pointer anchor.
+    move_pointer(&mut f, id, 2000., 0.);
+    let focal = zoom_focal(&mut f, &output);
+    assert_abs_diff_eq!(focal.x, 150., epsilon = EPS);
+    assert_abs_diff_eq!(focal.y, 100., epsilon = EPS);
+
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+
+    // The lock outlives the transition: a later move still cannot start a
+    // follow.
+    move_pointer(&mut f, id, -500., 0.);
+    assert_eq!(zoom_focal(&mut f, &output), Point::from((150., 100.)));
+    assert!(zoom_locked(&mut f, &output));
+}
+
+#[test]
+fn zoom_anim_hold_lock_anchors_on_pointer() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+    freeze_clock(&mut f);
+
+    // A `zoom hold=true lock=true` press anchors on the pointer like the
+    // toggle activation: the cursor content stays displayed at (150, 100)
+    // for the whole transition.
+    let trigger = key_trigger(30);
+    hold_press_locking(&mut f, trigger, 2., true);
+    assert!(zoom_locked(&mut f, &output));
+    assert!(zoom_is_animating(&mut f, &output));
+
+    for _ in 0..10 {
+        advance_clock(&mut f, 20);
+        let focal = zoom_focal(&mut f, &output);
+        assert_abs_diff_eq!(focal.x, 150., epsilon = EPS);
+        assert_abs_diff_eq!(focal.y, 100., epsilon = EPS);
+        let displayed = displayed_pointer_location(&mut f);
+        assert_abs_diff_eq!(displayed.x, 150., epsilon = EPS);
+        assert_abs_diff_eq!(displayed.y, 100., epsilon = EPS);
+    }
+
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert!(zoom_locked(&mut f, &output));
+}
+
+#[test]
+fn zoom_anim_hold_lock_anchors_displayed_pointer_position() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    freeze_clock(&mut f);
+
+    // Zoomed in, the canonical pointer and its displayed position diverge:
+    // at 1.5x around (960, 360) the cursor at (700, 400) is displayed at
+    // (570, 420). The locking hold anchors on that displayed position.
+    f.niri_state().move_cursor(Point::from((700., 400.)));
+    set_zoom(&mut f, &output, 1.5, Point::from((960., 360.)));
+    assert_eq!(
+        displayed_pointer_location(&mut f),
+        Point::from((570., 420.))
+    );
+
+    let trigger = key_trigger(30);
+    hold_press_locking(&mut f, trigger, 3., true);
+    assert!(zoom_locked(&mut f, &output));
+    assert!(zoom_is_animating(&mut f, &output));
+
+    for _ in 0..10 {
+        advance_clock(&mut f, 20);
+        let displayed = displayed_pointer_location(&mut f);
+        assert_abs_diff_eq!(displayed.x, 570., epsilon = EPS);
+        assert_abs_diff_eq!(displayed.y, 420., epsilon = EPS);
+    }
+
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_level(&mut f, &output), 3.);
+    // Keeping content (700, 400) displayed at (570, 420) at level 3 solves
+    // to focal (765, 390): neither the viewport center nor the canonical
+    // position as display.
+    let focal = zoom_focal(&mut f, &output);
+    assert_abs_diff_eq!(focal.x, 765., epsilon = EPS);
+    assert_abs_diff_eq!(focal.y, 390., epsilon = EPS);
+    let displayed = displayed_pointer_location(&mut f);
+    assert_abs_diff_eq!(displayed.x, 570., epsilon = EPS);
+    assert_abs_diff_eq!(displayed.y, 420., epsilon = EPS);
+}
+
+#[test]
+fn zoom_anim_hold_lock_release_restores_prior_view() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+    freeze_clock(&mut f);
+
+    // A non-center pre-hold view: the release animates back to it and
+    // restores the unlocked state.
+    set_zoom(&mut f, &output, 1.5, Point::from((300., 200.)));
+    let focal = zoom_focal(&mut f, &output);
+
+    let trigger = key_trigger(30);
+    hold_press_locking(&mut f, trigger, 2., true);
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert!(zoom_locked(&mut f, &output));
+
+    hold_release(&mut f, trigger);
+    assert!(!zoom_locked(&mut f, &output));
+    assert!(zoom_is_animating(&mut f, &output));
+
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_level(&mut f, &output), 1.5);
+    assert_eq!(zoom_focal(&mut f, &output), focal);
     assert!(!zoom_locked(&mut f, &output));
 }
 
@@ -3405,20 +3731,20 @@ fn zoom_anim_repeated_zoom_in_targets() {
 }
 
 #[test]
-fn zoom_anim_toggle_mid_animation() {
+fn zoom_anim_zoom_toggle_mid_animation() {
     let mut f = set_up_animated();
     let output = f.niri_output(1);
     f.niri_state().move_cursor(Point::from((960., 360.)));
     freeze_clock(&mut f);
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, false), false);
     advance_clock(&mut f, 50);
     assert!(zoom_level(&mut f, &output) > 1.);
 
     // Toggling mid-flight targets 1 regardless of the displayed level.
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, false), false);
     assert_eq!(zoom_target_level(&mut f, &output), 1.);
 
     advance_clock(&mut f, 5000);
@@ -3852,7 +4178,7 @@ fn zoom_anim_redraw_scheduled_while_animating() {
     assert!(!f.niri().layout.are_animations_ongoing(Some(&output)));
 }
 
-// --- animated hold-zoom lifecycle ---
+// --- animated zoom hold lifecycle ---
 
 /// Resizes the output's mode and notifies the compositor.
 fn resize_output(f: &mut Fixture, output: &Output, size: (i32, i32)) {
@@ -4070,7 +4396,7 @@ fn zoom_anim_hold_reset_and_toggle_during_hold() {
     assert!(f.niri().zoom_hold.is_some());
 
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, false), false);
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 2.);
 
@@ -4196,7 +4522,7 @@ fn zoom_anim_hold_toggle_during_restore() {
     // The toggle decision uses the restore's target (1.5 > 1), so it resets
     // to 1 from the displayed state without a jump.
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(4.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(4.), false, false), false);
     assert_eq!(zoom_target_level(&mut f, &output), 1.);
     assert_abs_diff_eq!(zoom_level(&mut f, &output), mid, epsilon = EPS);
 
@@ -5272,7 +5598,7 @@ fn zoom_overview_actions_are_ignored() {
     f.niri_state()
         .do_action(Action::SetZoomLevel(FloatOrInt(4.)), false);
     f.niri_state()
-        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+        .do_action(Action::Zoom(ZoomLevelPreset(2.), false, false), false);
     f.niri_state().do_action(Action::ZoomLock(false), false);
     hold_press(&mut f, key_trigger(30), 3.);
     zoom_lock_press(&mut f, key_trigger(31));

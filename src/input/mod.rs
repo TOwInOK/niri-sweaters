@@ -87,11 +87,11 @@ pub enum ZoomHoldTrigger {
     TabletButton(u32),
 }
 
-/// An active `hold-zoom` session.
+/// An active `zoom hold=true` session.
 ///
-/// Created when a `hold-zoom` bind press is executed and owned by the trigger
-/// and the output resolved at that moment. Releasing the trigger animates the
-/// saved zoom state back on the owning output.
+/// Created when a `zoom hold=true` bind press is executed and owned by the
+/// trigger and the output resolved at that moment. Releasing the trigger
+/// animates the saved zoom state back on the owning output.
 #[derive(Debug, Clone)]
 pub struct ZoomHoldState {
     /// The physical control whose release ends the hold.
@@ -102,9 +102,9 @@ pub struct ZoomHoldState {
     pub previous: ZoomSnapshot,
     /// The lock state to restore on release, when the hold engaged the lock.
     ///
-    /// `Some` only for `hold-zoom hold=true`: it captures whether the viewport
-    /// was locked at press time so release can restore it. Plain holds leave
-    /// the lock untouched, so this stays `None` for them.
+    /// `Some` only for `zoom hold=true lock=true`: it captures whether the
+    /// viewport was locked at press time so release can restore it. Plain
+    /// holds leave the lock untouched, so this stays `None` for them.
     pub locked: Option<bool>,
 }
 
@@ -753,9 +753,14 @@ impl State {
     }
 
     pub(crate) fn start_key_repeat(&mut self, bind: Bind) {
-        // hold-zoom and momentary zoom-lock are intrinsically non-repeatable:
+        // Momentary zoom and zoom-lock are intrinsically non-repeatable:
         // they are driven by the press/release lifecycle, not by key repeat.
-        if !bind.repeat || matches!(bind.action, Action::HoldZoom(..) | Action::ZoomLock(true)) {
+        if !bind.repeat
+            || matches!(
+                bind.action,
+                Action::Zoom(_, true, _) | Action::ZoomLock(true)
+            )
+        {
             return;
         }
 
@@ -812,7 +817,7 @@ impl State {
     /// Executes a resolved bind.
     ///
     /// `hold_trigger` is the physical control that produced the press, needed
-    /// by `hold-zoom` to own the ending release. Callers without a real
+    /// by `zoom hold=true` to own the ending release. Callers without a real
     /// trigger (key repeat, scroll ticks) pass `None`.
     pub fn handle_bind(&mut self, bind: Bind, hold_trigger: Option<ZoomHoldTrigger>) {
         let Some(cooldown) = bind.cooldown else {
@@ -2632,25 +2637,21 @@ impl State {
                     }
                 }
             }
-            Action::ToggleZoom(preset, hold) => {
+            Action::Zoom(preset, hold, lock) => {
                 let preset = preset.0;
                 if !preset.is_finite() || preset <= 1. {
-                    warn!("ignoring toggle-zoom with invalid level: {preset}");
+                    warn!("ignoring zoom with invalid level: {preset}");
                     return;
                 }
-                self.toggle_zoom(preset, hold);
-            }
-            Action::HoldZoom(preset, hold) => {
-                let preset = preset.0;
-                if !preset.is_finite() || preset <= 1. {
-                    warn!("ignoring hold-zoom with invalid level: {preset}");
-                    return;
+                if hold {
+                    let Some(trigger) = hold_trigger else {
+                        warn!("ignoring zoom hold without a physical trigger");
+                        return;
+                    };
+                    self.begin_zoom_hold(trigger, preset, lock);
+                } else {
+                    self.toggle_zoom(preset, lock);
                 }
-                let Some(trigger) = hold_trigger else {
-                    warn!("ignoring hold-zoom without a physical trigger");
-                    return;
-                };
-                self.begin_zoom_hold(trigger, preset, hold);
             }
         }
     }
@@ -4947,7 +4948,9 @@ impl State {
     /// Toggles the zoom target output between 1 and `preset`.
     ///
     /// The decision is made on `intent_level` (user intent), not on the
-    fn toggle_zoom(&mut self, preset: f64, hold: bool) {
+    /// sampled animation level. With `lock` the zoom-in also locks the
+    /// viewport and the toggle back to 1 unlocks it.
+    fn toggle_zoom(&mut self, preset: f64, lock: bool) {
         let max_zoom = self.niri.config.borrow().zoom.max_zoom;
         let Some((output, anchor)) = self.zoom_target() else {
             return;
@@ -4962,15 +4965,13 @@ impl State {
             preset.clamp(1., max_zoom)
         };
 
-        if hold && level > 1. {
-            // Lock before zooming in so the transition stays centered like a
-            // regular locked zoom.
-            mon.zoom_mut().set_locked(true, anchor);
+        if lock && level > 1. {
+            mon.zoom_to_and_lock(level, anchor);
+        } else {
+            mon.zoom_to(level, anchor);
         }
 
-        mon.zoom_to(level, anchor);
-
-        if hold && level == 1. {
+        if lock && level == 1. {
             // Unlock after zooming out so the restore stays centered too.
             mon.zoom_mut().set_locked(false, anchor);
         }
@@ -4978,7 +4979,7 @@ impl State {
         self.niri.queue_redraw(&output);
     }
 
-    /// Starts a `hold-zoom` session owned by `trigger`.
+    /// Starts a `zoom hold=true` session owned by `trigger`.
     ///
     /// Snapshots the current zoom state of the target output, then animates
     /// towards `preset` (clamped to the current `max-zoom`) like a regular
@@ -4987,9 +4988,9 @@ impl State {
     /// retargets the current viewport; on another output the old session ends
     /// with an animated restore first.
     ///
-    /// With `hold` the press also locks the viewport and the release restores
+    /// With `lock` the press also locks the viewport and the release restores
     /// the lock state captured at press time.
-    pub(crate) fn begin_zoom_hold(&mut self, trigger: ZoomHoldTrigger, preset: f64, hold: bool) {
+    pub(crate) fn begin_zoom_hold(&mut self, trigger: ZoomHoldTrigger, preset: f64, lock: bool) {
         let max_zoom = self.niri.config.borrow().zoom.max_zoom;
         let Some((output, anchor)) = self.zoom_target() else {
             return;
@@ -5002,7 +5003,7 @@ impl State {
         if let Some(active) = self.niri.zoom_hold.as_mut() {
             if active.output == output {
                 active.trigger = trigger;
-                if hold && active.locked.is_none() {
+                if lock && active.locked.is_none() {
                     // A plain hold retargeted by a locking hold starts
                     // restoring the lock state from this press.
                     if let Some(mon) = self.niri.layout.monitor_for_output(&output) {
@@ -5020,7 +5021,7 @@ impl State {
 
         if self.niri.zoom_hold.is_none() {
             let previous = mon.zoom().snapshot();
-            let locked = hold.then(|| mon.zoom().is_locked());
+            let locked = lock.then(|| mon.zoom().is_locked());
             self.niri.zoom_hold = Some(ZoomHoldState {
                 trigger,
                 output: output.clone(),
@@ -5029,17 +5030,15 @@ impl State {
             });
         }
 
-        if hold {
-            // Lock before zooming so the transition stays centered like a
-            // regular locked zoom.
-            mon.zoom_mut().set_locked(true, anchor);
+        if lock {
+            mon.zoom_to_and_lock(preset.clamp(1., max_zoom), anchor);
+        } else {
+            mon.zoom_to(preset.clamp(1., max_zoom), anchor);
         }
-
-        mon.zoom_to(preset.clamp(1., max_zoom), anchor);
         self.niri.queue_redraw(&output);
     }
 
-    /// Ends the active `hold-zoom` session with an animated restore.
+    /// Ends the active `zoom hold=true` session with an animated restore.
     ///
     /// The viewport animates back to the saved state: the level towards the
     /// saved target and the focal point towards the saved focal. The restored
@@ -5078,8 +5077,8 @@ impl State {
         self.niri.queue_redraw(&hold.output);
     }
 
-    /// Ends the active `hold-zoom` session, restoring the saved zoom state
-    /// immediately.
+    /// Ends the active `zoom hold=true` session, restoring the saved zoom
+    /// state immediately.
     ///
     /// Used by lost-release cleanup paths (VT switch, suspend, device
     /// removal, focus loss) where no frames may remain for an animated
@@ -5112,7 +5111,7 @@ impl State {
         self.niri.queue_redraw(&hold.output);
     }
 
-    /// Ends the active `hold-zoom` session if it is owned by `trigger`.
+    /// Ends the active `zoom hold=true` session if it is owned by `trigger`.
     ///
     /// Called on release events; a release of any other control is a no-op.
     /// The release is a normal user action, so the restore is animated.

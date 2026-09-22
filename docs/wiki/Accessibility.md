@@ -51,8 +51,8 @@ Desktop zoom is controlled through [bind actions](./Configuration:-Key-Bindings.
 
 ```kdl
 binds {
-    Mod+Z { toggle-zoom 2.0; }
-    Mod+X { hold-zoom 2.0; }
+    Mod+Z { zoom 2.0; }
+    Mod+X { zoom 2.0 hold=true; }
 }
 ```
 
@@ -69,15 +69,18 @@ If the pointer is already outside the deadzone, the viewport starts following it
 Zooming back out to 1× returns cleanly to the normal view.
 
 The `zoom-lock` action stops pointer-driven viewport following: while locked, moving the pointer does not pan the view, and the pointer stays confined to the visible area.
-Changing the zoom level while locked keeps the content at the center of the viewport centered.
+`zoom-in` and `zoom-out` still zoom around the pointer while locked: each command captures its position, and moving the pointer afterwards does not move that anchor. Absolute level changes and locked restoration remain centered on the viewport.
 
-`hold-zoom` is a momentary zoom: pressing the trigger remembers the current view and temporarily zooms in, normal zoom interactions keep working while it is held, and releasing the trigger restores the previous view.
+`zoom <LEVEL> lock=true` enters this locked state directly: the press zooms around the pointer and locks the viewport immediately, so the point under the pointer stays visually anchored during the zoom-in.
+
+`zoom <LEVEL> hold=true` is a momentary zoom: pressing the trigger remembers the current view and temporarily zooms in, normal zoom interactions keep working while it is held, and releasing the trigger restores the previous view.
+Adding `lock=true` locks the viewport for the duration of the hold—the press zooms around the pointer and locks immediately—and restores the previous lock state on release.
 
 You can also zoom with a touchpad pinch gesture by setting [`pinch-fingers`](./Configuration:-Miscellaneous.md#pinch-fingers) in the `zoom` config section.
 This is an opt-in: a matching pinch gesture is claimed by the compositor when it begins, so applications will no longer receive pinch gestures with that finger count.
 
 Opening the [Overview](./Overview.md) returns the desktop to normal scale and ends the zoom session: closing the Overview comes back to the unzoomed desktop, and zoom actions are ignored while the Overview is open.
-An in-progress `hold-zoom` or `zoom-lock hold=true` hold is dropped without restoring its remembered view.
+An in-progress `zoom hold=true` or `zoom-lock hold=true` hold is dropped without restoring its remembered view.
 The lock screen is shown unzoomed; the stored zoom is restored when you unlock.
 Viewport following is also suspended while the screenshot UI or the window switcher is open.
 Lowering [`max-zoom`](./Configuration:-Miscellaneous.md#max-zoom) in the config clamps the zoom level of every output right away, including locked outputs.

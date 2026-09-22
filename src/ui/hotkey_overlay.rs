@@ -484,8 +484,7 @@ fn action_name(action: &Action) -> String {
         Action::SetZoomLevel(_) => String::from("Set Zoom Level"),
         Action::ResetZoom => String::from("Reset Zoom"),
         Action::ZoomLock(_) => String::from("Zoom Lock"),
-        Action::ToggleZoom(..) => String::from("Toggle Zoom"),
-        Action::HoldZoom(..) => String::from("Hold Zoom"),
+        Action::Zoom(_, hold, _) => String::from(if *hold { "Hold Zoom" } else { "Toggle Zoom" }),
         Action::Screenshot(_, _) => String::from("Take a Screenshot"),
         Action::Spawn(args) => format!(
             "Spawn <span face='monospace' bgcolor='#000000'>{}</span>",
@@ -730,12 +729,11 @@ mod tests {
             (Action::ZoomOut, "Zoom Out"),
             (Action::SetZoomLevel(FloatOrInt(2.)), "Set Zoom Level"),
             (Action::ResetZoom, "Reset Zoom"),
-            (Action::ZoomLock(false), "Zoom Lock"),
             (
-                Action::ToggleZoom(ZoomLevelPreset(2.), false),
+                Action::Zoom(ZoomLevelPreset(2.), false, false),
                 "Toggle Zoom",
             ),
-            (Action::HoldZoom(ZoomLevelPreset(2.), false), "Hold Zoom"),
+            (Action::Zoom(ZoomLevelPreset(2.), true, false), "Hold Zoom"),
         ] {
             assert_eq!(action_name(&action), name);
         }

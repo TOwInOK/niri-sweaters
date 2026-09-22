@@ -351,7 +351,7 @@ pub struct Niri {
     pub suppressed_buttons: HashSet<u32>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
-    /// Active `hold-zoom` session, if any.
+    /// Active `zoom hold=true` session, if any.
     ///
     /// Owned by the physical trigger that started it; releasing the trigger
     /// animates the saved zoom state back on the owning output, while
@@ -3200,7 +3200,7 @@ impl Niri {
     ///
     /// The Overview replaces the desktop presentation entirely, so the zoom
     /// session does not survive it: each monitor's zoom state is reset to
-    /// the resting 1x identity, the `hold-zoom` and `zoom-lock` hold
+    /// the resting 1x identity, the `zoom hold=true` and `zoom-lock` hold
     /// sessions are dropped without restoring their snapshots, and an
     /// active zoom pinch switches to `Swallowing` so the rest of the
     /// already-claimed gesture sequence never reaches the client.

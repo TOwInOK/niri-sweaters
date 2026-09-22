@@ -172,7 +172,7 @@ binds {
 ### Actions
 
 Almost every action that you can bind is also available for programmatic invocation via `niri msg action`.
-The exception is actions whose semantics depend on the physical bind lifecycle, such as [`hold-zoom`](#zoom).
+The exception is action options whose semantics depend on the physical bind lifecycle, such as [`zoom hold=true`](#zoom).
 Run `niri msg action` to get a full list of actions along with their short descriptions.
 
 Here are a few actions that benefit from more explanation.
@@ -427,8 +427,8 @@ See the [Accessibility](./Accessibility.md#desktop-zoom) page for an overview an
 
 ```kdl
 binds {
-    Mod+Z { toggle-zoom 2.0; }
-    Mod+X { hold-zoom 2.0; }
+    Mod+Z { zoom 2.0; }
+    Mod+X { zoom 2.0 hold=true; }
     Mod+0 { reset-zoom; }
 
     // Mouse wheel zooming works too.
@@ -444,9 +444,9 @@ They are ignored while the [Overview](./Overview.md) is open, since opening it e
 - `zoom-out`: divides the target zoom level by `increment-factor`, ending at exactly 1×.
 - `set-zoom-level <LEVEL>`: sets the target zoom level to `LEVEL`, which must be at least `1`. Values above `max-zoom` are clamped to it.
 - `reset-zoom`: returns the target zoom level to 1×.
-- `zoom-lock`: toggles the zoom lock. While locked, the zoomed viewport no longer follows the pointer, and changing the zoom level keeps the content at the center of the viewport centered. `zoom-lock hold=true` inverts the lock only while the trigger is held: pressing locks an unlocked viewport or unlocks a locked one, and releasing restores the previous state.
-- `toggle-zoom <LEVEL>`: if the current target zoom level is above 1×, returns it to 1×; otherwise zooms to `LEVEL`. `LEVEL` must be greater than `1` and is clamped to `max-zoom`. It is the preset used when entering zoom, not a permanent fixed target. `toggle-zoom <LEVEL> hold=true` also locks the viewport while zoomed in and unlocks it when toggling back to 1×.
-- `hold-zoom <LEVEL>`: pressing the trigger remembers the current zoom view and temporarily zooms to `LEVEL`; releasing the same trigger restores the previous view, not simply 1×. `LEVEL` must be greater than `1` and is clamped to `max-zoom`. `hold-zoom <LEVEL> hold=true` also locks the viewport during the hold and restores the previous lock state on release.
+- `zoom-lock`: toggles the zoom lock. While locked, the zoomed viewport no longer follows the pointer. `zoom-in` and `zoom-out` capture the pointer as their fixed anchor on each command; absolute level changes keep the content at the viewport center centered. `zoom <LEVEL> lock=true` activation also anchors on the pointer. `zoom-lock hold=true` inverts the lock only while the trigger is held: pressing locks an unlocked viewport or unlocks a locked one, and releasing restores the previous state.
+- `zoom <LEVEL>`: if the current target zoom level is above 1×, returns it to 1×; otherwise zooms to `LEVEL`. `LEVEL` must be greater than `1` and is clamped to `max-zoom`. It is the preset used when entering zoom, not a permanent fixed target. `zoom <LEVEL> lock=true` zooms in around the pointer and locks the viewport immediately, keeping the point under the pointer visually anchored during the zoom-in; toggling back to 1× unlocks it. `zoom <LEVEL> hold=true` makes it a momentary zoom: pressing the trigger remembers the current zoom view and temporarily zooms to `LEVEL`; releasing the same trigger restores the previous view, not simply 1×. `zoom <LEVEL> hold=true lock=true` also locks the viewport during the hold—pointer-anchored like the toggle—and restores the previous lock state on release.
 
-`hold-zoom` and `zoom-lock hold=true` are bind-only: they are not available through `niri msg action`, since their semantics depend on the physical press and release.
-The trigger must have a release event, so scroll binds cannot be used for `hold-zoom` or `zoom-lock hold=true`.
+`zoom` with `hold=true` and `zoom-lock hold=true` are bind-only: they are not available through `niri msg action`, since their semantics depend on the physical press and release.
+The IPC `zoom` action accepts only `level` and `lock`.
+The trigger must have a release event, so scroll binds cannot be used for `zoom hold=true` or `zoom-lock hold=true`.
