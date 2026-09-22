@@ -2463,11 +2463,11 @@ impl State {
                 self.niri.stop_cast(CastSessionId::from(session_id));
             }
             Action::ToggleOverview => {
-                self.niri.layout.toggle_overview();
+                self.toggle_overview();
                 self.niri.queue_redraw_all();
             }
             Action::OpenOverview => {
-                if self.niri.layout.open_overview() {
+                if self.overview_entry(|state| state.niri.layout.open_overview()) {
                     self.niri.queue_redraw_all();
                 }
             }
@@ -2625,9 +2625,9 @@ impl State {
                         return;
                     };
                     self.begin_zoom_lock_hold(trigger);
-                } else if let Some((output, _)) = self.zoom_target() {
+                } else if let Some((output, anchor)) = self.zoom_target() {
                     if let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) {
-                        mon.zoom_mut().toggle_locked();
+                        mon.zoom_mut().toggle_locked(anchor);
                         self.niri.queue_redraw(&output);
                     }
                 }
@@ -2900,7 +2900,7 @@ impl State {
                     .with_grab(|_, grab| grab_allows_hot_corner(grab))
                     .unwrap_or(true)
             {
-                self.niri.layout.toggle_overview();
+                self.toggle_overview();
             }
             self.niri.pointer_inside_hot_corner = true;
         }
@@ -2993,7 +2993,7 @@ impl State {
                     .with_grab(|_, grab| grab_allows_hot_corner(grab))
                     .unwrap_or(true)
             {
-                self.niri.layout.toggle_overview();
+                self.toggle_overview();
             }
             self.niri.pointer_inside_hot_corner = true;
         }
@@ -4254,7 +4254,7 @@ impl State {
             // We handled this event.
             return;
         } else if event.fingers() == 4 {
-            self.niri.layout.overview_gesture_begin();
+            self.overview_entry(|state| state.niri.layout.overview_gesture_begin());
             self.niri.queue_redraw_all();
 
             // We handled this event.
@@ -4671,6 +4671,57 @@ impl State {
         }
     }
 
+    /// Runs an Overview entry transition and ends the desktop zoom session.
+    ///
+    /// The Overview replaces the desktop presentation, so entering it is a
+    /// lifecycle boundary for the desktop zoom: the zoom session is
+    /// terminated rather than suppressed, and the pointer is rebased so it
+    /// does not visually jump when the zoom transform disappears.
+    ///
+    /// `open` performs the actual Overview state transition (toggle, open,
+    /// gesture begin). If it did not open the Overview — a toggle that
+    /// closed it, or an open request while it is already open — the zoom
+    /// session is untouched.
+    fn overview_entry<R>(&mut self, open: impl FnOnce(&mut Self) -> R) -> R {
+        // The pointer is displayed through the zoom presentation transform,
+        // so capture its current displayed position before the transform
+        // disappears; afterwards the canonical position is rebased onto it.
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        let displayed = self
+            .niri
+            .display_position_for_content(pointer.current_location());
+        let tablet_displayed = self
+            .niri
+            .tablet_cursor_location
+            .map(|pos| self.niri.display_position_for_content(pos));
+        let result = open(self);
+
+        if !self.niri.layout.is_overview_open() {
+            return result;
+        }
+
+        trace!("ending desktop zoom session on overview entry");
+        self.niri.terminate_zoom_for_overview();
+
+        // The zoom presentation is now the identity, so the displayed
+        // position is the new canonical position. The rebase is a
+        // compositor-side correction, not physical motion: it goes through
+        // the regular programmatic warp, which sends no relative motion.
+        if let Some(displayed) = tablet_displayed {
+            self.niri.tablet_cursor_location = Some(displayed);
+        }
+        if displayed != pointer.current_location() {
+            self.move_cursor(displayed);
+        }
+
+        result
+    }
+
+    /// Toggles the Overview, ending the desktop zoom session on entry.
+    pub(crate) fn toggle_overview(&mut self) {
+        self.overview_entry(|state| state.niri.layout.toggle_overview());
+    }
+
     pub(crate) fn prepare_zoom_warp_target(
         &self,
         requested: Point<f64, Logical>,
@@ -4695,9 +4746,8 @@ impl State {
     /// the desktop zoom is locked.
     ///
     /// The viewport is derived from the pointer presentation transform, so it
-    /// matches what is actually displayed: the zoomed viewport normally, the
-    /// effective (Overview-suppressed) viewport during the Overview, and the
-    /// entire output while the session is locked.
+    /// matches what is actually displayed: the zoomed viewport normally, and
+    /// the entire output while the session is locked.
     fn clamp_pointer_to_locked_viewport(
         &self,
         pos: Point<f64, Logical>,
@@ -4762,6 +4812,33 @@ impl State {
         }
     }
 
+    /// The canonical pointer position in `output`-local content coordinates.
+    ///
+    /// This is the pointer position when the pointer is on `output`, and the
+    /// output center otherwise — the same fallback [`zoom_target`](Self::zoom_target)
+    /// uses for its anchor. Lock state changes reanchor on this position, so
+    /// callers restoring state on an output the pointer may have left must
+    /// resolve it against the owning output rather than the current target.
+    fn canonical_zoom_pointer(&self, output: &Output) -> Point<f64, Logical> {
+        let pointer_pos = self
+            .niri
+            .seat
+            .get_pointer()
+            .map(|pointer| pointer.current_location());
+
+        pointer_pos
+            .and_then(|pos| self.niri.output_under(pos))
+            .filter(|(under, _)| *under == output)
+            .map(|(_, local)| local)
+            .or_else(|| {
+                self.niri
+                    .layout
+                    .monitor_for_output(output)
+                    .map(|mon| mon.view_size().to_point().downscale(2.))
+            })
+            .unwrap_or_else(|| Point::from((0., 0.)))
+    }
+
     /// The output a zoom action applies to, and the zoom anchor in its
     /// output-local content coordinates.
     ///
@@ -4769,6 +4846,9 @@ impl State {
     /// the active output when the pointer is not on any output. The anchor is
     /// the pointer position when it is on the target output, and the output
     /// center otherwise.
+    ///
+    /// While the Overview is active there is no desktop zoom session to
+    /// target: zoom actions are ignored rather than mutating hidden state.
     fn zoom_target(&self) -> Option<(Output, Point<f64, Logical>)> {
         let pointer_pos = self
             .niri
@@ -4782,17 +4862,23 @@ impl State {
                 .map(|(output, local)| (output.clone(), local))
         });
 
-        if let Some((output, anchor)) = pointer_output {
-            return Some((output, anchor));
-        }
+        let (output, anchor) = if let Some((output, anchor)) = pointer_output {
+            (output, anchor)
+        } else {
+            let output = self.niri.layout.active_output()?.clone();
+            let anchor = self.canonical_zoom_pointer(&output);
+            (output, anchor)
+        };
 
-        let output = self.niri.layout.active_output()?.clone();
-        let anchor = self
+        if self
             .niri
             .layout
             .monitor_for_output(&output)
-            .map(|mon| mon.view_size().to_point().downscale(2.))
-            .unwrap_or_else(|| Point::from((0., 0.)));
+            .is_some_and(|mon| mon.overview_active())
+        {
+            return None;
+        }
+
         Some((output, anchor))
     }
 
@@ -4821,20 +4907,27 @@ impl State {
             return;
         };
 
-        // Incremental actions are based on the target level so that they stay
+        // Incremental actions are based on the intent level so that they stay
         // correct while zoom transitions are animated.
-        let mut level = (mon.zoom().target_level() * factor).clamp(1., max_zoom);
+        let mut level = (mon.zoom().intent_level() * factor).clamp(1., max_zoom);
         if level < 1. + ZOOM_SNAP_TO_ONE_EPSILON {
             level = 1.;
         }
 
-        mon.zoom_to(level, anchor);
+        if level == 1. {
+            // Zooming out to the identity transform is a ToIdentity command.
+            mon.zoom_to(level, anchor);
+        } else if factor > 1. {
+            mon.zoom_in(level, anchor);
+        } else if factor < 1. {
+            mon.zoom_out(level, anchor);
+        }
         self.niri.queue_redraw(&output);
     }
 
     /// Toggles the zoom target output between 1 and `preset`.
     ///
-    /// The decision is made on `target_level` (user intent), not on the
+    /// The decision is made on `intent_level` (user intent), not on the
     fn toggle_zoom(&mut self, preset: f64, hold: bool) {
         let max_zoom = self.niri.config.borrow().zoom.max_zoom;
         let Some((output, anchor)) = self.zoom_target() else {
@@ -4844,7 +4937,7 @@ impl State {
             return;
         };
 
-        let level = if mon.zoom().target_level() > 1. {
+        let level = if mon.zoom().intent_level() > 1. {
             1.
         } else {
             preset.clamp(1., max_zoom)
@@ -4853,14 +4946,14 @@ impl State {
         if hold && level > 1. {
             // Lock before zooming in so the transition stays centered like a
             // regular locked zoom.
-            mon.zoom_mut().set_locked(true);
+            mon.zoom_mut().set_locked(true, anchor);
         }
 
         mon.zoom_to(level, anchor);
 
         if hold && level == 1. {
             // Unlock after zooming out so the restore stays centered too.
-            mon.zoom_mut().set_locked(false);
+            mon.zoom_mut().set_locked(false, anchor);
         }
 
         self.niri.queue_redraw(&output);
@@ -4920,7 +5013,7 @@ impl State {
         if hold {
             // Lock before zooming so the transition stays centered like a
             // regular locked zoom.
-            mon.zoom_mut().set_locked(true);
+            mon.zoom_mut().set_locked(true, anchor);
         }
 
         mon.zoom_to(preset.clamp(1., max_zoom), anchor);
@@ -4944,6 +5037,7 @@ impl State {
             return;
         };
 
+        let pointer = self.canonical_zoom_pointer(&hold.output);
         let Some(mon) = self.niri.layout.monitor_for_output_mut(&hold.output) else {
             // The owning output is gone; there is nothing to restore.
             return;
@@ -4953,7 +5047,7 @@ impl State {
         // restore: a locked restore animates only the level, so the lock must
         // already be in its final state.
         if let Some(locked) = hold.locked {
-            mon.zoom_mut().set_locked(locked);
+            mon.zoom_mut().set_locked(locked, pointer);
         }
 
         let max_zoom = self.niri.config.borrow().zoom.max_zoom;
@@ -4976,6 +5070,7 @@ impl State {
             return;
         };
 
+        let pointer = self.canonical_zoom_pointer(&hold.output);
         let Some(mon) = self.niri.layout.monitor_for_output_mut(&hold.output) else {
             // The owning output is gone; there is nothing to restore.
             return;
@@ -4985,7 +5080,7 @@ impl State {
         // restore: a locked restore animates only the level, so the lock must
         // already be in its final state.
         if let Some(locked) = hold.locked {
-            mon.zoom_mut().set_locked(locked);
+            mon.zoom_mut().set_locked(locked, pointer);
         }
 
         let max_zoom = self.niri.config.borrow().zoom.max_zoom;
@@ -5021,7 +5116,7 @@ impl State {
     /// captured state and simply retargets the trigger; on another output the
     /// old session ends first.
     pub(crate) fn begin_zoom_lock_hold(&mut self, trigger: ZoomHoldTrigger) {
-        let Some((output, _)) = self.zoom_target() else {
+        let Some((output, anchor)) = self.zoom_target() else {
             return;
         };
 
@@ -5038,7 +5133,7 @@ impl State {
         };
 
         let was_locked = mon.zoom().is_locked();
-        mon.zoom_mut().set_locked(!was_locked);
+        mon.zoom_mut().set_locked(!was_locked, anchor);
         self.niri.zoom_lock_hold = Some(ZoomLockHoldState {
             trigger,
             output: output.clone(),
@@ -5057,12 +5152,13 @@ impl State {
             return;
         };
 
+        let pointer = self.canonical_zoom_pointer(&hold.output);
         let Some(mon) = self.niri.layout.monitor_for_output_mut(&hold.output) else {
             // The owning output is gone; there is nothing to restore.
             return;
         };
 
-        mon.zoom_mut().set_locked(hold.was_locked);
+        mon.zoom_mut().set_locked(hold.was_locked, pointer);
         self.niri.queue_redraw(&hold.output);
     }
 

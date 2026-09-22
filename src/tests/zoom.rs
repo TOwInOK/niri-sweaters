@@ -641,7 +641,7 @@ fn zoom_debug_hidden_by_overview() {
     let mut f = set_up_debug();
     let output = f.niri_output(1);
 
-    set_overview_open(&mut f, &output, true);
+    enter_overview(&mut f);
 
     let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
     assert!(debug_solids(&elements, zoom_debug::DEADZONE_COLOR).is_empty());
@@ -1065,7 +1065,7 @@ fn zoom_lock_clamps_pointer_to_viewport() {
     set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
     {
         let mon = f.niri().layout.monitor_for_output_mut(&output).unwrap();
-        mon.zoom_mut().set_locked(true);
+        mon.zoom_mut().set_locked(true, Point::from((960., 360.)));
     }
     f.niri_state().move_cursor(Point::from((960., 360.)));
 
@@ -1085,7 +1085,7 @@ fn zoom_lock_1x_does_not_clamp() {
 
     {
         let mon = f.niri().layout.monitor_for_output_mut(&output).unwrap();
-        mon.zoom_mut().set_locked(true);
+        mon.zoom_mut().set_locked(true, Point::from((960., 360.)));
     }
     f.niri_state().move_cursor(Point::from((1900., 360.)));
 
@@ -1109,7 +1109,7 @@ fn zoom_hot_corner_display_space() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
     f.niri_state().move_cursor(Point::from((480., 180.)));
 
     assert!(!f.niri().layout.is_overview_open());
@@ -1344,7 +1344,7 @@ fn zoom_absolute_pointer_lock_preserves_focal() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
 
     move_pointer_absolute(&mut f, id, Point::from((1560., 360.)), extent, None);
 
@@ -1546,7 +1546,7 @@ fn zoom_programmatic_warp_locked_inside_viewport_is_exact() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
     f.niri_state().move_cursor(target);
 
     assert_eq!(pointer_location(&mut f), target);
@@ -1565,7 +1565,7 @@ fn zoom_programmatic_warp_locked_outside_viewport_clamps_target() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
     f.niri_state().move_cursor(Point::from((1900., 360.)));
 
     assert_eq!(pointer_location(&mut f), Point::from((1440., 360.)));
@@ -1583,7 +1583,7 @@ fn zoom_programmatic_warp_locked_one_x_does_not_clamp() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
     f.niri_state().move_cursor(target);
 
     assert_eq!(pointer_location(&mut f), target);
@@ -1648,7 +1648,7 @@ fn zoom_programmatic_warp_cross_output_locked_clamps_destination() {
         .monitor_for_output_mut(&output2)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
     f.niri_state()
         .move_cursor(geo2.loc.to_f64() + Point::from((1800., 360.)));
 
@@ -1711,7 +1711,7 @@ fn zoom_constraint_warp_locked_clamps_without_focal_change() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
     let final_target = silent_warp(&mut f, Point::from((1900., 360.)));
 
     assert_eq!(final_target, Point::from((1440., 360.)));
@@ -1812,7 +1812,7 @@ fn zoom_tablet_cursor_locked_render_does_not_move_focal() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
     f.niri().tablet_cursor_location = Some(content);
 
     let _ = pointer_element_locs(f.niri_state(), &output);
@@ -1973,7 +1973,7 @@ fn zoom_action_locked_zooms_around_viewport_center() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
     f.niri_state().do_action(Action::ZoomIn, false);
 
     assert_abs_diff_eq!(zoom_level(&mut f, &output), 1.2, epsilon = EPS);
@@ -2003,7 +2003,7 @@ fn zoom_action_locked_keeps_viewport_center_fixed() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
     f.niri_state().do_action(Action::ZoomIn, false);
 
     let center_after = crate::utils::center_f64(
@@ -2375,7 +2375,7 @@ fn zoom_reload_max_clamps_locked() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
 
     reload_with_zoom(&mut f, "zoom { max-zoom 3; }");
 
@@ -3487,7 +3487,7 @@ fn zoom_anim_locked_viewport_clamps_pointer() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
     advance_clock(&mut f, 50);
 
     let viewport = f
@@ -3563,7 +3563,7 @@ fn zoom_anim_locked_keeps_viewport_center_fixed() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
 
     f.niri_state()
         .do_action(Action::SetZoomLevel(FloatOrInt(4.)), false);
@@ -3610,7 +3610,9 @@ fn zoom_anim_lock_mid_animation_freezes_focal() {
 
     for _ in 0..10 {
         advance_clock(&mut f, 20);
-        assert_eq!(zoom_focal(&mut f, &output), frozen);
+        let focal = zoom_focal(&mut f, &output);
+        assert_abs_diff_eq!(focal.x, frozen.x, epsilon = EPS);
+        assert_abs_diff_eq!(focal.y, frozen.y, epsilon = EPS);
     }
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 3.);
@@ -3632,17 +3634,64 @@ fn zoom_anim_unlock_mid_animation_no_jump() {
     advance_clock(&mut f, 20);
 
     f.niri_state().do_action(Action::ZoomLock(false), false);
-    assert_eq!(zoom_focal(&mut f, &output), frozen);
+    let focal = zoom_focal(&mut f, &output);
+    assert_abs_diff_eq!(focal.x, frozen.x, epsilon = EPS);
+    assert_abs_diff_eq!(focal.y, frozen.y, epsilon = EPS);
 
     // Deadzone tracking waits for the level animation to finish.
     f.niri_state().move_cursor(Point::from((0., 0.)));
-    assert_eq!(zoom_focal(&mut f, &output), frozen);
+    let focal = zoom_focal(&mut f, &output);
+    assert_abs_diff_eq!(focal.x, frozen.x, epsilon = EPS);
+    assert_abs_diff_eq!(focal.y, frozen.y, epsilon = EPS);
 
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 3.);
 
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_focal(&mut f, &output), Point::from((0., 0.)));
+}
+
+#[test]
+fn zoom_anim_unlock_reanchors_on_canonical_pointer() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    f.niri_state().move_cursor(Point::from((960., 360.)));
+    freeze_clock(&mut f);
+
+    f.niri_state()
+        .do_action(Action::SetZoomLevel(FloatOrInt(3.)), false);
+    advance_clock(&mut f, 50);
+
+    // Lock, then move the canonical pointer inside the deadzone: the
+    // viewport stays fixed and the pointer clamps to it, so the canonical
+    // and displayed positions diverge.
+    f.niri_state().do_action(Action::ZoomLock(false), false);
+    move_pointer(&mut f, id, 240., 40.);
+    let canonical = pointer_location(&mut f);
+    let displayed = displayed_pointer_location(&mut f);
+    assert_ne!(canonical, displayed);
+
+    // Unlocking mid-animation re-anchors the command on the canonical
+    // pointer at its current displayed position: no jump, and the pointer
+    // stays displayed at that spot for the rest of the transition.
+    f.niri_state().do_action(Action::ZoomLock(false), false);
+    assert!(!zoom_locked(&mut f, &output));
+    assert_eq!(pointer_location(&mut f), canonical);
+    assert_eq!(displayed_pointer_location(&mut f), displayed);
+
+    for _ in 0..10 {
+        advance_clock(&mut f, 20);
+        let now = displayed_pointer_location(&mut f);
+        assert_abs_diff_eq!(now.x, displayed.x, epsilon = EPS);
+        assert_abs_diff_eq!(now.y, displayed.y, epsilon = EPS);
+    }
+
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_level(&mut f, &output), 3.);
+    let now = displayed_pointer_location(&mut f);
+    assert_abs_diff_eq!(now.x, displayed.x, epsilon = EPS);
+    assert_abs_diff_eq!(now.y, displayed.y, epsilon = EPS);
 }
 
 #[test]
@@ -4179,21 +4228,27 @@ fn zoom_anim_hold_lock_during_restore() {
     advance_clock(&mut f, 50);
     assert!(zoom_is_animating(&mut f, &output));
 
-    // Locking mid-restore freezes the current focal point; the saved focal
-    // destination is discarded while the level keeps animating.
-    let frozen = zoom_focal(&mut f, &output);
+    // Locking mid-restore reanchors on the viewport center: the content under
+    // the output center stays centered while the level keeps animating, and
+    // the saved focal destination is discarded.
+    let center = Point::from((960., 360.));
+    let center_content = zoom_transform(&mut f, &output).apply_inverse(center);
     f.niri_state().do_action(Action::ZoomLock(false), false);
     assert!(zoom_locked(&mut f, &output));
 
     for _ in 0..10 {
         advance_clock(&mut f, 20);
-        assert_eq!(zoom_focal(&mut f, &output), frozen);
+        let displayed = zoom_transform(&mut f, &output).apply(center_content);
+        assert_abs_diff_eq!(displayed.x, center.x, epsilon = EPS);
+        assert_abs_diff_eq!(displayed.y, center.y, epsilon = EPS);
     }
 
     advance_clock(&mut f, 5000);
     assert_eq!(zoom_level(&mut f, &output), 2.);
-    assert_eq!(zoom_focal(&mut f, &output), frozen);
-    assert_ne!(frozen, saved_focal);
+    let displayed = zoom_transform(&mut f, &output).apply(center_content);
+    assert_abs_diff_eq!(displayed.x, center.x, epsilon = EPS);
+    assert_abs_diff_eq!(displayed.y, center.y, epsilon = EPS);
+    assert_ne!(zoom_focal(&mut f, &output), saved_focal);
 }
 
 #[test]
@@ -4557,104 +4612,375 @@ fn zoom_anim_hold_multi_output_independence() {
     assert_eq!(zoom_level(&mut f, &output2), 4.);
 }
 
-fn effective_zoom_transform(
-    f: &mut Fixture,
-    output: &Output,
-) -> crate::utils::view::ViewportTransform {
-    f.niri()
-        .layout
-        .monitor_for_output(output)
-        .unwrap()
-        .effective_zoom_transform()
+/// Enters the Overview through the real input path: the desktop zoom session
+/// is terminated and the pointer is rebased to its displayed position.
+fn enter_overview(f: &mut Fixture) {
+    f.niri_state().toggle_overview();
+    f.niri_complete_animations();
+    assert!(f.niri().layout.is_overview_open());
 }
 
-fn set_overview_progress(f: &mut Fixture, _output: &Output, progress: Option<f64>) {
-    f.niri().layout.set_overview_progress_for_test(progress);
-}
-
-fn set_overview_open(f: &mut Fixture, _output: &Output, open: bool) {
-    f.niri().layout.set_overview_open_for_test(open);
+/// Exits the Overview through the real input path.
+fn exit_overview(f: &mut Fixture) {
+    f.niri_state().toggle_overview();
+    f.niri_complete_animations();
+    assert!(!f.niri().layout.is_overview_open());
 }
 
 #[test]
-fn zoom_overview_effective_transform_math() {
+fn zoom_overview_entry_preserves_displayed_pointer() {
+    // The main regression: entering the Overview must not visually move the
+    // pointer even though the zoom presentation transform disappears.
     let mut f = set_up();
     let output = f.niri_output(1);
-    let focal = Point::from((100., 200.));
+    let focal = Point::from((960., 360.));
 
     set_zoom(&mut f, &output, 4., focal);
-    let stored = zoom_transform(&mut f, &output);
-    assert_eq!(effective_zoom_transform(&mut f, &output), stored);
+    f.niri_state().move_cursor(Point::from((1100., 400.)));
+    let displayed_before = displayed_pointer_location(&mut f);
+    assert_ne!(displayed_before, pointer_location(&mut f));
 
-    set_overview_progress(&mut f, &output, Some(0.));
-    assert_eq!(effective_zoom_transform(&mut f, &output), stored);
+    enter_overview(&mut f);
 
-    set_overview_progress(&mut f, &output, Some(0.5));
-    let partial = effective_zoom_transform(&mut f, &output);
-    assert_abs_diff_eq!(partial.factor(), 2., epsilon = EPS);
-    assert_eq!(partial.focal(), focal);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert_eq!(zoom_target_level(&mut f, &output), 1.);
+    assert!(!zoom_is_animating(&mut f, &output));
+    assert!(!zoom_locked(&mut f, &output));
 
-    let view_size = f
-        .niri()
-        .layout
-        .monitor_for_output(&output)
-        .unwrap()
-        .view_size();
-    let expected_viewport = crate::utils::view::ViewportTransform::new(focal, 2.)
-        .apply_inverse_rect(Rectangle::from_size(view_size));
-    let viewport = f
-        .niri()
-        .layout
-        .monitor_for_output(&output)
-        .unwrap()
-        .effective_viewport();
-    assert_eq!(viewport, expected_viewport);
-
-    set_overview_progress(&mut f, &output, Some(1.));
-    assert_eq!(
-        effective_zoom_transform(&mut f, &output),
-        crate::utils::view::ViewportTransform::identity()
-    );
-
-    set_overview_progress(&mut f, &output, Some(-0.5));
-    assert_eq!(effective_zoom_transform(&mut f, &output), stored);
-    set_overview_progress(&mut f, &output, Some(1.5));
-    assert_eq!(
-        effective_zoom_transform(&mut f, &output),
-        crate::utils::view::ViewportTransform::identity()
-    );
+    // Under the identity presentation the canonical position is the displayed
+    // position: the pointer did not visually move.
+    assert_eq!(pointer_location(&mut f), displayed_before);
+    assert_eq!(displayed_pointer_location(&mut f), displayed_before);
 }
 
 #[test]
-fn zoom_overview_effective_transform_reverses_continuously() {
+fn zoom_overview_entry_terminates_session() {
     let mut f = set_up();
     let output = f.niri_output(1);
+
     set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
+    f.niri()
+        .layout
+        .monitor_for_output_mut(&output)
+        .unwrap()
+        .zoom_mut()
+        .set_locked(true, Point::from((960., 360.)));
 
-    let opening = [0., 0.25, 0.5, 0.75, 1.]
-        .into_iter()
-        .map(|progress| {
-            set_overview_progress(&mut f, &output, Some(progress));
-            effective_zoom_transform(&mut f, &output).factor()
-        })
-        .collect::<Vec<_>>();
-    assert!(opening.windows(2).all(|pair| pair[0] >= pair[1]));
-    assert_eq!(opening[0], 4.);
-    assert_eq!(opening[4], 1.);
+    enter_overview(&mut f);
 
-    set_overview_progress(&mut f, &output, Some(0.4));
-    let before_reversal = effective_zoom_transform(&mut f, &output).factor();
-    set_overview_progress(&mut f, &output, Some(0.));
-    assert!(effective_zoom_transform(&mut f, &output).factor() > before_reversal);
-
-    set_overview_progress(&mut f, &output, Some(0.6));
-    let before_close_reversal = effective_zoom_transform(&mut f, &output).factor();
-    set_overview_progress(&mut f, &output, Some(1.));
-    assert!(effective_zoom_transform(&mut f, &output).factor() < before_close_reversal);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert_eq!(zoom_target_level(&mut f, &output), 1.);
+    assert!(!zoom_locked(&mut f, &output));
+    assert!(!zoom_is_animating(&mut f, &output));
+    assert!(!zoom_gesturing(&mut f, &output));
 }
 
 #[test]
-fn zoom_overview_render_targets_use_effective_identity() {
+fn zoom_overview_exit_does_not_restore() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+
+    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
+    enter_overview(&mut f);
+    exit_overview(&mut f);
+
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert_eq!(zoom_target_level(&mut f, &output), 1.);
+    assert!(!zoom_is_animating(&mut f, &output));
+}
+
+#[test]
+fn zoom_overview_entry_terminates_follow() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((960., 360.)));
+    freeze_clock(&mut f);
+
+    f.niri_state()
+        .do_action(Action::SetZoomLevel(FloatOrInt(2.)), false);
+    advance_clock(&mut f, 5000);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+
+    // Warp to the content corner: the displayed pointer lands outside the
+    // deadzone and a resting follow starts moving the camera.
+    f.niri_state().move_cursor(Point::from((0., 0.)));
+    let focal = zoom_focal(&mut f, &output);
+    advance_clock(&mut f, 50);
+    assert_ne!(zoom_focal(&mut f, &output), focal);
+
+    enter_overview(&mut f);
+
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    // The follow transition is terminated, not suspended: there is nothing
+    // left to commit.
+    assert!(!f
+        .niri()
+        .layout
+        .monitor_for_output_mut(&output)
+        .unwrap()
+        .zoom_mut()
+        .commit_follow_focal());
+
+    exit_overview(&mut f);
+
+    // No follow resumes after the exit.
+    assert!(!f
+        .niri()
+        .layout
+        .monitor_for_output_mut(&output)
+        .unwrap()
+        .zoom_mut()
+        .commit_follow_focal());
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+}
+
+#[test]
+fn zoom_overview_entry_terminates_level_animation() {
+    let mut f = set_up_animated();
+    let output = f.niri_output(1);
+    let focal = Point::from((960., 360.));
+    freeze_clock(&mut f);
+    set_zoom(&mut f, &output, 1.5, focal);
+    f.niri_state().move_cursor(focal);
+
+    f.niri()
+        .layout
+        .monitor_for_output_mut(&output)
+        .unwrap()
+        .zoom_to(4., focal);
+    assert!(zoom_is_animating(&mut f, &output));
+
+    let displayed_before = displayed_pointer_location(&mut f);
+
+    enter_overview(&mut f);
+
+    // The transition is terminated mid-flight: the pointer is rebased to the
+    // position it was displayed at, and the level does not continue to 4.
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert_eq!(zoom_target_level(&mut f, &output), 1.);
+    assert!(!zoom_is_animating(&mut f, &output));
+    assert_eq!(displayed_pointer_location(&mut f), displayed_before);
+
+    exit_overview(&mut f);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert!(!zoom_is_animating(&mut f, &output));
+}
+
+#[test]
+fn zoom_overview_entry_clears_lock() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+
+    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
+    f.niri()
+        .layout
+        .monitor_for_output_mut(&output)
+        .unwrap()
+        .zoom_mut()
+        .set_locked(true, Point::from((960., 360.)));
+
+    enter_overview(&mut f);
+    exit_overview(&mut f);
+
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert!(!zoom_locked(&mut f, &output));
+
+    // The next ordinary zoom behaves unlocked: it anchors at the pointer.
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+    f.niri_state()
+        .do_action(Action::SetZoomLevel(FloatOrInt(2.)), false);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+    assert_eq!(zoom_focal(&mut f, &output), Point::from((150., 100.)));
+}
+
+#[test]
+fn zoom_overview_entry_drops_hold_session() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
+    let trigger = key_trigger(30);
+    hold_press(&mut f, trigger, 3.);
+    assert!(f.niri().zoom_hold.is_some());
+
+    enter_overview(&mut f);
+
+    // The session is gone, not merely suspended: the late release has
+    // nothing to restore.
+    assert!(f.niri().zoom_hold.is_none());
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+
+    hold_release(&mut f, trigger);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert_eq!(zoom_target_level(&mut f, &output), 1.);
+
+    exit_overview(&mut f);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+}
+
+#[test]
+fn zoom_overview_entry_drops_lock_hold_session() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
+    let trigger = key_trigger(30);
+    zoom_lock_press(&mut f, trigger);
+    assert!(f.niri().zoom_lock_hold.is_some());
+    assert!(zoom_locked(&mut f, &output));
+
+    enter_overview(&mut f);
+
+    assert!(f.niri().zoom_lock_hold.is_none());
+    assert!(!zoom_locked(&mut f, &output));
+
+    // The late release finds no session and must not resurrect the lock.
+    f.niri_state().end_zoom_lock_hold_for_trigger(trigger);
+    assert!(!zoom_locked(&mut f, &output));
+
+    exit_overview(&mut f);
+    assert!(!zoom_locked(&mut f, &output));
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+}
+
+#[test]
+fn zoom_overview_entry_swallows_active_pinch() {
+    let mut f = set_up_with_pinch();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    f.niri_state().begin_zoom_pinch("dev0".to_owned());
+    f.niri_state().update_zoom_pinch(&output, 2.);
+    assert_eq!(zoom_level(&mut f, &output), 2.);
+
+    enter_overview(&mut f);
+
+    // The claimed sequence switches to Swallowing: the client never saw the
+    // begin, so the remaining updates and the end are consumed.
+    assert!(matches!(
+        zoom_pinch(&mut f),
+        Some(ZoomPinchRouting::Swallowing { ref device_id }) if device_id == "dev0"
+    ));
+    assert!(!zoom_gesturing(&mut f, &output));
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+
+    // A swallowed update cannot resurrect the zoom.
+    f.niri_state().update_zoom_pinch(&output, 4.);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+
+    // The physical end clears the routing.
+    f.niri_state().commit_zoom_pinch();
+    assert!(zoom_pinch(&mut f).is_none());
+}
+
+#[test]
+fn zoom_overview_actions_are_ignored() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    f.niri_state().move_cursor(Point::from((150., 100.)));
+
+    set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
+    enter_overview(&mut f);
+
+    // Zoom actions cannot construct hidden zoom state while the Overview is
+    // active.
+    f.niri_state().do_action(Action::ZoomIn, false);
+    f.niri_state().do_action(Action::ZoomOut, false);
+    f.niri_state()
+        .do_action(Action::SetZoomLevel(FloatOrInt(4.)), false);
+    f.niri_state()
+        .do_action(Action::ToggleZoom(ZoomLevelPreset(2.), false), false);
+    f.niri_state().do_action(Action::ZoomLock(false), false);
+    hold_press(&mut f, key_trigger(30), 3.);
+    zoom_lock_press(&mut f, key_trigger(31));
+
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert_eq!(zoom_target_level(&mut f, &output), 1.);
+    assert!(!zoom_locked(&mut f, &output));
+    assert!(!zoom_is_animating(&mut f, &output));
+    assert!(f.niri().zoom_hold.is_none());
+    assert!(f.niri().zoom_lock_hold.is_none());
+}
+
+#[test]
+fn zoom_overview_entry_resets_all_outputs() {
+    // The Overview is global: every monitor's zoom session ends on entry.
+    let mut f = set_up();
+    let output1 = f.niri_output(1);
+    f.add_output(2, (1920, 720));
+    let output2 = f.niri_output(2);
+
+    set_zoom(&mut f, &output1, 2., Point::from((960., 360.)));
+    set_zoom(&mut f, &output2, 4., Point::from((960., 360.)));
+    f.niri()
+        .layout
+        .monitor_for_output_mut(&output2)
+        .unwrap()
+        .zoom_mut()
+        .set_locked(true, Point::from((960., 360.)));
+
+    // The pointer sits on output 1; only its position is rebased.
+    f.niri_state().move_cursor(Point::from((1100., 400.)));
+    let displayed_before = displayed_pointer_location(&mut f);
+
+    enter_overview(&mut f);
+
+    assert_eq!(zoom_level(&mut f, &output1), 1.);
+    assert!(!zoom_locked(&mut f, &output1));
+    assert_eq!(zoom_level(&mut f, &output2), 1.);
+    assert!(!zoom_locked(&mut f, &output2));
+    assert_eq!(pointer_location(&mut f), displayed_before);
+}
+
+#[test]
+fn zoom_overview_repeated_entry_no_drift() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+
+    set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
+    f.niri_state().move_cursor(Point::from((1100., 400.)));
+
+    enter_overview(&mut f);
+    let displayed = displayed_pointer_location(&mut f);
+
+    exit_overview(&mut f);
+    enter_overview(&mut f);
+    exit_overview(&mut f);
+
+    // With no zoom active the rebase is a no-op: repeated entries accumulate
+    // no pointer drift.
+    assert_eq!(displayed_pointer_location(&mut f), displayed);
+    assert_eq!(pointer_location(&mut f), displayed);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+}
+
+#[test]
+fn zoom_overview_entry_pointer_stays_on_output() {
+    let mut f = set_up();
+    let output = f.niri_output(1);
+    let geo = f.niri().global_space.output_geometry(&output).unwrap();
+
+    // The canonical pointer near the viewport edge displays near the output
+    // boundary; the rebase must keep it on the same output.
+    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
+    f.niri_state().move_cursor(Point::from((1199., 449.)));
+    let displayed_before = displayed_pointer_location(&mut f);
+
+    enter_overview(&mut f);
+
+    let pos = pointer_location(&mut f);
+    assert_eq!(pos, displayed_before);
+    assert!(geo.to_f64().contains(pos));
+    assert_eq!(
+        f.niri().output_under(pos).map(|(output, _)| output.clone()),
+        Some(output)
+    );
+}
+
+#[test]
+fn zoom_overview_render_targets_use_identity() {
     let mut f = set_up();
     let output = f.niri_output(1);
     let id = f.add_client();
@@ -4662,7 +4988,7 @@ fn zoom_overview_render_targets_use_effective_identity() {
     add_top_layer(&mut f, id, 50);
     set_zoom(&mut f, &output, 4., Point::from((100., 100.)));
 
-    set_overview_open(&mut f, &output, true);
+    enter_overview(&mut f);
     for target in [
         RenderTarget::Output,
         RenderTarget::Screencast,
@@ -4671,147 +4997,64 @@ fn zoom_overview_render_targets_use_effective_identity() {
         let elements = render_elements(f.niri_state(), &output, target);
         assert!(
             elements.iter().all(|element| !is_zoomed(element)),
-            "fully-open Overview must use identity presentation for {target:?}"
+            "the Overview must render the desktop at the identity for {target:?}"
         );
     }
-
-    set_overview_progress(&mut f, &output, Some(0.5));
-    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
-    assert!(
-        elements.iter().any(is_zoomed),
-        "partial Overview must retain the unsuppressed part of desktop zoom"
-    );
 }
 
 #[test]
-fn zoom_overview_pointer_input_and_lock_use_effective_viewport() {
+fn zoom_overview_pointer_input_uses_identity_viewport() {
     let mut f = set_up();
     let output = f.niri_output(1);
     let id = f.add_client();
-    let center = Point::from((960., 360.));
     let extent = f.niri().global_space.output_geometry(&output).unwrap().size;
 
-    set_zoom(&mut f, &output, 4., center);
-    f.niri()
-        .layout
-        .monitor_for_output_mut(&output)
-        .unwrap()
-        .zoom_mut()
-        .set_locked(true);
-    f.niri_state().move_cursor(center);
+    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
+    f.niri_state().move_cursor(Point::from((960., 360.)));
 
-    set_overview_open(&mut f, &output, true);
+    enter_overview(&mut f);
+
+    // Relative motion is unscaled at the identity presentation.
     move_pointer(&mut f, id, 20., 10.);
-    assert_eq!(pointer_location(&mut f), center + Point::from((20., 10.)));
+    assert_eq!(
+        pointer_location(&mut f),
+        Point::from((960., 360.)) + Point::from((20., 10.))
+    );
 
+    // Absolute input maps display to content through the identity.
     move_pointer_absolute(&mut f, id, Point::from((1200., 360.)), extent, None);
     assert_eq!(pointer_location(&mut f), Point::from((1200., 360.)));
-
-    set_overview_progress(&mut f, &output, Some(0.5));
-    f.niri_state().move_cursor(center);
-    move_pointer(&mut f, id, 20., 10.);
-    assert_eq!(pointer_location(&mut f), center + Point::from((10., 5.)));
-
-    move_pointer_absolute(&mut f, id, Point::from((1400., 360.)), extent, None);
-    assert_eq!(pointer_location(&mut f), Point::from((1180., 360.)));
-
-    f.niri_state().move_cursor(center);
-    move_pointer(&mut f, id, 2000., 0.);
-    assert_eq!(pointer_location(&mut f), Point::from((1440., 360.)));
-
-    set_overview_open(&mut f, &output, true);
-    f.niri_state().move_cursor(center);
-    move_pointer(&mut f, id, 2000., 0.);
-    assert_eq!(pointer_location(&mut f), Point::from((1919., 360.)));
 }
 
 #[test]
-fn zoom_overview_pointer_visual_and_deadzone_are_presentation_bound() {
+fn zoom_overview_pointer_visual_is_identity() {
     let mut f = set_up();
     let output = f.niri_output(1);
-    let focal = Point::from((960., 360.));
-    let content = Point::from((1060., 360.));
 
-    set_zoom(&mut f, &output, 4., focal);
-    f.niri_state().move_cursor(content);
-    let before_focal = zoom_focal(&mut f, &output);
+    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
+    f.niri_state().move_cursor(Point::from((1060., 360.)));
+    let displayed_before = displayed_pointer_location(&mut f);
 
-    set_overview_open(&mut f, &output, true);
+    enter_overview(&mut f);
+
+    // The pointer element renders at the captured displayed position.
     let hotspot = cursor_hotspot(&mut f, &output);
     let scale = Scale::from(output.current_scale().fractional_scale());
     let locs = pointer_element_locs(f.niri_state(), &output);
     assert_eq!(locs.len(), 1);
     assert_eq!(
         locs[0],
-        (content - hotspot).to_physical_precise_round(scale)
-    );
-    assert_eq!(zoom_focal(&mut f, &output), before_focal);
-
-    set_overview_progress(&mut f, &output, Some(0.5));
-    let locs = pointer_element_locs(f.niri_state(), &output);
-    let displayed = Point::from((
-        focal.x + (content.x - focal.x) * 2.,
-        focal.y + (content.y - focal.y) * 2.,
-    ));
-    assert_eq!(
-        locs[0],
-        (displayed - hotspot).to_physical_precise_round(scale)
+        (displayed_before - hotspot).to_physical_precise_round(scale)
     );
 
+    // Deadzone tracking stays off while the Overview is active.
     f.niri_state().move_cursor(Point::from((0., 0.)));
-    assert_eq!(zoom_focal(&mut f, &output), before_focal);
     silent_warp(&mut f, Point::from((1900., 700.)));
-    assert_eq!(zoom_focal(&mut f, &output), before_focal);
-
-    set_overview_progress(&mut f, &output, None);
-    f.niri_state().move_cursor(Point::from((0., 0.)));
-    assert_ne!(zoom_focal(&mut f, &output), before_focal);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
 }
 
 #[test]
-fn zoom_overview_actions_hold_and_multi_output_state_survive() {
-    let mut f = set_up();
-    let output1 = f.niri_output(1);
-    f.add_output(2, (1920, 720));
-    let output2 = f.niri_output(2);
-    let center = Point::from((960., 360.));
-
-    set_zoom(&mut f, &output1, 2., center);
-    set_zoom(&mut f, &output2, 4., center);
-    f.niri_state().move_cursor(center);
-    f.niri().layout.toggle_overview();
-    f.niri_complete_animations();
-
-    assert_eq!(effective_zoom_transform(&mut f, &output1).factor(), 1.);
-    assert_eq!(effective_zoom_transform(&mut f, &output2).factor(), 1.);
-
-    let target_before = zoom_target_level(&mut f, &output1);
-    f.niri_state().do_action(Action::ZoomIn, false);
-    let target_after_action = zoom_target_level(&mut f, &output1);
-    assert!(target_after_action > target_before);
-    assert_eq!(effective_zoom_transform(&mut f, &output1).factor(), 1.);
-
-    f.niri_state().do_action(Action::ZoomLock(false), false);
-    assert!(zoom_locked(&mut f, &output1));
-    let trigger = key_trigger(30);
-    hold_press(&mut f, trigger, 3.);
-    let target_after_hold = zoom_target_level(&mut f, &output1);
-    assert_eq!(target_after_hold, 3.);
-    assert_eq!(effective_zoom_transform(&mut f, &output1).factor(), 1.);
-    hold_release(&mut f, trigger);
-    assert_eq!(zoom_target_level(&mut f, &output1), target_after_action);
-
-    f.niri().layout.toggle_overview();
-    f.niri_complete_animations();
-    assert_eq!(
-        effective_zoom_transform(&mut f, &output1).factor(),
-        target_after_action
-    );
-    assert_eq!(effective_zoom_transform(&mut f, &output2).factor(), 4.);
-}
-
-#[test]
-fn zoom_overview_hides_zoom_redraw_and_completes_from_clock() {
+fn zoom_overview_stops_zoom_animation() {
     let mut f = set_up_animated();
     let output = f.niri_output(1);
     let focal = Point::from((960., 360.));
@@ -4824,28 +5067,14 @@ fn zoom_overview_hides_zoom_redraw_and_completes_from_clock() {
         .unwrap()
         .zoom_to(4., focal);
     assert!(zoom_is_animating(&mut f, &output));
-    assert!(f.niri().layout.are_animations_ongoing(Some(&output)));
 
-    set_overview_open(&mut f, &output, true);
-    assert!(!f.niri().layout.are_animations_ongoing(Some(&output)));
+    enter_overview(&mut f);
 
-    let now = f.niri().clock.now_unadjusted();
-    f.niri().clock.set_rate(1.);
-    f.niri().clock.set_unadjusted(now + Duration::from_secs(5));
-    let _ = f.niri().clock.now();
-    f.niri().clock.set_rate(0.);
-
-    assert_eq!(zoom_level(&mut f, &output), 4.);
+    // The zoom animation is terminated rather than completed in the
+    // background.
     assert!(!zoom_is_animating(&mut f, &output));
-    assert_eq!(effective_zoom_transform(&mut f, &output).factor(), 1.);
-
-    f.niri()
-        .layout
-        .monitor_for_output_mut(&output)
-        .unwrap()
-        .zoom_mut()
-        .advance_animations();
-    assert_eq!(zoom_target_level(&mut f, &output), 4.);
+    assert_eq!(zoom_level(&mut f, &output), 1.);
+    assert_eq!(zoom_target_level(&mut f, &output), 1.);
 }
 
 #[test]
@@ -4853,11 +5082,11 @@ fn zoom_overview_open_hot_corner_uses_identity_presentation() {
     let mut f = set_up();
     let output = f.niri_output(1);
     set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
-    set_overview_open(&mut f, &output, true);
+    enter_overview(&mut f);
 
     assert!(
         f.niri().contents_under(Point::from((0., 0.))).hot_corner,
-        "fully-open Overview must evaluate hot corners in identity presentation"
+        "the Overview must evaluate hot corners in identity presentation"
     );
     assert!(f.niri().layout.is_overview_open());
 }
@@ -4867,53 +5096,18 @@ fn zoom_overview_output_add_and_remove_are_isolated() {
     let mut f = set_up();
     let output1 = f.niri_output(1);
     set_zoom(&mut f, &output1, 2., Point::from((960., 360.)));
-    f.niri().layout.toggle_overview();
-    f.niri_complete_animations();
+    enter_overview(&mut f);
 
     f.add_output(2, (1920, 720));
     let output2 = f.niri_output(2);
-    assert_eq!(effective_zoom_transform(&mut f, &output1).factor(), 1.);
-    assert_eq!(effective_zoom_transform(&mut f, &output2).factor(), 1.);
+    assert_eq!(zoom_level(&mut f, &output1), 1.);
+    assert_eq!(zoom_level(&mut f, &output2), 1.);
 
     f.niri().remove_output(&output2);
-    assert_eq!(effective_zoom_transform(&mut f, &output1).factor(), 1.);
+    assert_eq!(zoom_level(&mut f, &output1), 1.);
 
-    f.niri().layout.toggle_overview();
-    f.niri_complete_animations();
-    assert_eq!(effective_zoom_transform(&mut f, &output1).factor(), 2.);
-}
-
-#[test]
-fn zoom_overview_preserves_stored_transition_state() {
-    let mut f = set_up_animated();
-    let output = f.niri_output(1);
-    let focal = Point::from((960., 360.));
-    freeze_clock(&mut f);
-    set_zoom(&mut f, &output, 1.5, focal);
-
-    f.niri()
-        .layout
-        .monitor_for_output_mut(&output)
-        .unwrap()
-        .zoom_to(4., focal);
-    let stored_focal = zoom_focal(&mut f, &output);
-    assert!(zoom_is_animating(&mut f, &output));
-
-    set_overview_progress(&mut f, &output, Some(0.5));
-    let partial = effective_zoom_transform(&mut f, &output).factor();
-    assert!(partial > 1. && partial < 1.5);
-    assert_eq!(zoom_target_level(&mut f, &output), 4.);
-    assert_eq!(zoom_focal(&mut f, &output), stored_focal);
-
-    advance_clock(&mut f, 100);
-    assert!(zoom_is_animating(&mut f, &output));
-    assert_ne!(effective_zoom_transform(&mut f, &output).factor(), partial);
-
-    set_overview_open(&mut f, &output, true);
-    assert_eq!(effective_zoom_transform(&mut f, &output).factor(), 1.);
-    assert!(zoom_is_animating(&mut f, &output));
-    assert_eq!(zoom_target_level(&mut f, &output), 4.);
-    assert_eq!(zoom_focal(&mut f, &output), stored_focal);
+    exit_overview(&mut f);
+    assert_eq!(zoom_level(&mut f, &output1), 1.);
 }
 
 #[test]
@@ -5108,7 +5302,7 @@ fn zoom_pointer_surface_outputs_follow_displayed_bbox() {
         .monitor_for_output_mut(&output1)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
     f.niri().tablet_cursor_location = Some(Point::from((1430., 360.)));
     f.dispatch();
     f.double_roundtrip(id);
@@ -5132,7 +5326,7 @@ fn zoom_overview_identity_reaches_image_copy_cursor_position() {
     let mode = output.current_mode().unwrap();
     let canonical = Point::from((150., 100.));
     set_zoom(&mut f, &output, 4., Point::from((100., 100.)));
-    set_overview_progress(&mut f, &output, Some(1.));
+    enter_overview(&mut f);
     f.niri_state().move_cursor(canonical);
 
     assert_eq!(
@@ -5148,7 +5342,7 @@ fn zoom_overview_identity_reaches_image_copy_cursor_position() {
 }
 
 #[test]
-fn zoom_pipewire_metadata_updates_when_effective_transform_changes() {
+fn zoom_pipewire_metadata_updates_when_zoom_transform_changes() {
     let mut f = set_up();
     let output = f.niri_output(1);
     let canonical = Point::from((150., 100.));
@@ -5156,7 +5350,7 @@ fn zoom_pipewire_metadata_updates_when_effective_transform_changes() {
     set_zoom(&mut f, &output, 2., Point::from((100., 100.)));
 
     let before = f.niri().pointer_pos_for_output_cast(&output);
-    set_overview_progress(&mut f, &output, Some(1.));
+    set_zoom(&mut f, &output, 1., Point::from((100., 100.)));
     let after = f.niri().pointer_pos_for_output_cast(&output);
 
     assert_eq!(before, Some(Point::from((200., 100.))));
@@ -5188,11 +5382,11 @@ fn zoom_pointer_presentation_transform_unlocked_identity() {
     let output = f.niri_output(1);
 
     // At level 1 the stored transform keeps the output-center focal but is
-    // semantically the identity; the pointer transform must equal the
-    // effective transform and map every point to itself.
+    // semantically the identity; the pointer transform must equal the zoom
+    // transform and map every point to itself.
     assert!(!f.niri().is_locked());
     let transform = f.niri().pointer_presentation_transform(&output);
-    assert_eq!(transform, effective_zoom_transform(&mut f, &output));
+    assert_eq!(transform, zoom_transform(&mut f, &output));
     assert_eq!(transform.factor(), 1.);
     assert_eq!(
         transform.apply(Point::from((150., 100.))),
@@ -5209,7 +5403,7 @@ fn zoom_pointer_presentation_transform_unlocked_zoom() {
 
     assert_eq!(
         f.niri().pointer_presentation_transform(&output),
-        effective_zoom_transform(&mut f, &output)
+        zoom_transform(&mut f, &output)
     );
 }
 
@@ -5246,19 +5440,19 @@ fn zoom_pointer_presentation_lock_entry_and_exit() {
     let canonical = Point::from((150., 100.));
     set_zoom(&mut f, &output, 3., Point::from((960., 360.)));
 
-    // Unlocked: the pointer is displayed through the effective zoom transform.
-    let effective = effective_zoom_transform(&mut f, &output);
+    // Unlocked: the pointer is displayed through the zoom transform.
+    let zoomed = zoom_transform(&mut f, &output);
     let zoomed_display = f.niri().display_position_for_content(canonical);
-    assert_eq!(zoomed_display, effective.apply(canonical));
+    assert_eq!(zoomed_display, zoomed.apply(canonical));
     assert_ne!(zoomed_display, canonical);
 
     // Locked: the lock surface is the authoritative presentation, so the
     // pointer is displayed at its canonical position.
-    let locked = crate::niri::Niri::pointer_transform_for_presentation(true, effective);
+    let locked = crate::niri::Niri::pointer_transform_for_presentation(true, zoomed);
     assert_eq!(locked.apply(canonical), canonical);
 
     // Unlock restores the desktop presentation; the stored zoom never changed.
-    assert_eq!(zoom_transform(&mut f, &output), effective);
+    assert_eq!(zoom_transform(&mut f, &output), zoomed);
     assert_eq!(
         f.niri().display_position_for_content(canonical),
         zoomed_display
@@ -5266,28 +5460,21 @@ fn zoom_pointer_presentation_lock_entry_and_exit() {
 }
 
 #[test]
-fn zoom_pointer_presentation_transform_overview_partial() {
-    let mut f = set_up();
-    let output = f.niri_output(1);
-    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
-    set_overview_progress(&mut f, &output, Some(0.5));
-
-    // Unlocked, the pointer follows the effective (Overview-suppressed) transform.
-    let effective = effective_zoom_transform(&mut f, &output);
-    assert!(effective.factor() < 4.);
-    assert_eq!(f.niri().pointer_presentation_transform(&output), effective);
-}
-
-#[test]
 fn zoom_pointer_presentation_transform_overview_open() {
     let mut f = set_up();
     let output = f.niri_output(1);
     set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
-    set_overview_open(&mut f, &output, true);
+    enter_overview(&mut f);
 
+    // The zoom session is terminated on entry: the pointer presentation is
+    // the identity because the actual zoom state is 1x, not because the
+    // Overview suppresses a stored zoom. The focal point may keep its last
+    // value, so assert the mapping rather than the exact struct.
+    let transform = f.niri().pointer_presentation_transform(&output);
+    assert_eq!(transform.factor(), 1.);
     assert_eq!(
-        f.niri().pointer_presentation_transform(&output),
-        crate::utils::view::ViewportTransform::identity()
+        transform.apply(Point::from((150., 100.))),
+        Point::from((150., 100.))
     );
 }
 
@@ -5362,12 +5549,12 @@ fn zoom_session_lock_presentation_viewport_is_full_output() {
         .view_size();
     let output_rect = Rectangle::from_size(view_size);
 
-    let effective = effective_zoom_transform(&mut f, &output);
-    let locked = crate::niri::Niri::pointer_transform_for_presentation(true, effective);
+    let zoomed = zoom_transform(&mut f, &output);
+    let locked = crate::niri::Niri::pointer_transform_for_presentation(true, zoomed);
     assert_eq!(locked.apply_inverse_rect(output_rect), output_rect);
 
     // Unlocked regression: the presented viewport stays the zoomed viewport.
-    let unlocked = crate::niri::Niri::pointer_transform_for_presentation(false, effective);
+    let unlocked = crate::niri::Niri::pointer_transform_for_presentation(false, zoomed);
     let zoomed_viewport = unlocked.apply_inverse_rect(output_rect);
     assert_eq!(zoomed_viewport.size, view_size.downscale(4.));
     assert_ne!(zoomed_viewport, output_rect);
@@ -5408,8 +5595,8 @@ fn zoom_session_lock_warp_policy_uses_presentation() {
         .monitor_for_output(&output)
         .unwrap()
         .view_size();
-    let effective = effective_zoom_transform(&mut f, &output);
-    let locked = crate::niri::Niri::pointer_transform_for_presentation(true, effective);
+    let zoomed = zoom_transform(&mut f, &output);
+    let locked = crate::niri::Niri::pointer_transform_for_presentation(true, zoomed);
     let viewport = locked.apply_inverse_rect(Rectangle::from_size(view_size));
 
     let candidate = Point::<f64, Logical>::from((1900., 700.));
@@ -5707,48 +5894,6 @@ fn zoom_mru_button_animated_zoom() {
     // Place the canonical pointer so that its displayed position is D. Use
     // set_location to avoid perturbing the in-flight transition's focal.
     let c = origin + transform.apply_inverse(d - origin);
-    f.niri().seat.get_pointer().unwrap().set_location(c);
-    let displayed = f.niri().display_position_for_content(c);
-    assert_abs_diff_eq!(displayed.x, d.x, epsilon = EPS);
-    assert_abs_diff_eq!(displayed.y, d.y, epsilon = EPS);
-
-    click_left(&mut f, id);
-
-    assert!(!f.niri().window_mru_ui.is_open());
-    assert_eq!(f.niri().layout.focus().map(|m| m.id()), Some(id_d));
-}
-
-#[test]
-fn zoom_mru_button_overview_uses_effective_transform() {
-    let mut f = set_up_with_config(MRU_CONFIG);
-    let output = f.niri_output(1);
-    let id = f.add_client();
-    open_window(&mut f, id, "one", 100, 100, [255, 0, 0, 255]);
-    open_window(&mut f, id, "two", 100, 100, [0, 255, 0, 255]);
-    open_mru(&mut f);
-
-    // The MRU UI can coexist with the Overview; the pointer presentation
-    // follows the effective (Overview-suppressed) transform.
-    let focal = Point::from((960., 360.));
-    set_zoom(&mut f, &output, 4., focal);
-    set_overview_progress(&mut f, &output, Some(0.5));
-
-    let effective = f.niri().pointer_presentation_transform(&output);
-    assert_abs_diff_eq!(effective.factor(), 2., epsilon = EPS);
-    let stored = zoom_transform(&mut f, &output);
-    assert_abs_diff_eq!(stored.factor(), 4., epsilon = EPS);
-
-    let origin = f
-        .niri()
-        .global_space
-        .output_geometry(&output)
-        .unwrap()
-        .loc
-        .to_f64();
-    let (d, id_d) = mru_distinguishing_position(&mut f, origin, effective, 1920.)
-        .expect("no distinguishing MRU position found");
-
-    let c = origin + effective.apply_inverse(d - origin);
     f.niri().seat.get_pointer().unwrap().set_location(c);
     let displayed = f.niri().display_position_for_content(c);
     assert_abs_diff_eq!(displayed.x, d.x, epsilon = EPS);
@@ -6416,7 +6561,7 @@ fn zoom_ipc_locked() {
         .monitor_for_output_mut(&output)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
 
     let state = ipc_zoom_for(&mut f, &output);
     assert!(state.locked);
@@ -6450,7 +6595,7 @@ fn zoom_ipc_multi_output() {
         .monitor_for_output_mut(&output2)
         .unwrap()
         .zoom_mut()
-        .set_locked(true);
+        .set_locked(true, Point::from((960., 360.)));
 
     let states = ipc_zoom_state(&mut f);
     assert_eq!(states.len(), 2);
@@ -6480,33 +6625,10 @@ fn zoom_ipc_output_removal() {
 }
 
 #[test]
-fn zoom_ipc_overview_suppression() {
-    let mut f = set_up();
-    let output = f.niri_output(1);
-    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
-
-    // Partial overview: the effective level moves towards 1 while the stored
-    // state is untouched.
-    set_overview_progress(&mut f, &output, Some(0.5));
-    let state = ipc_zoom_for(&mut f, &output);
-    assert_eq!(state.level, 4.);
-    assert_eq!(state.target_level, 4.);
-    assert_abs_diff_eq!(state.effective_level, 2., epsilon = EPS);
-
-    // Fully open overview: the desktop scene presents at the identity.
-    set_overview_open(&mut f, &output, true);
-    let state = ipc_zoom_for(&mut f, &output);
-    assert_eq!(state.level, 4.);
-    assert_eq!(state.target_level, 4.);
-    assert_eq!(state.effective_level, 1.);
-    assert!(!state.locked);
-}
-
-#[test]
 fn zoom_ipc_effective_level_is_not_presentation_transform() {
-    // effective_level describes the desktop scene after Overview suppression.
-    // The session lock replaces the whole presentation with the identity, but
-    // that is a separate transform: a stored zoom still reports its level.
+    // effective_level describes the desktop scene zoom level. The session
+    // lock replaces the whole presentation with the identity, but that is a
+    // separate transform: a stored zoom still reports its level.
     let mut f = set_up();
     let output = f.niri_output(1);
     set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
@@ -6517,31 +6639,27 @@ fn zoom_ipc_effective_level_is_not_presentation_transform() {
 
     // The session-lock presentation transform is identity regardless; the IPC
     // snapshot deliberately does not model it.
-    let effective = effective_zoom_transform(&mut f, &output);
+    let zoomed = zoom_transform(&mut f, &output);
     assert_eq!(
-        crate::niri::Niri::pointer_transform_for_presentation(true, effective),
+        crate::niri::Niri::pointer_transform_for_presentation(true, zoomed),
         crate::utils::view::ViewportTransform::identity()
     );
 }
 
 #[test]
-fn zoom_ipc_query_is_side_effect_free() {
-    let mut f = set_up_animated();
+fn zoom_ipc_overview_entry_reports_reset_state() {
+    let mut f = set_up();
     let output = f.niri_output(1);
-    f.niri_state().move_cursor(Point::from((960., 360.)));
-    freeze_clock(&mut f);
+    set_zoom(&mut f, &output, 4., Point::from((960., 360.)));
 
-    f.niri_state()
-        .do_action(Action::SetZoomLevel(FloatOrInt(4.)), false);
-    advance_clock(&mut f, 50);
-
-    let first = ipc_zoom_state(&mut f);
-    let second = ipc_zoom_state(&mut f);
-    assert_eq!(first, second);
-
-    // The query did not finish the transition or change the target.
-    assert!(zoom_is_animating(&mut f, &output));
-    assert_eq!(zoom_target_level(&mut f, &output), 4.);
+    // Entering the Overview terminates the zoom session: the IPC snapshot
+    // reports the actual reset state, not a stored zoom.
+    enter_overview(&mut f);
+    let state = ipc_zoom_for(&mut f, &output);
+    assert_eq!(state.level, 1.);
+    assert_eq!(state.target_level, 1.);
+    assert_eq!(state.effective_level, 1.);
+    assert!(!state.locked);
 }
 
 // --- continuous deadzone follow ---
@@ -6759,11 +6877,11 @@ fn zoom_golden_overview() {
     let output = f.niri_output(1);
     golden_scene(&mut f);
 
-    // Overview at 50% suppresses the stored 2x to an effective ~1.41x: the
-    // outer seams move inward compared to zoom_2x.
+    // Entering the Overview terminates the zoom session: the desktop scene
+    // renders at the identity while the Overview presentation is at 50%.
     set_zoom(&mut f, &output, 2., Point::from((960., 360.)));
-    set_overview_open(&mut f, &output, true);
-    set_overview_progress(&mut f, &output, Some(0.5));
+    enter_overview(&mut f);
+    f.niri().layout.set_overview_progress_for_test(Some(0.5));
     assert_zoom_golden(&mut f, &output, "zoom_overview");
 }
 

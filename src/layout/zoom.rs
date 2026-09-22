@@ -3,7 +3,15 @@
 //! Holds the canonical zoom state for a single output and implements the
 //! viewport/deadzone math on top of [`ViewportTransform`]. All coordinates are
 //! output-local logical. Rendering and input integration live elsewhere.
+//!
+//! The state is an explicit finite-state machine: [`OutputZoomState`] is an
+//! enum whose variants are the only legal combinations of resting state,
+//! autonomous level transitions, direct-manipulation gestures, deadzone
+//! follows and the zoom lock. There is no authoritative target level outside
+//! an in-progress operation: the resting level lives in [`ZoomView`], and the
+//! level an operation animates towards lives inside that operation's payload.
 
+use std::mem;
 use std::time::Duration;
 
 use smithay::utils::{Logical, Point, Rectangle, Size};
@@ -14,98 +22,316 @@ use crate::utils::view::ViewportTransform;
 
 /// Desktop zoom state of a single output.
 ///
-/// `level` is the committed zoom level, `target_level` is the user-requested
-/// level that future continuous actions and animations operate on. `focal` is
-/// the fixed point of the viewport transform; it is kept within the output so
-/// that the logical viewport never leaves the output bounds. `locked`
-/// disables focal tracking.
+/// The variants are the complete lifecycle: a resting state owns only a
+/// [`ZoomView`]; autonomous operations ([`ZoomCommandState`],
+/// [`RestorePayload`]) own the level animation; a gesture owns the level
+/// directly; a follow owns only the focal point. `Locked*` variants are the
+/// locked counterparts of the unlocked lifecycle.
 ///
-/// While a [`ZoomLevelTransition`] is active, [`level()`](Self::level) and
+/// While a transition is active, [`level()`](Self::level) and
 /// [`focal()`](Self::focal) report the animated presentation values; the
-/// committed fields are only updated when the transition completes.
-#[derive(Debug, Clone)]
-pub struct OutputZoomState {
-    level: f64,
-    target_level: f64,
-    focal: Point<f64, Logical>,
-    locked: bool,
-    /// Output-local logical size of the output.
-    ///
-    /// Needed to clamp derived focal points in the accessors.
-    view_size: Size<f64, Logical>,
-    /// In-progress zoom level transition, if any.
-    transition: Option<ZoomLevelTransition>,
-}
-
-/// An in-progress zoom level transition.
+/// committed `view` fields are only updated when the transition completes.
 ///
-/// The level animates in `log2` space so that equal multiplicative steps
-/// (1x→2x and 2x→4x) cover equal animation distance.
+/// The payload types are public so the state can be inspected, but their
+/// fields are private: only this module can construct or mutate them, so
+/// every state change goes through a domain operation.
 #[derive(Debug, Clone)]
-enum ZoomLevelTransition {
-    /// Driven by an [`Animation`] over `log2(level)`.
-    Animation {
-        animation: Animation,
-        /// How the focal point behaves while the level animates.
-        focal: ZoomTransitionFocal,
-        /// Deadzone drift of the anchor's displayed position, if any.
-        ///
-        /// While the displayed cursor is outside the deadzone during a level
-        /// transition, the anchor's display position moves towards the
-        /// deadzone boundary with the shared distance-driven follow physics,
-        /// so the camera starts following immediately instead of waiting for
-        /// the level animation to finish. The value is the timestamp of the
-        /// last drift step, used to compute the frame delta.
-        display_follow: Option<Duration>,
-    },
-    /// A viewport restore driven by an [`Animation`] over progress `0 → 1`.
-    ///
-    /// Used to return from a `hold-zoom` override: unlike [`Self::Animation`],
-    /// which keeps an action anchor in place, a restore moves the whole
-    /// viewport back to a saved state. The level still animates in `log2`
-    /// space between `from_level` and `to_level`, while the focal point
-    /// interpolates linearly between `from_focal` and `to_focal`. When
-    /// restoring to 1x the focal point stays at `from_focal` instead: the
-    /// destination focal point is degenerate at the identity transform, so
-    /// moving it early would only pan the viewport.
-    Restore {
-        animation: Animation,
-        from_level: f64,
-        to_level: f64,
-        from_focal: Point<f64, Logical>,
-        to_focal: Point<f64, Logical>,
-        /// Clock and config captured at restore start, needed to convert the
-        /// restore back into a regular level animation when user input takes
-        /// over the camera mid-flight.
-        clock: Clock,
-        config: niri_config::Animation,
-    },
-    Gesturing {
-        /// The displayed level when the gesture began.
-        start_level: f64,
-        /// The level set by the latest gesture update.
-        current_level: f64,
-        /// How the focal point behaves while the level changes.
-        focal: ZoomTransitionFocal,
-    },
+pub enum OutputZoomState {
+    /// Resting, unlocked: the level is at rest and no follow is active.
+    Idle(ZoomView),
     /// A deadzone-driven camera follow at a resting zoom level.
     ///
     /// The level is already at its target; only the focal point moves,
     /// driven by the shared distance-driven follow physics towards
-    /// `to_focal`. A follow is mutually exclusive with the other
-    /// transitions: it starts only once the level animation, restore or
-    /// gesture that owned the viewport has finished.
-    Follow {
-        /// The clamped focal point the follow converges to.
-        to_focal: Point<f64, Logical>,
-        /// Timestamp of the last follow step.
-        ///
-        /// Owned by the follow itself: it is created with the follow and
-        /// dies with it, so a follow can never consume time that elapsed
-        /// before it started — while tracking was suspended, the compositor
-        /// was idle, or a different transition owned the viewport.
-        last_step: Duration,
+    /// `follow.to_focal`.
+    Follow { view: ZoomView, follow: FollowState },
+    /// An autonomous level transition owns the viewport.
+    Zooming {
+        view: ZoomView,
+        zooming: ZoomingState,
     },
+    /// A level command and a deadzone drift of its anchor run together.
+    ///
+    /// The drift is the follow's share of the level transition: the camera
+    /// starts following the cursor during the zoom animation instead of
+    /// after it. When the command completes first, the drift continues
+    /// seamlessly as a resting [`Self::Follow`].
+    ZoomingFollow {
+        view: ZoomView,
+        zooming: ZoomCommandState,
+        follow: CombinedFollow,
+    },
+    /// A direct-manipulation gesture owns the level.
+    Gesture {
+        view: ZoomView,
+        gesture: GesturePayload,
+    },
+    /// Resting, locked: the camera does not track the pointer.
+    Locked(ZoomView),
+    /// A locked autonomous level transition owns the viewport.
+    LockedZooming {
+        view: ZoomView,
+        zooming: LockedZoomingState,
+    },
+    /// A locked direct-manipulation gesture owns the level.
+    LockedGesture {
+        view: ZoomView,
+        gesture: LockedGesturePayload,
+    },
+}
+
+/// The resting zoom view: committed level, focal point and output size.
+///
+/// `level` is the committed zoom level. `focal` is the fixed point of the
+/// viewport transform; it is kept within the output so that the logical
+/// viewport never leaves the output bounds. `view_size` is the output-local
+/// logical size of the output, needed to clamp derived focal points in the
+/// accessors.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoomView {
+    level: f64,
+    focal: Point<f64, Logical>,
+    view_size: Size<f64, Logical>,
+}
+
+/// An autonomous level transition of an unlocked output.
+#[derive(Debug, Clone)]
+pub enum ZoomingState {
+    /// A user zoom command: animates `log2(level)` towards `target`.
+    Command(ZoomCommandState),
+    /// A viewport restore driven by an [`Animation`] over progress `0 → 1`.
+    Restore(RestorePayload),
+}
+
+/// An autonomous level transition of a locked output.
+///
+/// A locked output has no restores: a restore requested while locked becomes
+/// a regular command, and locking during a restore converts it in place.
+#[derive(Debug, Clone)]
+pub enum LockedZoomingState {
+    /// A user zoom command: animates `log2(level)` towards `target`.
+    Command(LockedCommandState),
+}
+
+/// A zoom command of an unlocked output.
+///
+/// `In`, `Out` and `Value` record which operation created the command
+/// (`zoom-in`, `zoom-out`, `set-target-level`); they share the anchored
+/// payload and identical physics. `ToIdentity` is the `target == 1` special
+/// case: the anchored focal solve degenerates as the level approaches 1 (it
+/// divides by `level - 1`), so the command keeps the focal point fixed and
+/// the zoom-out pivots around its displayed position instead.
+#[derive(Debug, Clone)]
+pub enum ZoomCommandState {
+    /// A `zoom-in` command towards `target`.
+    In { target: f64, payload: ZoomCommand },
+    /// A `zoom-out` command towards `target`.
+    Out { target: f64, payload: ZoomCommand },
+    /// An absolute `set-target-level` command towards `target`.
+    Value { target: f64, payload: ZoomCommand },
+    /// A command towards the identity transform (`target == 1`).
+    ToIdentity { payload: IdentityCommand },
+}
+
+/// A zoom command of a locked output.
+///
+/// The locked anchor is always the viewport center: the user-facing
+/// invariant while locked is that the content displayed at the center stays
+/// centered. `ToIdentity` keeps the focal point fixed like the unlocked
+/// variant.
+#[derive(Debug, Clone)]
+pub enum LockedCommandState {
+    /// A `zoom-in` command towards `target`.
+    In {
+        target: f64,
+        payload: LockedZoomCommand,
+    },
+    /// A `zoom-out` command towards `target`.
+    Out {
+        target: f64,
+        payload: LockedZoomCommand,
+    },
+    /// An absolute `set-target-level` command towards `target`.
+    Value {
+        target: f64,
+        payload: LockedZoomCommand,
+    },
+    /// A command towards the identity transform (`target == 1`).
+    ToIdentity { payload: LockedIdentityCommand },
+}
+
+/// Payload of an anchored unlocked zoom command.
+///
+/// The level animates in `log2` space so that equal multiplicative steps
+/// (1x→2x and 2x→4x) cover equal animation distance. The anchor keeps the
+/// `content` point at the `display` position while the level animates,
+/// subject to the output bounds clamp.
+#[derive(Debug, Clone)]
+pub struct ZoomCommand {
+    animation: Animation,
+    anchor: FlexibleAnchor,
+}
+
+/// Payload of a zoom command towards the identity transform.
+///
+/// The focal point stays fixed while the level animates to exactly 1: the
+/// anchored solve is degenerate at the identity transform, so the zoom-out
+/// pivots around the focal point's displayed position and lands
+/// continuously.
+#[derive(Debug, Clone)]
+pub struct IdentityCommand {
+    animation: Animation,
+    focal: Point<f64, Logical>,
+}
+
+/// Payload of an anchored locked zoom command.
+#[derive(Debug, Clone)]
+pub struct LockedZoomCommand {
+    animation: Animation,
+    anchor: LockedAnchor,
+}
+
+/// Payload of a locked zoom command towards the identity transform.
+#[derive(Debug, Clone)]
+pub struct LockedIdentityCommand {
+    animation: Animation,
+    focal: Point<f64, Logical>,
+}
+
+/// The anchor of an unlocked zoom command.
+///
+/// Both points are output-local logical coordinates snapshotted at
+/// (re)target time: `display` is where `content` was shown when the
+/// transition started. While a [`CombinedFollow`] drift is active, `display`
+/// is mutated in place by the distance-driven step.
+#[derive(Debug, Clone, Copy)]
+pub struct FlexibleAnchor {
+    content: Point<f64, Logical>,
+    display: Point<f64, Logical>,
+}
+
+/// The anchor of a locked zoom command: the viewport center.
+///
+/// `display` is the output-local center snapshotted at command creation and
+/// `content` is the content point displayed there, so the viewed content
+/// stays centered while the level animates.
+#[derive(Debug, Clone, Copy)]
+pub struct LockedAnchor {
+    content: Point<f64, Logical>,
+    display: Point<f64, Logical>,
+}
+
+/// A viewport restore driven by an [`Animation`] over progress `0 → 1`.
+///
+/// Used to return from a `hold-zoom` override: unlike a command, which keeps
+/// an action anchor in place, a restore moves the whole viewport back to a
+/// saved state. The level still animates in `log2` space between
+/// `from_level` and `to_level`, while the focal point interpolates linearly
+/// between `from_focal` and `to_focal`. When restoring to 1x the focal point
+/// stays at `from_focal` instead: the destination focal point is degenerate
+/// at the identity transform, so moving it early would only pan the
+/// viewport.
+#[derive(Debug, Clone)]
+pub struct RestorePayload {
+    animation: Animation,
+    from_level: f64,
+    to_level: f64,
+    from_focal: Point<f64, Logical>,
+    to_focal: Point<f64, Logical>,
+    /// Clock and config captured at restore start, needed to convert the
+    /// restore back into a regular level command when user input takes over
+    /// the camera mid-flight.
+    clock: Clock,
+    config: niri_config::Animation,
+}
+
+/// Payload of an unlocked direct-manipulation gesture.
+///
+/// The gesture owns the level directly: gesture updates set the displayed
+/// level, with no clock involvement.
+#[derive(Debug, Clone)]
+pub struct GesturePayload {
+    /// The displayed level when the gesture began.
+    start_level: f64,
+    /// The level set by the latest gesture update.
+    current_level: f64,
+    /// How the focal point behaves while the level changes.
+    focal: GestureFocal,
+}
+
+/// Payload of a locked direct-manipulation gesture.
+#[derive(Debug, Clone)]
+pub struct LockedGesturePayload {
+    /// The displayed level when the gesture began.
+    start_level: f64,
+    /// The level set by the latest gesture update.
+    current_level: f64,
+    /// How the focal point behaves while the level changes.
+    focal: LockedGestureFocal,
+}
+
+/// Focal point behavior during an unlocked gesture.
+#[derive(Debug, Clone, Copy)]
+pub enum GestureFocal {
+    /// Keeps the `content` point at the `display` position while the level
+    /// changes, subject to the output bounds clamp.
+    Anchored(FlexibleAnchor),
+    /// The focal point stays fixed while the level changes.
+    ///
+    /// Reached by locking mid-gesture: the camera freezes at its current
+    /// displayed position for the rest of the gesture.
+    Fixed { focal: Point<f64, Logical> },
+}
+
+/// Focal point behavior during a locked gesture.
+#[derive(Debug, Clone, Copy)]
+pub enum LockedGestureFocal {
+    /// Keeps the content point displayed at the viewport center centered
+    /// while the level changes.
+    Anchored(LockedAnchor),
+    /// The focal point stays fixed while the level changes.
+    ///
+    /// Reached by locking mid-gesture: the camera freezes at its current
+    /// displayed position for the rest of the gesture.
+    Fixed { focal: Point<f64, Logical> },
+}
+
+/// A resting deadzone follow.
+///
+/// The level is already at its target; only the focal point moves, driven by
+/// the shared distance-driven follow physics towards `to_focal`. A follow is
+/// mutually exclusive with the other transitions: it starts only once the
+/// level animation, restore or gesture that owned the viewport has finished.
+#[derive(Debug, Clone, Copy)]
+pub struct FollowState {
+    /// The clamped focal point the follow converges to.
+    to_focal: Point<f64, Logical>,
+    /// Timestamp of the last follow step.
+    ///
+    /// Owned by the follow itself: it is created with the follow and dies
+    /// with it, so a follow can never consume time that elapsed before it
+    /// started — while tracking was suspended, the compositor was idle, or a
+    /// different transition owned the viewport.
+    last_step: Duration,
+}
+
+/// A deadzone drift of a command anchor's displayed position.
+///
+/// While the displayed cursor is outside the deadzone during a level
+/// command, the anchor's display position moves towards the deadzone
+/// boundary with the shared distance-driven follow physics, so the camera
+/// starts following immediately instead of waiting for the level animation
+/// to finish. The payload stores enough live geometry — the last step
+/// timestamp and the drift's displayed destination — to become a resting
+/// [`FollowState`] when the command completes first, without consuming stale
+/// time.
+#[derive(Debug, Clone, Copy)]
+pub struct CombinedFollow {
+    /// Timestamp of the last drift step.
+    last_step: Duration,
+    /// The displayed destination of the drift: the nearest point inside/on
+    /// the deadzone at the last evaluation.
+    target_display: Point<f64, Logical>,
 }
 
 /// Zoom-out results within this distance of 1 are snapped to exactly 1 so
@@ -120,25 +346,15 @@ pub(crate) const ZOOM_SNAP_TO_ONE_EPSILON: f64 = 1e-9;
 /// rest instead of mapping a huge progress velocity out of a tiny delta.
 const RESTORE_VELOCITY_MIN_DELTA: f64 = 1e-3;
 
-/// Focal point behavior during a zoom level transition.
+/// Which operation created a zoom command.
+///
+/// The direction is resolved from the user intent by the caller and recorded
+/// in the command variant; it does not change the physics.
 #[derive(Debug, Clone, Copy)]
-enum ZoomTransitionFocal {
-    /// Keeps the `content` point at the `display` position while the level
-    /// animates, subject to the output bounds clamp.
-    ///
-    /// Both points are output-local logical coordinates snapshotted at
-    /// (re)target time: `display` is where `content` was shown when the
-    /// transition started.
-    Anchored {
-        content: Point<f64, Logical>,
-        display: Point<f64, Logical>,
-    },
-
-    /// The focal point stays fixed while the level animates.
-    ///
-    /// Used while the zoom is locked: the camera does not move, so the
-    /// displayed content shifts relative to the screen instead.
-    Fixed { focal: Point<f64, Logical> },
+enum CommandDirection {
+    In,
+    Out,
+    Value,
 }
 
 /// The distance-driven deadzone follow input for one frame.
@@ -159,6 +375,94 @@ struct DeadzoneFollowInput {
     overshoot_length: f64,
 }
 
+impl ZoomCommandState {
+    /// The level this command animates towards.
+    fn target(&self) -> f64 {
+        match self {
+            Self::In { target, .. } | Self::Out { target, .. } | Self::Value { target, .. } => {
+                *target
+            }
+            Self::ToIdentity { .. } => 1.,
+        }
+    }
+
+    fn animation(&self) -> &Animation {
+        match self {
+            Self::In { payload, .. } | Self::Out { payload, .. } | Self::Value { payload, .. } => {
+                &payload.animation
+            }
+            Self::ToIdentity { payload } => &payload.animation,
+        }
+    }
+
+    /// The command's anchor, if it has one.
+    ///
+    /// `ToIdentity` has no anchor: its focal point is fixed.
+    fn anchor(&self) -> Option<&FlexibleAnchor> {
+        match self {
+            Self::In { payload, .. } | Self::Out { payload, .. } | Self::Value { payload, .. } => {
+                Some(&payload.anchor)
+            }
+            Self::ToIdentity { .. } => None,
+        }
+    }
+
+    fn anchor_mut(&mut self) -> Option<&mut FlexibleAnchor> {
+        match self {
+            Self::In { payload, .. } | Self::Out { payload, .. } | Self::Value { payload, .. } => {
+                Some(&mut payload.anchor)
+            }
+            Self::ToIdentity { .. } => None,
+        }
+    }
+}
+
+impl ZoomingState {
+    /// The mutable anchor of a command, if this is an anchored command.
+    fn anchor_mut(&mut self) -> Option<&mut FlexibleAnchor> {
+        match self {
+            Self::Command(c) => c.anchor_mut(),
+            Self::Restore(_) => None,
+        }
+    }
+}
+
+impl LockedCommandState {
+    /// The level this command animates towards.
+    fn target(&self) -> f64 {
+        match self {
+            Self::In { target, .. } | Self::Out { target, .. } | Self::Value { target, .. } => {
+                *target
+            }
+            Self::ToIdentity { .. } => 1.,
+        }
+    }
+
+    fn animation(&self) -> &Animation {
+        match self {
+            Self::In { payload, .. } | Self::Out { payload, .. } | Self::Value { payload, .. } => {
+                &payload.animation
+            }
+            Self::ToIdentity { payload } => &payload.animation,
+        }
+    }
+}
+
+impl LockedZoomingState {
+    /// The level this transition animates towards.
+    fn target(&self) -> f64 {
+        match self {
+            Self::Command(c) => c.target(),
+        }
+    }
+
+    fn animation(&self) -> &Animation {
+        match self {
+            Self::Command(c) => c.animation(),
+        }
+    }
+}
+
 impl OutputZoomState {
     /// Creates a zoom state for an output of the given size.
     ///
@@ -171,72 +475,171 @@ impl OutputZoomState {
         assert!(view_size.w.is_finite() && view_size.h.is_finite());
         assert!(view_size.w >= 0. && view_size.h >= 0.);
 
-        Self {
+        Self::Idle(ZoomView {
             level: 1.,
-            target_level: 1.,
             focal: view_size.to_point().downscale(2.),
-            locked: false,
             view_size,
-            transition: None,
+        })
+    }
+
+    /// The view shared by every state.
+    fn view(&self) -> &ZoomView {
+        match self {
+            Self::Idle(view)
+            | Self::Follow { view, .. }
+            | Self::Zooming { view, .. }
+            | Self::ZoomingFollow { view, .. }
+            | Self::Gesture { view, .. }
+            | Self::Locked(view)
+            | Self::LockedZooming { view, .. }
+            | Self::LockedGesture { view, .. } => view,
+        }
+    }
+
+    fn view_mut(&mut self) -> &mut ZoomView {
+        match self {
+            Self::Idle(view)
+            | Self::Follow { view, .. }
+            | Self::Zooming { view, .. }
+            | Self::ZoomingFollow { view, .. }
+            | Self::Gesture { view, .. }
+            | Self::Locked(view)
+            | Self::LockedZooming { view, .. }
+            | Self::LockedGesture { view, .. } => view,
+        }
+    }
+
+    /// Moves the current state out, leaving a resting `Idle` behind.
+    ///
+    /// The placeholder's view is a copy of the current one; callers that
+    /// need the live camera position must sample `focal()`/`level()` before
+    /// taking, since the placeholder only carries the committed fields.
+    /// `ZoomView` is `Copy`, so the placeholder is cheap and the real
+    /// payload is moved, never cloned.
+    fn take(&mut self) -> Self {
+        mem::replace(self, Self::Idle(*self.view()))
+    }
+
+    /// Builds a command variant classified by the direction of the level
+    /// delta: `In` when the target is above the displayed level, `Out` when
+    /// below, `Value` when equal. Used for commands synthesized internally
+    /// (restore takeovers), where there is no originating operation kind.
+    fn command_by_delta(target: f64, level: f64, payload: ZoomCommand) -> ZoomCommandState {
+        if target > level {
+            ZoomCommandState::In { target, payload }
+        } else if target < level {
+            ZoomCommandState::Out { target, payload }
+        } else {
+            ZoomCommandState::Value { target, payload }
+        }
+    }
+
+    /// The locked counterpart of [`command_by_delta`](Self::command_by_delta).
+    fn locked_command_by_delta(
+        target: f64,
+        level: f64,
+        payload: LockedZoomCommand,
+    ) -> LockedCommandState {
+        if target > level {
+            LockedCommandState::In { target, payload }
+        } else if target < level {
+            LockedCommandState::Out { target, payload }
+        } else {
+            LockedCommandState::Value { target, payload }
         }
     }
 
     /// The currently displayed zoom level.
     ///
     /// While a transition is in progress this samples the animation; once the
-    /// animation first reaches its target this returns `target_level` exactly.
+    /// animation first reaches its target this returns the target exactly.
     pub fn level(&self) -> f64 {
-        let Some(transition) = &self.transition else {
-            return self.level;
-        };
-
-        match transition {
-            ZoomLevelTransition::Gesturing { current_level, .. } => *current_level,
-            ZoomLevelTransition::Animation { animation, .. } => {
-                if animation.is_clamped_done() {
-                    // Commit the exact target rather than exp2(log2(target))
-                    // so that level == 1.0 stays exact for the identity fast
-                    // path.
-                    return self.target_level;
-                }
-                // Clamp to the animation endpoints so that an underdamped
-                // spring can never display a level past the target or below
-                // the start.
-                let z = animation.value().clamp(
-                    animation.from().min(animation.to()),
-                    animation.from().max(animation.to()),
-                );
-                z.exp2()
-            }
-            ZoomLevelTransition::Restore {
-                animation,
-                from_level,
-                to_level,
-                ..
-            } => {
-                if animation.is_clamped_done() {
-                    return self.target_level;
-                }
-                // The progress animation is clamped to 0..=1, so the level
-                // stays between the endpoints even for an underdamped spring.
-                let p = animation.clamped_value().clamp(0., 1.);
-                let z = from_level.log2() + (to_level.log2() - from_level.log2()) * p;
-                z.exp2()
-            }
-            ZoomLevelTransition::Follow { .. } => {
-                // The level is already resting at its target; a follow only
-                // moves the focal point.
-                self.level
-            }
+        match self {
+            Self::Idle(view) | Self::Follow { view, .. } | Self::Locked(view) => view.level,
+            Self::Zooming { zooming, .. } => match zooming {
+                ZoomingState::Command(c) => Self::command_level(c),
+                ZoomingState::Restore(r) => Self::restore_level(r),
+            },
+            Self::ZoomingFollow { zooming, .. } => Self::command_level(zooming),
+            Self::Gesture { gesture, .. } => gesture.current_level,
+            Self::LockedZooming { zooming, .. } => match zooming {
+                LockedZoomingState::Command(c) => Self::locked_command_level(c),
+            },
+            Self::LockedGesture { gesture, .. } => gesture.current_level,
         }
+    }
+
+    /// The displayed level of an unlocked command.
+    ///
+    /// Once the animation first reaches its target this returns the target
+    /// exactly rather than `exp2(log2(target))`, so that level == 1.0 stays
+    /// exact for the identity fast path. In flight the value is clamped to
+    /// the animation endpoints so that an underdamped spring can never
+    /// display a level past the target or below the start.
+    fn command_level(c: &ZoomCommandState) -> f64 {
+        let animation = c.animation();
+        if animation.is_clamped_done() {
+            return c.target();
+        }
+        let z = animation.value().clamp(
+            animation.from().min(animation.to()),
+            animation.from().max(animation.to()),
+        );
+        z.exp2()
+    }
+
+    fn locked_command_level(c: &LockedCommandState) -> f64 {
+        let animation = c.animation();
+        if animation.is_clamped_done() {
+            return c.target();
+        }
+        let z = animation.value().clamp(
+            animation.from().min(animation.to()),
+            animation.from().max(animation.to()),
+        );
+        z.exp2()
+    }
+
+    /// The displayed level of a restore.
+    ///
+    /// The progress animation is clamped to `0..=1`, so the level stays
+    /// between the endpoints even for an underdamped spring.
+    fn restore_level(r: &RestorePayload) -> f64 {
+        if r.animation.is_clamped_done() {
+            return r.to_level;
+        }
+        let p = r.animation.clamped_value().clamp(0., 1.);
+        let z = r.from_level.log2() + (r.to_level.log2() - r.from_level.log2()) * p;
+        z.exp2()
     }
 
     /// The user-requested zoom level.
     ///
     /// May differ from [`level()`](Self::level) while a continuous action or
-    /// animation is in progress.
+    /// animation is in progress. There is no authoritative target outside an
+    /// in-progress operation: at rest this is the committed level.
     pub fn target_level(&self) -> f64 {
-        self.target_level
+        match self {
+            Self::Idle(view) | Self::Follow { view, .. } | Self::Locked(view) => view.level,
+            Self::Zooming { zooming, .. } => match zooming {
+                ZoomingState::Command(c) => c.target(),
+                ZoomingState::Restore(r) => r.to_level,
+            },
+            Self::ZoomingFollow { zooming, .. } => zooming.target(),
+            Self::Gesture { gesture, .. } => gesture.current_level,
+            Self::LockedGesture { gesture, .. } => gesture.current_level,
+            Self::LockedZooming { zooming, .. } => zooming.target(),
+        }
+    }
+
+    /// The level that incremental zoom actions operate on.
+    ///
+    /// This is the current user intent: the level `zoom-in`/`zoom-out` and
+    /// `toggle-zoom` base their next target on. It coincides with
+    /// [`target_level()`](Self::target_level): during a gesture it is the
+    /// level set by the latest update, during a restore the saved target.
+    pub fn intent_level(&self) -> f64 {
+        self.target_level()
     }
 
     /// The fixed point of the current viewport transform, in output-local
@@ -245,75 +648,149 @@ impl OutputZoomState {
     /// While a transition is in progress this is derived from the transition
     /// state at the current animated level.
     pub fn focal(&self) -> Point<f64, Logical> {
-        let Some(transition) = &self.transition else {
-            return self.focal;
-        };
-
-        match transition {
-            ZoomLevelTransition::Animation { focal, .. }
-            | ZoomLevelTransition::Gesturing { focal, .. } => match focal {
-                // The anchor's display position already carries any deadzone
-                // drift: it is mutated in place by the distance-driven step.
-                ZoomTransitionFocal::Anchored { content, display } => {
-                    self.anchored_focal(*content, *display, self.level())
-                }
-                ZoomTransitionFocal::Fixed { focal } => Self::clamp_focal(*focal, self.view_size),
-            },
-            ZoomLevelTransition::Restore {
-                animation,
-                from_focal,
-                to_level,
-                to_focal,
-                ..
-            } => {
-                // Restoring to 1x: the destination focal point is visually
-                // degenerate (the transform is the identity), so the focal
-                // point stays at `from_focal` until the transition commits.
-                // Interpolating it early would pan the viewport towards a
-                // point that only matters once the level reaches 1.
-                if *to_level == 1. && !animation.is_clamped_done() {
-                    return Self::clamp_focal(*from_focal, self.view_size);
-                }
-
-                // The focal point interpolates with the clamped progress so
-                // that it never overshoots the restore destination.
-                let p = animation.clamped_value().clamp(0., 1.);
-                let to_focal = Self::clamp_focal(*to_focal, self.view_size);
-                let focal = Point::from((
-                    from_focal.x + (to_focal.x - from_focal.x) * p,
-                    from_focal.y + (to_focal.y - from_focal.y) * p,
-                ));
-                Self::clamp_focal(focal, self.view_size)
-            }
-            ZoomLevelTransition::Follow { .. } => {
+        match self {
+            Self::Idle(view) | Self::Locked(view) => view.focal,
+            Self::Follow { view, .. } => {
                 // The distance-driven follow mutates the committed focal
                 // point in place every frame.
-                Self::clamp_focal(self.focal, self.view_size)
+                Self::clamp_focal(view.focal, view.view_size)
             }
+            Self::Zooming { view, zooming } => match zooming {
+                ZoomingState::Command(c) => Self::command_focal(view, c),
+                ZoomingState::Restore(r) => Self::restore_focal(view, r),
+            },
+            Self::ZoomingFollow { view, zooming, .. } => Self::command_focal(view, zooming),
+            Self::Gesture { view, gesture } => Self::gesture_focal(view, gesture),
+            Self::LockedZooming { view, zooming } => match zooming {
+                LockedZoomingState::Command(c) => Self::locked_command_focal(view, c),
+            },
+            Self::LockedGesture { view, gesture } => Self::locked_gesture_focal(view, gesture),
+        }
+    }
+
+    /// The focal point of an unlocked command at the current level.
+    ///
+    /// The anchor's display position already carries any deadzone drift: it
+    /// is mutated in place by the distance-driven step.
+    fn command_focal(view: &ZoomView, c: &ZoomCommandState) -> Point<f64, Logical> {
+        match c.anchor() {
+            Some(anchor) => {
+                Self::anchored_focal(view, anchor.content, anchor.display, Self::command_level(c))
+            }
+            None => match c {
+                ZoomCommandState::ToIdentity { payload } => {
+                    Self::clamp_focal(payload.focal, view.view_size)
+                }
+                _ => unreachable!(),
+            },
+        }
+    }
+
+    fn locked_command_focal(view: &ZoomView, c: &LockedCommandState) -> Point<f64, Logical> {
+        match c {
+            LockedCommandState::In { payload, .. }
+            | LockedCommandState::Out { payload, .. }
+            | LockedCommandState::Value { payload, .. } => Self::anchored_focal(
+                view,
+                payload.anchor.content,
+                payload.anchor.display,
+                Self::locked_command_level(c),
+            ),
+            LockedCommandState::ToIdentity { payload } => {
+                Self::clamp_focal(payload.focal, view.view_size)
+            }
+        }
+    }
+
+    /// The focal point of a restore at the current progress.
+    fn restore_focal(view: &ZoomView, r: &RestorePayload) -> Point<f64, Logical> {
+        // Restoring to 1x: the destination focal point is visually
+        // degenerate (the transform is the identity), so the focal point
+        // stays at `from_focal` until the transition commits. Interpolating
+        // it early would pan the viewport towards a point that only matters
+        // once the level reaches 1.
+        if r.to_level == 1. && !r.animation.is_clamped_done() {
+            return Self::clamp_focal(r.from_focal, view.view_size);
+        }
+
+        // The focal point interpolates with the clamped progress so that it
+        // never overshoots the restore destination.
+        let p = r.animation.clamped_value().clamp(0., 1.);
+        let to_focal = Self::clamp_focal(r.to_focal, view.view_size);
+        let focal = Point::from((
+            r.from_focal.x + (to_focal.x - r.from_focal.x) * p,
+            r.from_focal.y + (to_focal.y - r.from_focal.y) * p,
+        ));
+        Self::clamp_focal(focal, view.view_size)
+    }
+
+    fn gesture_focal(view: &ZoomView, g: &GesturePayload) -> Point<f64, Logical> {
+        match &g.focal {
+            GestureFocal::Anchored(anchor) => {
+                Self::anchored_focal(view, anchor.content, anchor.display, g.current_level)
+            }
+            GestureFocal::Fixed { focal } => Self::clamp_focal(*focal, view.view_size),
+        }
+    }
+
+    fn locked_gesture_focal(view: &ZoomView, g: &LockedGesturePayload) -> Point<f64, Logical> {
+        match &g.focal {
+            LockedGestureFocal::Anchored(anchor) => {
+                Self::anchored_focal(view, anchor.content, anchor.display, g.current_level)
+            }
+            LockedGestureFocal::Fixed { focal } => Self::clamp_focal(*focal, view.view_size),
         }
     }
 
     /// Whether focal tracking is locked.
     pub fn is_locked(&self) -> bool {
-        self.locked
+        matches!(
+            self,
+            Self::Locked(_) | Self::LockedZooming { .. } | Self::LockedGesture { .. }
+        )
     }
 
     /// Whether a zoom level transition is in progress.
     ///
-    /// A [`ZoomLevelTransition::Gesturing`] is not an animation: gesture
-    /// events drive the displayed level directly and queue their own redraws.
+    /// A gesture is not an animation: gesture events drive the displayed
+    /// level directly and queue their own redraws.
     pub fn is_animating(&self) -> bool {
-        match &self.transition {
-            Some(ZoomLevelTransition::Animation {
-                animation,
-                display_follow,
-                ..
-            }) => !animation.is_clamped_done() || display_follow.is_some(),
-            Some(ZoomLevelTransition::Restore { animation, .. }) => !animation.is_clamped_done(),
+        match self {
+            Self::Zooming { zooming, .. } => match zooming {
+                ZoomingState::Command(c) => !c.animation().is_clamped_done(),
+                ZoomingState::Restore(r) => !r.animation.is_clamped_done(),
+            },
+            // A combined drift is always active while the state exists, so
+            // the state animates until the command completes and the drift
+            // is handed off to a resting follow.
+            Self::ZoomingFollow { .. } => true,
+            Self::LockedZooming { zooming, .. } => !zooming.animation().is_clamped_done(),
             // A distance-driven follow animates until it reaches its target.
-            Some(ZoomLevelTransition::Follow { to_focal, .. }) => self.focal() != *to_focal,
-            Some(ZoomLevelTransition::Gesturing { .. }) | None => false,
+            Self::Follow { follow, .. } => self.focal() != follow.to_focal,
+            Self::Idle(_) | Self::Gesture { .. } | Self::Locked(_) | Self::LockedGesture { .. } => {
+                false
+            }
         }
+    }
+
+    /// Whether an autonomous level transition is in progress.
+    ///
+    /// Autonomous means clock-driven: commands, restores and their combined
+    /// drift, locked or not. Direct-manipulation gestures and resting
+    /// follows are not zooming.
+    pub fn is_zooming(&self) -> bool {
+        matches!(
+            self,
+            Self::Zooming { .. } | Self::ZoomingFollow { .. } | Self::LockedZooming { .. }
+        )
+    }
+
+    /// Whether a deadzone follow currently owns the focal point.
+    ///
+    /// Covers both the resting follow and the combined drift inside a level
+    /// command.
+    pub fn is_following(&self) -> bool {
+        matches!(self, Self::Follow { .. } | Self::ZoomingFollow { .. })
     }
 
     /// Whether a direct-manipulation gesture currently owns the zoom level.
@@ -322,55 +799,362 @@ impl OutputZoomState {
     /// [`target_level()`](Self::target_level) both report the level set by
     /// the latest gesture update.
     pub fn is_gesturing(&self) -> bool {
-        matches!(self.transition, Some(ZoomLevelTransition::Gesturing { .. }))
+        matches!(self, Self::Gesture { .. } | Self::LockedGesture { .. })
+    }
+
+    /// The animation driving the current autonomous transition, if any.
+    ///
+    /// Used by production code that samples animation state and by tests
+    /// that verify velocity carry-over.
+    fn animation(&self) -> Option<&Animation> {
+        match self {
+            Self::Zooming { zooming, .. } => match zooming {
+                ZoomingState::Command(c) => Some(c.animation()),
+                ZoomingState::Restore(r) => Some(&r.animation),
+            },
+            Self::ZoomingFollow { zooming, .. } => Some(zooming.animation()),
+            Self::LockedZooming { zooming, .. } => Some(zooming.animation()),
+            Self::Idle(_)
+            | Self::Follow { .. }
+            | Self::Gesture { .. }
+            | Self::Locked(_)
+            | Self::LockedGesture { .. } => None,
+        }
     }
 
     /// Sets whether focal tracking is locked.
     ///
-    /// Locking during a transition freezes the focal point at its current
-    /// displayed value: the level animation continues, but the camera stops
-    /// tracking the anchor. Unlocking keeps the current focal point; regular
-    /// deadzone tracking can move it again on the next pointer event.
-    pub fn set_locked(&mut self, locked: bool) {
-        // A follow owns the focal point: materialize its current displayed
-        // value first so the camera freezes where it actually is.
-        self.commit_follow_focal();
-
-        self.locked = locked;
-
+    /// `pointer` is the canonical pointer position in output-local content
+    /// coordinates; callers pass the output center when the pointer is
+    /// elsewhere.
+    ///
+    /// Locking materializes the current displayed camera position first (a
+    /// running follow commits its focal), drops any deadzone drift, and
+    /// re-anchors an in-flight command or restore on the viewport center, so
+    /// the viewed content stays centered. A gesture freezes the focal point
+    /// at its current displayed value instead: the level keeps following the
+    /// fingers while the camera stops tracking the anchor.
+    ///
+    /// Unlocking does not move the viewport: an in-flight command re-anchors
+    /// on the canonical pointer at its current displayed position, a
+    /// `ToIdentity` command keeps its fixed focal point, and a gesture keeps
+    /// its current focal mode. Regular deadzone tracking can move the camera
+    /// again on the next pointer event.
+    pub fn set_locked(&mut self, locked: bool, pointer: Point<f64, Logical>) {
         if locked {
-            let current = self.focal();
-            if matches!(self.transition, Some(ZoomLevelTransition::Restore { .. })) {
-                // Locking during a restore discards the focal destination:
-                // the camera freezes at its current position while the level
-                // keeps animating towards the restore target.
-                self.convert_restore_to_level_animation(ZoomTransitionFocal::Fixed {
-                    focal: current,
-                });
-            } else {
-                match &mut self.transition {
-                    Some(ZoomLevelTransition::Animation {
-                        focal,
-                        display_follow,
-                        ..
-                    }) => {
-                        *focal = ZoomTransitionFocal::Fixed { focal: current };
-                        // The lock freezes the camera: drop any deadzone
-                        // drift so it cannot keep moving under the lock.
-                        *display_follow = None;
-                    }
-                    Some(ZoomLevelTransition::Gesturing { focal, .. }) => {
-                        *focal = ZoomTransitionFocal::Fixed { focal: current };
-                    }
-                    _ => (),
-                }
-            }
+            self.lock();
+        } else {
+            self.unlock(pointer);
         }
     }
 
     /// Toggles whether focal tracking is locked.
-    pub fn toggle_locked(&mut self) {
-        self.set_locked(!self.locked);
+    ///
+    /// `pointer` is the canonical pointer position used to re-anchor an
+    /// in-flight command on unlock.
+    pub fn toggle_locked(&mut self, pointer: Point<f64, Logical>) {
+        self.set_locked(!self.is_locked(), pointer);
+    }
+
+    /// Transitions the state machine into its locked counterpart.
+    fn lock(&mut self) {
+        // The displayed camera position and the center anchor are derived
+        // from the current state, so sample them before taking it apart.
+        let current_focal = self.focal();
+        let center = self.view().view_size.to_point().downscale(2.);
+        let center_content = self.viewport_transform().apply_inverse(center);
+        let displayed_level = self.level();
+
+        *self = match self.take() {
+            Self::Idle(view) | Self::Follow { view, .. } | Self::Locked(view) => Self::Locked(view),
+            Self::Zooming { view, zooming } => {
+                let command = match zooming {
+                    ZoomingState::Command(c) => Self::lock_command(c, center_content, center),
+                    ZoomingState::Restore(r) => Self::restore_to_locked_command(
+                        r,
+                        displayed_level,
+                        current_focal,
+                        center_content,
+                        center,
+                    ),
+                };
+                Self::LockedZooming {
+                    view,
+                    zooming: LockedZoomingState::Command(command),
+                }
+            }
+            Self::ZoomingFollow { view, zooming, .. } => Self::LockedZooming {
+                view,
+                zooming: LockedZoomingState::Command(Self::lock_command(
+                    zooming,
+                    center_content,
+                    center,
+                )),
+            },
+            Self::Gesture { view, gesture } => Self::LockedGesture {
+                view,
+                gesture: LockedGesturePayload {
+                    start_level: gesture.start_level,
+                    current_level: gesture.current_level,
+                    // Locking mid-gesture freezes the focal point at its
+                    // current displayed value for the rest of the gesture.
+                    focal: LockedGestureFocal::Fixed {
+                        focal: current_focal,
+                    },
+                },
+            },
+            Self::LockedZooming { view, zooming } => {
+                // Already locked: re-anchor on the current center content.
+                let zooming = match zooming {
+                    LockedZoomingState::Command(c) => LockedZoomingState::Command(
+                        Self::reanchor_locked_command(c, current_focal, center_content, center),
+                    ),
+                };
+                Self::LockedZooming { view, zooming }
+            }
+            Self::LockedGesture { view, gesture } => Self::LockedGesture {
+                view,
+                gesture: LockedGesturePayload {
+                    focal: LockedGestureFocal::Fixed {
+                        focal: current_focal,
+                    },
+                    ..gesture
+                },
+            },
+        };
+    }
+
+    /// Converts an unlocked command into its locked counterpart.
+    ///
+    /// The animation is moved over unchanged; only the anchor is replaced by
+    /// the viewport-center anchor.
+    fn lock_command(
+        c: ZoomCommandState,
+        center_content: Point<f64, Logical>,
+        center: Point<f64, Logical>,
+    ) -> LockedCommandState {
+        let anchor = LockedAnchor {
+            content: center_content,
+            display: center,
+        };
+        match c {
+            ZoomCommandState::In { target, payload } => LockedCommandState::In {
+                target,
+                payload: LockedZoomCommand {
+                    animation: payload.animation,
+                    anchor,
+                },
+            },
+            ZoomCommandState::Out { target, payload } => LockedCommandState::Out {
+                target,
+                payload: LockedZoomCommand {
+                    animation: payload.animation,
+                    anchor,
+                },
+            },
+            ZoomCommandState::Value { target, payload } => LockedCommandState::Value {
+                target,
+                payload: LockedZoomCommand {
+                    animation: payload.animation,
+                    anchor,
+                },
+            },
+            ZoomCommandState::ToIdentity { payload } => LockedCommandState::ToIdentity {
+                payload: LockedIdentityCommand {
+                    animation: payload.animation,
+                    focal: payload.focal,
+                },
+            },
+        }
+    }
+
+    /// Re-anchors a locked command on the viewport center.
+    ///
+    /// Used when locking an already-locked command: the animation is moved
+    /// over unchanged and the anchor is replaced by the current center
+    /// content. `ToIdentity` keeps a fixed focal point instead.
+    fn reanchor_locked_command(
+        c: LockedCommandState,
+        current_focal: Point<f64, Logical>,
+        center_content: Point<f64, Logical>,
+        center: Point<f64, Logical>,
+    ) -> LockedCommandState {
+        let anchor = LockedAnchor {
+            content: center_content,
+            display: center,
+        };
+        match c {
+            LockedCommandState::In { target, payload } => LockedCommandState::In {
+                target,
+                payload: LockedZoomCommand {
+                    animation: payload.animation,
+                    anchor,
+                },
+            },
+            LockedCommandState::Out { target, payload } => LockedCommandState::Out {
+                target,
+                payload: LockedZoomCommand {
+                    animation: payload.animation,
+                    anchor,
+                },
+            },
+            LockedCommandState::Value { target, payload } => LockedCommandState::Value {
+                target,
+                payload: LockedZoomCommand {
+                    animation: payload.animation,
+                    anchor,
+                },
+            },
+            LockedCommandState::ToIdentity { payload } => LockedCommandState::ToIdentity {
+                payload: LockedIdentityCommand {
+                    animation: payload.animation,
+                    focal: current_focal,
+                },
+            },
+        }
+    }
+
+    /// Converts a restore into a locked level command.
+    ///
+    /// The saved focal destination is abandoned: the level keeps animating
+    /// towards the restore target with its current velocity, anchored on the
+    /// viewport center.
+    fn restore_to_locked_command(
+        r: RestorePayload,
+        displayed_level: f64,
+        current_focal: Point<f64, Logical>,
+        center_content: Point<f64, Logical>,
+        center: Point<f64, Logical>,
+    ) -> LockedCommandState {
+        let dz = r.to_level.log2() - r.from_level.log2();
+        let velocity = if dz.abs() > RESTORE_VELOCITY_MIN_DELTA {
+            r.animation.velocity().unwrap_or(0.) * dz
+        } else {
+            0.
+        };
+        let animation = Animation::new(
+            r.clock,
+            displayed_level.log2(),
+            r.to_level.log2(),
+            velocity,
+            r.config,
+        );
+
+        if r.to_level == 1. {
+            // Zooming out to the identity transform degenerates the anchored
+            // focal solve, so the focal point stays fixed instead.
+            return LockedCommandState::ToIdentity {
+                payload: LockedIdentityCommand {
+                    animation,
+                    focal: current_focal,
+                },
+            };
+        }
+
+        let payload = LockedZoomCommand {
+            animation,
+            anchor: LockedAnchor {
+                content: center_content,
+                display: center,
+            },
+        };
+        Self::locked_command_by_delta(r.to_level, displayed_level, payload)
+    }
+
+    /// Transitions the state machine into its unlocked counterpart.
+    ///
+    /// `pointer` is the canonical pointer position: an in-flight command
+    /// re-anchors on it at its current displayed position, so the camera
+    /// does not jump.
+    fn unlock(&mut self, pointer: Point<f64, Logical>) {
+        // The pointer's displayed position under the current (locked)
+        // transform, sampled before the state is taken apart.
+        let display = self.viewport_transform().apply(pointer);
+        let current_focal = self.focal();
+
+        *self = match self.take() {
+            Self::Locked(view) => Self::Idle(view),
+            Self::LockedZooming { view, zooming } => {
+                let zooming = match zooming {
+                    LockedZoomingState::Command(c) => {
+                        ZoomingState::Command(Self::unlock_command(c, pointer, display))
+                    }
+                };
+                Self::Zooming { view, zooming }
+            }
+            Self::LockedGesture { view, gesture } => Self::Gesture {
+                view,
+                gesture: GesturePayload {
+                    start_level: gesture.start_level,
+                    current_level: gesture.current_level,
+                    // Unlocking mid-gesture keeps the current focal mode: a
+                    // frozen focal stays frozen, a center anchor becomes a
+                    // regular anchor at the same points.
+                    focal: match gesture.focal {
+                        LockedGestureFocal::Anchored(anchor) => {
+                            GestureFocal::Anchored(FlexibleAnchor {
+                                content: anchor.content,
+                                display: anchor.display,
+                            })
+                        }
+                        LockedGestureFocal::Fixed { .. } => GestureFocal::Fixed {
+                            focal: current_focal,
+                        },
+                    },
+                },
+            },
+            // A resting follow commits its live focal point, matching the
+            // materialize-on-lock-change contract.
+            Self::Follow { view, .. } => Self::Idle(view),
+            // Unlocking an already-unlocked state is a no-op.
+            state => state,
+        };
+    }
+
+    /// Converts a locked command into its unlocked counterpart.
+    ///
+    /// The animation is moved over unchanged; the anchor is replaced by the
+    /// canonical pointer at its current displayed position. `ToIdentity`
+    /// keeps its fixed focal point: the identity solve is degenerate, so
+    /// re-anchoring on the pointer would only move the camera.
+    fn unlock_command(
+        c: LockedCommandState,
+        pointer: Point<f64, Logical>,
+        display: Point<f64, Logical>,
+    ) -> ZoomCommandState {
+        let anchor = FlexibleAnchor {
+            content: pointer,
+            display,
+        };
+        match c {
+            LockedCommandState::In { target, payload } => ZoomCommandState::In {
+                target,
+                payload: ZoomCommand {
+                    animation: payload.animation,
+                    anchor,
+                },
+            },
+            LockedCommandState::Out { target, payload } => ZoomCommandState::Out {
+                target,
+                payload: ZoomCommand {
+                    animation: payload.animation,
+                    anchor,
+                },
+            },
+            LockedCommandState::Value { target, payload } => ZoomCommandState::Value {
+                target,
+                payload: ZoomCommand {
+                    animation: payload.animation,
+                    anchor,
+                },
+            },
+            LockedCommandState::ToIdentity { payload } => ZoomCommandState::ToIdentity {
+                payload: IdentityCommand {
+                    animation: payload.animation,
+                    focal: payload.focal,
+                },
+            },
+        }
     }
 
     /// Sets the user-requested zoom level and starts a transition towards it
@@ -400,60 +1184,212 @@ impl OutputZoomState {
         config: niri_config::Animation,
     ) {
         assert!(level.is_finite() && level >= 1.);
+        self.start_command(level, anchor, clock, config, CommandDirection::Value);
+    }
+
+    /// Starts a `zoom-in` command towards `target`.
+    ///
+    /// `target` is the level resolved from the current intent by the caller
+    /// (typically `intent_level() * factor`, clamped and snapped). A target
+    /// of exactly 1 produces a [`ZoomCommandState::ToIdentity`] command like
+    /// every other transition to the identity transform.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `target` is not finite or less than 1.
+    pub fn zoom_in(
+        &mut self,
+        target: f64,
+        anchor: Point<f64, Logical>,
+        clock: &Clock,
+        config: niri_config::Animation,
+    ) {
+        assert!(target.is_finite() && target >= 1.);
+        debug_assert!(
+            target >= self.intent_level(),
+            "zoom-in target {target} below intent {}",
+            self.intent_level()
+        );
+        self.start_command(target, anchor, clock, config, CommandDirection::In);
+    }
+
+    /// Starts a `zoom-out` command towards `target`.
+    ///
+    /// `target` is the level resolved from the current intent by the caller.
+    /// A target of exactly 1 produces a `ToIdentity` command.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `target` is not finite or less than 1.
+    pub fn zoom_out(
+        &mut self,
+        target: f64,
+        anchor: Point<f64, Logical>,
+        clock: &Clock,
+        config: niri_config::Animation,
+    ) {
+        assert!(target.is_finite() && target >= 1.);
+        debug_assert!(
+            target <= self.intent_level(),
+            "zoom-out target {target} above intent {}",
+            self.intent_level()
+        );
+        self.start_command(target, anchor, clock, config, CommandDirection::Out);
+    }
+
+    /// Starts a level command towards `target`.
+    ///
+    /// Shared implementation of the zoom commands. A resting state already
+    /// at `target` is a no-op; otherwise the current log-space velocity
+    /// carries over where the animation kind supports it. An active follow
+    /// is preserved as the command's combined drift — the camera keeps
+    /// following during the level animation — except for `ToIdentity`, which
+    /// drops it.
+    fn start_command(
+        &mut self,
+        target: f64,
+        anchor: Point<f64, Logical>,
+        clock: &Clock,
+        config: niri_config::Animation,
+        direction: CommandDirection,
+    ) {
+        // A resting state already at the target has nothing to do: no
+        // degenerate animation is allocated and a running follow is not
+        // disturbed. In-flight transitions still retarget normally so a
+        // repeated action keeps its restart semantics.
+        match self {
+            Self::Idle(view) | Self::Follow { view, .. } | Self::Locked(view)
+                if view.level == target =>
+            {
+                return;
+            }
+            _ => (),
+        }
 
         if config.off {
-            self.set_level_immediate(level, anchor);
+            self.set_level_immediate(target, anchor);
             return;
         }
 
-        // A follow owns the focal point: materialize its current displayed
-        // value so the new level animation starts from the real camera
-        // position, not the stale committed focal point.
-        self.commit_follow_focal();
-
         let from_level = self.level();
         let velocity = self.transition_log_velocity();
+        let animation = Animation::new(
+            clock.clone(),
+            from_level.log2(),
+            target.log2(),
+            velocity,
+            config,
+        );
 
-        self.target_level = level;
-
-        let focal = if level == 1. {
-            // Zooming out to the identity transform: the anchored focal solve
-            // degenerates as the level approaches 1 (it divides by
-            // `level - 1`), so the focal point would fly to a clamped corner.
-            // Keep the current focal point fixed instead: the zoom-out
-            // pivots around its displayed position and lands continuously.
-            ZoomTransitionFocal::Fixed {
-                focal: self.focal(),
-            }
-        } else if self.locked {
+        if self.is_locked() {
             // A locked camera does not track the pointer: zoom around the
             // viewport center so the viewed content stays centered.
-            let center = self.view_size.to_point().downscale(2.);
-            ZoomTransitionFocal::Anchored {
-                content: self.viewport_transform().apply_inverse(center),
-                display: center,
+            let center = self.view().view_size.to_point().downscale(2.);
+            let center_content = self.viewport_transform().apply_inverse(center);
+            let view = *self.view();
+
+            let command = if target == 1. {
+                // Zooming out to the identity transform: the anchored focal
+                // solve degenerates as the level approaches 1, so the focal
+                // point stays fixed and the zoom-out pivots around its
+                // displayed position.
+                LockedCommandState::ToIdentity {
+                    payload: LockedIdentityCommand {
+                        animation,
+                        focal: self.focal(),
+                    },
+                }
+            } else {
+                let payload = LockedZoomCommand {
+                    animation,
+                    anchor: LockedAnchor {
+                        content: center_content,
+                        display: center,
+                    },
+                };
+                match direction {
+                    CommandDirection::In => LockedCommandState::In { target, payload },
+                    CommandDirection::Out => LockedCommandState::Out { target, payload },
+                    CommandDirection::Value => LockedCommandState::Value { target, payload },
+                }
+            };
+            *self = Self::LockedZooming {
+                view,
+                zooming: LockedZoomingState::Command(command),
+            };
+            return;
+        }
+
+        // The anchor's displayed position and the fixed focal point are
+        // derived from the live state, so sample them before taking it
+        // apart.
+        let anchor_display = self.viewport_transform().apply(anchor);
+        let displayed_focal = self.focal();
+
+        let command = if target == 1. {
+            ZoomCommandState::ToIdentity {
+                payload: IdentityCommand {
+                    animation,
+                    focal: displayed_focal,
+                },
             }
         } else {
-            ZoomTransitionFocal::Anchored {
-                content: anchor,
-                display: self.viewport_transform().apply(anchor),
+            let payload = ZoomCommand {
+                animation,
+                anchor: FlexibleAnchor {
+                    content: anchor,
+                    display: anchor_display,
+                },
+            };
+            match direction {
+                CommandDirection::In => ZoomCommandState::In { target, payload },
+                CommandDirection::Out => ZoomCommandState::Out { target, payload },
+                CommandDirection::Value => ZoomCommandState::Value { target, payload },
             }
         };
 
-        // The deadzone drift is not seeded here: the per-frame follow
-        // evaluation starts it on the first frame the displayed cursor is
-        // outside the deadzone.
-        self.transition = Some(ZoomLevelTransition::Animation {
-            animation: Animation::new(
-                clock.clone(),
-                from_level.log2(),
-                level.log2(),
-                velocity,
-                config,
-            ),
-            focal,
-            display_follow: None,
-        });
+        *self = match (self.take(), command) {
+            // A resting follow becomes the command's combined drift: the
+            // camera keeps following during the level animation instead of
+            // committing and restarting. The drift destination is the
+            // display position that resolves to the follow's focal target at
+            // the current level, and the step timestamp carries over so no
+            // stale time is consumed.
+            (
+                Self::Follow { view, follow },
+                command @ (ZoomCommandState::In { .. }
+                | ZoomCommandState::Out { .. }
+                | ZoomCommandState::Value { .. }),
+            ) => Self::ZoomingFollow {
+                view,
+                zooming: command,
+                follow: CombinedFollow {
+                    last_step: follow.last_step,
+                    target_display: Point::from((
+                        view.level * anchor.x - follow.to_focal.x * (view.level - 1.),
+                        view.level * anchor.y - follow.to_focal.y * (view.level - 1.),
+                    )),
+                },
+            },
+            // A combined drift survives a retarget: the new command keeps
+            // the live timing and destination.
+            (
+                Self::ZoomingFollow { view, follow, .. },
+                command @ (ZoomCommandState::In { .. }
+                | ZoomCommandState::Out { .. }
+                | ZoomCommandState::Value { .. }),
+            ) => Self::ZoomingFollow {
+                view,
+                zooming: command,
+                follow,
+            },
+            // Every other state — including a follow or drift interrupted by
+            // a `ToIdentity` command — becomes a plain zooming state.
+            (state, command) => Self::Zooming {
+                view: *state.view(),
+                zooming: ZoomingState::Command(command),
+            },
+        };
     }
 
     /// The viewport transform for the currently displayed zoom level.
@@ -468,7 +1404,7 @@ impl OutputZoomState {
     /// always contained within the output rectangle.
     pub fn viewport(&self) -> Rectangle<f64, Logical> {
         self.viewport_transform()
-            .apply_inverse_rect(Rectangle::from_size(self.view_size))
+            .apply_inverse_rect(Rectangle::from_size(self.view().view_size))
     }
 
     /// The deadzone rectangle in displayed coordinates.
@@ -515,7 +1451,7 @@ impl OutputZoomState {
             return None;
         }
 
-        let deadzone = Self::deadzone_rect(self.view_size, deadzone_size);
+        let deadzone = Self::deadzone_rect(self.view().view_size, deadzone_size);
         let display = self.viewport_transform().apply(cursor);
         if deadzone.contains(display) {
             return None;
@@ -536,7 +1472,7 @@ impl OutputZoomState {
             (level * cursor.x - desired.x) / (level - 1.),
             (level * cursor.y - desired.y) / (level - 1.),
         ));
-        let focal = Self::clamp_focal(focal, self.view_size);
+        let focal = Self::clamp_focal(focal, self.view().view_size);
 
         (focal != self.focal()).then_some(focal)
     }
@@ -632,13 +1568,13 @@ impl OutputZoomState {
     /// clamp makes further correction impossible.
     ///
     /// Pointer interaction during a restore takes over the camera: the
-    /// restore converts to a regular level transition anchored at the
-    /// cursor's current displayed position, so the level keeps animating
-    /// towards the restore target without a focal jump. During a level
-    /// animation the anchor owns the camera, but tracking still applies as a
-    /// drift of the anchor's display position towards the deadzone edge, so
-    /// the camera starts following the cursor during the zoom animation
-    /// rather than after it.
+    /// restore converts to a regular level command anchored at the cursor's
+    /// current displayed position, so the level keeps animating towards the
+    /// restore target without a focal jump. During a level command the
+    /// anchor owns the camera, but tracking still applies as a drift of the
+    /// anchor's display position towards the deadzone edge, so the camera
+    /// starts following the cursor during the zoom animation rather than
+    /// after it.
     ///
     /// Does nothing while [`is_locked()`](Self::is_locked), at `level == 1`,
     /// or while a gesture owns the viewport.
@@ -661,14 +1597,20 @@ impl OutputZoomState {
             return false;
         }
 
-        if self.locked || self.level() == 1. {
+        if self.is_locked() || self.level() == 1. {
             return false;
         }
 
-        // During a level transition the anchor owns the camera: retarget the
+        // During a level command the anchor owns the camera: retarget the
         // deadzone drift (or stop it when the cursor re-enters the deadzone)
         // instead of evaluating a resting-level follow.
-        if matches!(self.transition, Some(ZoomLevelTransition::Animation { .. })) {
+        if matches!(
+            self,
+            Self::Zooming {
+                zooming: ZoomingState::Command(_),
+                ..
+            } | Self::ZoomingFollow { .. }
+        ) {
             return self.update_follow(cursor, zoom, clock, config);
         }
 
@@ -680,13 +1622,19 @@ impl OutputZoomState {
 
         // During a restore the camera is heading back to a saved focal point.
         // User-driven tracking takes over: the restore becomes a regular level
-        // transition anchored on the cursor at its current displayed position,
+        // command anchored on the cursor at its current displayed position,
         // so the level keeps animating towards the restore target while the
         // camera stays continuous. The follow evaluation brings the cursor to
         // the deadzone edge once the level animation completes.
-        if matches!(self.transition, Some(ZoomLevelTransition::Restore { .. })) {
+        if matches!(
+            self,
+            Self::Zooming {
+                zooming: ZoomingState::Restore(_),
+                ..
+            }
+        ) {
             let display = self.viewport_transform().apply(cursor);
-            self.convert_restore_to_level_animation(ZoomTransitionFocal::Anchored {
+            self.convert_restore_to_command(FlexibleAnchor {
                 content: cursor,
                 display,
             });
@@ -698,12 +1646,12 @@ impl OutputZoomState {
 
     /// Starts or retargets a deadzone follow for the cursor.
     ///
-    /// This is the per-frame evaluation entry point. During a level
-    /// transition it retargets the anchor's deadzone drift instead of
-    /// starting a resting-level follow; a restore or gesture is never
-    /// disturbed. When the displayed cursor is inside the deadzone or
-    /// already at the clamped target, an active follow commits its current
-    /// displayed focal point and stops.
+    /// This is the per-frame evaluation entry point. During a level command
+    /// it retargets the anchor's deadzone drift instead of starting a
+    /// resting-level follow; a restore or gesture is never disturbed. When
+    /// the displayed cursor is inside the deadzone or already at the clamped
+    /// target, an active follow commits its current displayed focal point
+    /// and stops.
     ///
     /// With `config.off` the focal point is set immediately instead of
     /// starting a follow.
@@ -718,22 +1666,32 @@ impl OutputZoomState {
     ) -> bool {
         let now = clock.now_unadjusted();
 
-        if self.locked {
+        if self.is_locked() {
             // A locked camera does not track the pointer: no deadzone drift
             // during a level transition, no resting-level follow.
             return false;
         }
 
-        match &self.transition {
-            // A level transition owns the camera through its anchor: retarget
+        match self {
+            // A level command owns the camera through its anchor: retarget
             // the deadzone drift instead of starting a resting-level follow.
-            Some(ZoomLevelTransition::Animation { .. }) => {
+            Self::Zooming {
+                zooming: ZoomingState::Command(_),
+                ..
+            }
+            | Self::ZoomingFollow { .. } => {
                 return self.update_display_follow(cursor, zoom, clock, config);
             }
             // A restore or gesture owns the viewport.
-            Some(ZoomLevelTransition::Restore { .. })
-            | Some(ZoomLevelTransition::Gesturing { .. }) => return false,
-            Some(ZoomLevelTransition::Follow { .. }) | None => (),
+            Self::Zooming {
+                zooming: ZoomingState::Restore(_),
+                ..
+            }
+            | Self::Gesture { .. }
+            | Self::Locked(_)
+            | Self::LockedZooming { .. }
+            | Self::LockedGesture { .. } => return false,
+            Self::Idle(_) | Self::Follow { .. } => (),
         }
 
         if self.level() == 1. {
@@ -752,7 +1710,7 @@ impl OutputZoomState {
 
         let display = self.viewport_transform().apply(cursor);
         let input = Self::deadzone_follow_input(
-            self.view_size,
+            self.view().view_size,
             zoom.deadzone_size,
             display,
             zoom.follow_min_speed,
@@ -764,8 +1722,8 @@ impl OutputZoomState {
         // is parallel to the overshoot). The step is capped at the target so
         // the camera can never cross the deadzone border.
         let Some(input) = input else {
-            self.focal = target;
-            self.transition = None;
+            self.view_mut().focal = target;
+            self.commit_follow_focal();
             return true;
         };
 
@@ -773,43 +1731,42 @@ impl OutputZoomState {
         // step for the elapsed time since the previous step. The timestamp
         // is owned by the follow: a new follow starts at `dt = 0` and can
         // never consume time that elapsed before it was created.
-        if !matches!(self.transition, Some(ZoomLevelTransition::Follow { .. })) {
-            self.transition = Some(ZoomLevelTransition::Follow {
-                to_focal: target,
-                last_step: now,
-            });
+        if !matches!(self, Self::Follow { .. }) {
+            *self = Self::Follow {
+                view: *self.view(),
+                follow: FollowState {
+                    to_focal: target,
+                    last_step: now,
+                },
+            };
         }
-        let Some(ZoomLevelTransition::Follow {
-            to_focal,
-            last_step,
-        }) = &mut self.transition
-        else {
+        let Self::Follow { view, follow } = self else {
             unreachable!();
         };
 
         // The follow target tracks the live cursor.
-        *to_focal = target;
+        follow.to_focal = target;
 
-        let dt = now.saturating_sub(*last_step).as_secs_f64();
-        *last_step = now;
+        let dt = now.saturating_sub(follow.last_step).as_secs_f64();
+        follow.last_step = now;
         let distance = input.speed * dt;
-        let remaining = target - self.focal;
+        let remaining = target - view.focal;
         let rem_len = (remaining.x * remaining.x + remaining.y * remaining.y).sqrt();
 
         if distance >= rem_len {
-            self.focal = target;
-            self.transition = None;
+            view.focal = target;
+            *self = Self::Idle(*view);
         } else {
             let scale = distance / rem_len;
-            self.focal = Point::from((
-                self.focal.x + remaining.x * scale,
-                self.focal.y + remaining.y * scale,
+            view.focal = Point::from((
+                view.focal.x + remaining.x * scale,
+                view.focal.y + remaining.y * scale,
             ));
         }
         true
     }
 
-    /// Retargets the deadzone drift of an in-progress level transition.
+    /// Retargets the deadzone drift of an in-progress level command.
     ///
     /// While the displayed cursor is outside the deadzone, the anchor is
     /// re-pinned on the live cursor and its display position steps towards
@@ -818,8 +1775,8 @@ impl OutputZoomState {
     /// after it. When the cursor re-enters the deadzone the drift stops:
     /// the display position is already live, so nothing needs materializing.
     ///
-    /// Does nothing unless the current transition is an anchored level
-    /// animation. Returns `true` if the state changed.
+    /// Does nothing unless the current state is an anchored level command.
+    /// Returns `true` if the state changed.
     fn update_display_follow(
         &mut self,
         cursor: Point<f64, Logical>,
@@ -829,92 +1786,151 @@ impl OutputZoomState {
     ) -> bool {
         let display = self.viewport_transform().apply(cursor);
         let input = Self::deadzone_follow_input(
-            self.view_size,
+            self.view().view_size,
             zoom.deadzone_size,
             display,
             zoom.follow_min_speed,
             zoom.follow_max_speed,
         );
 
-        // The drift only applies while the transition zooms in: at a target
+        // The drift only applies while the command zooms in: at a target
         // level of 1 the deadzone is meaningless.
-        let drift_allowed = self.target_level > 1. && input.is_some();
+        let drift_allowed = self.target_level() > 1. && input.is_some();
 
         // Whether the drift target is reachable at the current level: when
         // the output clamp already pins the camera, the anchor display
         // position cannot move and no drift is started.
         let reachable = drift_allowed
-            && self.anchored_focal(cursor, input.unwrap().target, self.level()) != self.focal();
+            && Self::anchored_focal(self.view(), cursor, input.unwrap().target, self.level())
+                != self.focal();
 
         let now = clock.now_unadjusted();
-        let Some(ZoomLevelTransition::Animation {
-            focal:
-                ZoomTransitionFocal::Anchored {
-                    content,
-                    display: anchor_display,
-                },
-            display_follow,
-            ..
-        }) = &mut self.transition
-        else {
-            return false;
-        };
 
         if !drift_allowed || !reachable {
             // The display position is live: dropping the drift marker stops
             // the camera exactly where it is.
-            return display_follow.take().is_some();
+            return self.collapse_drift();
         }
         let input = input.unwrap();
 
         if config.off || clock.should_complete_instantly() {
             // Instant completion: the drift jumps straight to the deadzone
             // border.
-            *content = cursor;
-            *anchor_display = input.target;
-            *display_follow = None;
+            if let Some(anchor) = self.command_anchor_mut() {
+                anchor.content = cursor;
+                anchor.display = input.target;
+            }
+            self.collapse_drift();
             return true;
         }
-        // Re-anchor on the live cursor: the camera pans so that the cursor's
-        // displayed position drifts towards the deadzone boundary.
-        *content = cursor;
 
-        let Some(last) = *display_follow else {
-            *display_follow = Some(now);
-            *anchor_display = display;
-            return true;
+        match self {
+            Self::Zooming { zooming, .. } => {
+                // Start the drift: the display position is re-seeded from the
+                // live geometry so the first step never consumes time that
+                // elapsed before the drift existed.
+                let Some(anchor) = zooming.anchor_mut() else {
+                    return false;
+                };
+                anchor.content = cursor;
+                anchor.display = display;
+                let view = *self.view();
+                let Self::Zooming { zooming, .. } = self.take() else {
+                    unreachable!();
+                };
+                let ZoomingState::Command(command) = zooming else {
+                    unreachable!();
+                };
+                *self = Self::ZoomingFollow {
+                    view,
+                    zooming: command,
+                    follow: CombinedFollow {
+                        last_step: now,
+                        target_display: input.target,
+                    },
+                };
+                true
+            }
+            Self::ZoomingFollow {
+                zooming, follow, ..
+            } => {
+                // Re-anchor on the live cursor: the camera pans so that the
+                // cursor's displayed position drifts towards the deadzone
+                // boundary.
+                let Some(anchor) = zooming.anchor_mut() else {
+                    return false;
+                };
+                anchor.content = cursor;
+                follow.target_display = input.target;
+
+                let dt = now.saturating_sub(follow.last_step).as_secs_f64();
+                follow.last_step = now;
+
+                let distance = input.speed * dt;
+                if distance >= input.overshoot_length {
+                    anchor.display = input.target;
+                    // The drift landed: the state collapses back to a plain
+                    // command.
+                    self.collapse_drift();
+                } else {
+                    anchor.display = Point::from((
+                        display.x - input.direction.x * distance,
+                        display.y - input.direction.y * distance,
+                    ));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The mutable anchor of the in-progress unlocked command, if any.
+    fn command_anchor_mut(&mut self) -> Option<&mut FlexibleAnchor> {
+        match self {
+            Self::Zooming {
+                zooming: ZoomingState::Command(c),
+                ..
+            }
+            | Self::ZoomingFollow { zooming: c, .. } => c.anchor_mut(),
+            _ => None,
+        }
+    }
+
+    /// Drops the combined drift marker, collapsing `ZoomingFollow` back to a
+    /// plain `Zooming` command.
+    ///
+    /// The anchor's display position is live, so dropping the marker stops
+    /// the camera exactly where it is. Returns `true` if a drift was active.
+    fn collapse_drift(&mut self) -> bool {
+        if !matches!(self, Self::ZoomingFollow { .. }) {
+            return false;
+        }
+        let Self::ZoomingFollow { view, zooming, .. } = self.take() else {
+            unreachable!();
         };
-
-        let dt = now.saturating_sub(last).as_secs_f64();
-        *display_follow = Some(now);
-
-        let distance = input.speed * dt;
-        if distance >= input.overshoot_length {
-            *anchor_display = input.target;
-            *display_follow = None;
-        } else {
-            *anchor_display = Point::from((
-                display.x - input.direction.x * distance,
-                display.y - input.direction.y * distance,
-            ));
-        }
+        *self = Self::Zooming {
+            view,
+            zooming: ZoomingState::Command(zooming),
+        };
         true
     }
 
     /// Commits an active follow's current displayed focal point.
     ///
     /// The distance-driven follow mutates the committed focal point in
-    /// place every frame, so committing only drops the transition: the
-    /// camera stays exactly where it is. Does nothing unless a follow is
-    /// active.
+    /// place every frame, so committing only drops the follow state: the
+    /// camera stays exactly where it is. Does nothing unless a resting
+    /// follow is active.
     ///
     /// Returns `true` if a follow was committed.
     pub fn commit_follow_focal(&mut self) -> bool {
-        if !matches!(self.transition, Some(ZoomLevelTransition::Follow { .. })) {
+        if !matches!(self, Self::Follow { .. }) {
             return false;
         }
 
-        self.transition = None;
+        // `take` leaves `Idle(view)` behind: the follow's live focal point
+        // is already the committed one.
+        self.take();
         true
     }
 
@@ -930,13 +1946,7 @@ impl OutputZoomState {
     ///
     /// Returns `true` if the state changed.
     pub fn suspend_follow(&mut self) -> bool {
-        let drift = match &mut self.transition {
-            Some(ZoomLevelTransition::Animation { display_follow, .. }) => {
-                display_follow.take().is_some()
-            }
-            _ => false,
-        };
-
+        let drift = self.collapse_drift();
         self.commit_follow_focal() || drift
     }
 
@@ -944,8 +1954,10 @@ impl OutputZoomState {
     ///
     /// Without a transition this writes the committed focal point. During an
     /// anchored transition it re-pins the anchor's display position so that
+    /// the anchored focal resolves to `focal` right now.
     fn set_current_focal(&mut self, focal: Point<f64, Logical>) -> bool {
-        let focal = Self::clamp_focal(focal, self.view_size);
+        let view_size = self.view().view_size;
+        let focal = Self::clamp_focal(focal, view_size);
         if self.focal() == focal {
             return false;
         }
@@ -956,56 +1968,88 @@ impl OutputZoomState {
         self.commit_follow_focal();
 
         // A restore has no anchor to re-pin; it converts to a regular level
-        // transition first so that the focal point can be set directly.
-        if matches!(self.transition, Some(ZoomLevelTransition::Restore { .. })) {
-            self.convert_restore_to_level_animation(ZoomTransitionFocal::Fixed {
-                focal: self.focal(),
+        // command first so that the focal point can be set directly. The
+        // synthesized anchor pins the current focal point at the displayed
+        // position that resolves to the requested focal.
+        if matches!(
+            self,
+            Self::Zooming {
+                zooming: ZoomingState::Restore(_),
+                ..
+            }
+        ) {
+            let level = self.level();
+            let current = self.focal();
+            self.convert_restore_to_command(FlexibleAnchor {
+                content: current,
+                display: Point::from((
+                    level * current.x - focal.x * (level - 1.),
+                    level * current.y - focal.y * (level - 1.),
+                )),
             });
         }
 
         let level = self.level();
-        match &mut self.transition {
-            Some(ZoomLevelTransition::Animation {
-                focal: ZoomTransitionFocal::Anchored { content, display },
-                display_follow,
+        match self {
+            Self::Zooming {
+                zooming: ZoomingState::Command(c),
                 ..
-            }) => {
-                // Solve display = level * content - focal * (level - 1) so
-                // that the anchored focal resolves to `focal` right now. A
-                // deadzone drift is dropped: the explicit focal wins.
-                *display = Point::from((
-                    level * content.x - focal.x * (level - 1.),
-                    level * content.y - focal.y * (level - 1.),
-                ));
-                *display_follow = None;
             }
-            Some(ZoomLevelTransition::Gesturing {
-                focal: ZoomTransitionFocal::Anchored { content, display },
+            | Self::ZoomingFollow { zooming: c, .. } => {
+                match c {
+                    ZoomCommandState::In { payload, .. }
+                    | ZoomCommandState::Out { payload, .. }
+                    | ZoomCommandState::Value { payload, .. } => {
+                        // Solve display = level * content - focal * (level - 1)
+                        // so that the anchored focal resolves to `focal`
+                        // right now. A deadzone drift is dropped: the
+                        // explicit focal wins.
+                        payload.anchor.display = Point::from((
+                            level * payload.anchor.content.x - focal.x * (level - 1.),
+                            level * payload.anchor.content.y - focal.y * (level - 1.),
+                        ));
+                    }
+                    ZoomCommandState::ToIdentity { payload } => payload.focal = focal,
+                }
+                self.collapse_drift();
+            }
+            Self::Gesture { gesture, .. } => match &mut gesture.focal {
+                GestureFocal::Anchored(anchor) => {
+                    anchor.display = Point::from((
+                        level * anchor.content.x - focal.x * (level - 1.),
+                        level * anchor.content.y - focal.y * (level - 1.),
+                    ));
+                }
+                GestureFocal::Fixed { focal: fixed } => *fixed = focal,
+            },
+            Self::LockedGesture { gesture, .. } => match &mut gesture.focal {
+                LockedGestureFocal::Anchored(anchor) => {
+                    anchor.display = Point::from((
+                        level * anchor.content.x - focal.x * (level - 1.),
+                        level * anchor.content.y - focal.y * (level - 1.),
+                    ));
+                }
+                LockedGestureFocal::Fixed { focal: fixed } => *fixed = focal,
+            },
+            Self::LockedZooming { zooming, .. } => match zooming {
+                LockedZoomingState::Command(c) => match c {
+                    LockedCommandState::In { payload, .. }
+                    | LockedCommandState::Out { payload, .. }
+                    | LockedCommandState::Value { payload, .. } => {
+                        payload.anchor.display = Point::from((
+                            level * payload.anchor.content.x - focal.x * (level - 1.),
+                            level * payload.anchor.content.y - focal.y * (level - 1.),
+                        ));
+                    }
+                    LockedCommandState::ToIdentity { payload } => payload.focal = focal,
+                },
+            },
+            Self::Zooming {
+                zooming: ZoomingState::Restore(_),
                 ..
-            }) => {
-                *display = Point::from((
-                    level * content.x - focal.x * (level - 1.),
-                    level * content.y - focal.y * (level - 1.),
-                ));
-            }
-            Some(ZoomLevelTransition::Animation {
-                focal: ZoomTransitionFocal::Fixed { focal: fixed },
-                display_follow,
-                ..
-            }) => {
-                *fixed = focal;
-                *display_follow = None;
-            }
-            Some(ZoomLevelTransition::Gesturing {
-                focal: ZoomTransitionFocal::Fixed { focal: fixed },
-                ..
-            }) => {
-                *fixed = focal;
-            }
-            Some(ZoomLevelTransition::Restore { .. })
-            | Some(ZoomLevelTransition::Follow { .. }) => unreachable!(),
-            None => {
-                self.focal = focal;
+            } => unreachable!(),
+            Self::Idle(view) | Self::Follow { view, .. } | Self::Locked(view) => {
+                view.focal = focal;
             }
         }
 
@@ -1017,8 +2061,8 @@ impl OutputZoomState {
     ///
     /// `anchor` is a content position in output-local logical coordinates,
     /// typically the cursor; while locked it is ignored and the viewport
-    /// center is kept fixed instead. Also sets `target_level` to `level` and
-    /// cancels any transition in progress.
+    /// center is kept fixed instead. Also sets the intent level to `level`
+    /// and cancels any transition in progress.
     ///
     /// At `level == 1` the transform is the identity, so the displayed
     /// position of `anchor` cannot be preserved; the focal point is still kept
@@ -1036,31 +2080,58 @@ impl OutputZoomState {
 
         // A locked camera does not track the pointer: zoom around the
         // viewport center so the viewed content stays centered.
-        let anchor = if self.locked {
-            let center = self.view_size.to_point().downscale(2.);
+        let anchor = if self.is_locked() {
+            let center = self.view().view_size.to_point().downscale(2.);
             self.viewport_transform().apply_inverse(center)
         } else {
             anchor
         };
 
         let screen_anchor = self.viewport_transform().apply(anchor);
+        let view_size = self.view().view_size;
 
-        self.transition = None;
-        self.level = level;
-        self.target_level = level;
+        let mut view = *self.view();
+        view.level = level;
 
         if level == 1. {
-            self.focal = Self::clamp_focal(self.focal, self.view_size);
-            return;
+            view.focal = Self::clamp_focal(view.focal, view_size);
+        } else {
+            // The focal point that keeps the content anchor at its previous
+            // displayed position:
+            // screen_anchor = focal + (anchor - focal) * level.
+            let focal = Point::from((
+                (level * anchor.x - screen_anchor.x) / (level - 1.),
+                (level * anchor.y - screen_anchor.y) / (level - 1.),
+            ));
+            view.focal = Self::clamp_focal(focal, view_size);
         }
 
-        // The focal point that keeps the content anchor at its previous
-        // displayed position: screen_anchor = focal + (anchor - focal) * level.
-        let focal = Point::from((
-            (level * anchor.x - screen_anchor.x) / (level - 1.),
-            (level * anchor.y - screen_anchor.y) / (level - 1.),
-        ));
-        self.focal = Self::clamp_focal(focal, self.view_size);
+        *self = if self.is_locked() {
+            Self::Locked(view)
+        } else {
+            Self::Idle(view)
+        };
+    }
+
+    /// Ends the zoom session entirely: the state becomes the resting 1x
+    /// identity with no transition and no lock.
+    ///
+    /// This is a lifecycle boundary, not a level change: any in-progress
+    /// level animation, restore, gesture or follow is dropped rather than
+    /// completed, and the lock is cleared. The focal point keeps its current
+    /// displayed value clamped to the output; at the identity transform it
+    /// is presentation-degenerate.
+    ///
+    /// Used when a compositor mode that replaces the desktop presentation
+    /// (the Overview) takes over: the zoom session does not survive it and
+    /// is not restored afterwards.
+    pub fn end_session(&mut self) {
+        let view = ZoomView {
+            level: 1.,
+            focal: Self::clamp_focal(self.focal(), self.view().view_size),
+            view_size: self.view().view_size,
+        };
+        *self = Self::Idle(view);
     }
 
     /// Begins a direct-manipulation gesture on the zoom level.
@@ -1072,7 +2143,7 @@ impl OutputZoomState {
     /// unlocked, the anchor is kept at its current displayed position like a
     /// regular zoom transition; while locked, the viewport center stays fixed.
     ///
-    /// `target_level` is set to the displayed level: during a gesture the
+    /// The intent level is set to the displayed level: during a gesture the
     /// displayed state is the current user intent.
     pub fn begin_gesture(&mut self, anchor: Point<f64, Logical>) {
         // A follow owns the focal point: materialize its current displayed
@@ -1080,35 +2151,45 @@ impl OutputZoomState {
         self.commit_follow_focal();
 
         let level = self.level();
-        self.target_level = level;
+        let view = *self.view();
 
-        let focal = if self.locked {
+        if self.is_locked() {
             // A locked camera does not track the pointer: zoom around the
             // viewport center so the viewed content stays centered.
-            let center = self.view_size.to_point().downscale(2.);
-            ZoomTransitionFocal::Anchored {
+            let center = view.view_size.to_point().downscale(2.);
+            let anchor = LockedAnchor {
                 content: self.viewport_transform().apply_inverse(center),
                 display: center,
-            }
+            };
+            *self = Self::LockedGesture {
+                view,
+                gesture: LockedGesturePayload {
+                    start_level: level,
+                    current_level: level,
+                    focal: LockedGestureFocal::Anchored(anchor),
+                },
+            };
         } else {
-            ZoomTransitionFocal::Anchored {
+            let anchor = FlexibleAnchor {
                 content: anchor,
                 display: self.viewport_transform().apply(anchor),
-            }
-        };
-
-        self.transition = Some(ZoomLevelTransition::Gesturing {
-            start_level: level,
-            current_level: level,
-            focal,
-        });
+            };
+            *self = Self::Gesture {
+                view,
+                gesture: GesturePayload {
+                    start_level: level,
+                    current_level: level,
+                    focal: GestureFocal::Anchored(anchor),
+                },
+            };
+        }
     }
 
     /// Applies a gesture update's cumulative scale to the zoom level.
     ///
     /// `scale` is relative to the gesture begin: the new level is
     /// `start_level * scale`, clamped to `1..=max_zoom` and snapped to
-    /// exactly 1 within [`ZOOM_SNAP_TO_ONE_EPSILON`]. `target_level` tracks
+    /// exactly 1 within [`ZOOM_SNAP_TO_ONE_EPSILON`]. The intent level tracks
     /// the displayed level.
     ///
     /// Non-finite or non-positive scales are ignored without disturbing the
@@ -1116,13 +2197,12 @@ impl OutputZoomState {
     ///
     /// Returns `true` if the displayed state changed.
     pub fn update_gesture(&mut self, scale: f64, max_zoom: f64) -> bool {
-        let Some(ZoomLevelTransition::Gesturing {
-            start_level,
-            current_level,
-            ..
-        }) = &mut self.transition
-        else {
-            return false;
+        let (start_level, current_level) = match self {
+            Self::Gesture { gesture, .. } => (gesture.start_level, &mut gesture.current_level),
+            Self::LockedGesture { gesture, .. } => {
+                (gesture.start_level, &mut gesture.current_level)
+            }
+            _ => return false,
         };
 
         if !scale.is_finite() || scale <= 0. {
@@ -1130,7 +2210,7 @@ impl OutputZoomState {
             return false;
         }
 
-        let mut level = (*start_level * scale).clamp(1., max_zoom);
+        let mut level = (start_level * scale).clamp(1., max_zoom);
         if level <= 1. + ZOOM_SNAP_TO_ONE_EPSILON {
             level = 1.;
         }
@@ -1140,7 +2220,6 @@ impl OutputZoomState {
         }
 
         *current_level = level;
-        self.target_level = level;
         true
     }
 
@@ -1154,9 +2233,17 @@ impl OutputZoomState {
             return;
         }
 
-        self.level = self.target_level;
-        self.focal = self.focal();
-        self.transition = None;
+        let focal = self.focal();
+        let locked = self.is_locked();
+        let mut view = *self.view();
+        view.level = self.target_level();
+        view.focal = focal;
+
+        *self = if locked {
+            Self::Locked(view)
+        } else {
+            Self::Idle(view)
+        };
     }
 
     /// Adjusts the focal point after the output size changed.
@@ -1177,38 +2264,111 @@ impl OutputZoomState {
         // value so the resize clamp applies to the real camera position.
         self.commit_follow_focal();
 
-        self.view_size = view_size;
+        let view = self.view_mut();
+        view.view_size = view_size;
 
         if self.level() == 1. {
-            self.focal = view_size.to_point().downscale(2.);
+            self.view_mut().focal = view_size.to_point().downscale(2.);
         } else {
-            self.focal = Self::clamp_focal(self.focal, view_size);
+            let focal = Self::clamp_focal(self.view().focal, view_size);
+            self.view_mut().focal = focal;
         }
     }
 
     /// Commits a finished transition, if any.
     ///
     /// Called from the monitor's `advance_animations`. When the transition
-    /// first reaches its target, the exact `target_level` and the final
-    /// clamped focal point are committed and the transition is dropped.
+    /// first reaches its target, the exact target level and the final
+    /// clamped focal point are committed and the transition is dropped. A
+    /// combined drift that outlives its command continues seamlessly as a
+    /// resting follow.
     pub fn advance_animations(&mut self) {
-        let done = match &self.transition {
-            Some(ZoomLevelTransition::Animation { animation, .. }) => animation.is_clamped_done(),
-            Some(ZoomLevelTransition::Restore { animation, .. }) => animation.is_clamped_done(),
+        match self {
+            Self::Zooming { zooming, .. } => match zooming {
+                ZoomingState::Command(c) if c.animation().is_clamped_done() => {
+                    let focal = self.focal();
+                    let Self::Zooming { mut view, zooming } = self.take() else {
+                        unreachable!();
+                    };
+                    let ZoomingState::Command(c) = zooming else {
+                        unreachable!();
+                    };
+                    view.level = c.target();
+                    view.focal = focal;
+                    *self = Self::Idle(view);
+                }
+                ZoomingState::Restore(r) if r.animation.is_clamped_done() => {
+                    let focal = self.focal();
+                    let Self::Zooming { mut view, zooming } = self.take() else {
+                        unreachable!();
+                    };
+                    let ZoomingState::Restore(r) = zooming else {
+                        unreachable!();
+                    };
+                    view.level = r.to_level;
+                    view.focal = focal;
+                    *self = Self::Idle(view);
+                }
+                _ => (),
+            },
+            Self::ZoomingFollow { zooming, .. } => {
+                if !zooming.animation().is_clamped_done() {
+                    return;
+                }
+                // The command completed while the drift was still active:
+                // the drift continues as a resting follow towards the same
+                // deadzone destination, keeping its own step timestamp so no
+                // stale time is consumed.
+                let focal = self.focal();
+                let Self::ZoomingFollow {
+                    mut view,
+                    zooming,
+                    follow,
+                } = self.take()
+                else {
+                    unreachable!();
+                };
+                view.level = zooming.target();
+                view.focal = focal;
+                let to_focal = zooming.anchor().map_or(focal, |anchor| {
+                    Self::anchored_focal(&view, anchor.content, follow.target_display, view.level)
+                });
+                if to_focal == focal {
+                    *self = Self::Idle(view);
+                } else {
+                    *self = Self::Follow {
+                        view,
+                        follow: FollowState {
+                            to_focal,
+                            last_step: follow.last_step,
+                        },
+                    };
+                }
+            }
+            Self::LockedZooming { zooming, .. } => {
+                if !zooming.animation().is_clamped_done() {
+                    return;
+                }
+                let focal = self.focal();
+                let Self::LockedZooming { mut view, zooming } = self.take() else {
+                    unreachable!();
+                };
+                view.level = zooming.target();
+                view.focal = focal;
+                *self = Self::Locked(view);
+            }
             // A distance-driven follow completes when the focal point
             // reaches its target; the step caps exactly at it.
-            Some(ZoomLevelTransition::Follow { to_focal, .. }) => self.focal() == *to_focal,
+            Self::Follow { follow, .. } => {
+                let to_focal = follow.to_focal;
+                if self.focal() == to_focal {
+                    self.commit_follow_focal();
+                }
+            }
             // A gesture is driven by input events, not the clock; it never
             // completes here.
-            Some(ZoomLevelTransition::Gesturing { .. }) | None => return,
-        };
-        if !done {
-            return;
+            _ => (),
         }
-
-        self.level = self.target_level;
-        self.focal = self.focal();
-        self.transition = None;
     }
 
     /// Captures the restorable part of the zoom state.
@@ -1219,7 +2379,7 @@ impl OutputZoomState {
     pub fn snapshot(&self) -> ZoomSnapshot {
         ZoomSnapshot {
             level: self.level(),
-            target_level: self.target_level,
+            target_level: self.target_level(),
             focal: self.focal(),
         }
     }
@@ -1252,11 +2412,16 @@ impl OutputZoomState {
         // value so the camera position is not lost with the transition.
         self.commit_follow_focal();
 
-        self.view_size = view_size;
-        self.transition = None;
-        self.level = snapshot.target_level;
-        self.target_level = snapshot.target_level;
-        self.focal = Self::clamp_focal(snapshot.focal, view_size);
+        let view = ZoomView {
+            level: snapshot.target_level,
+            focal: Self::clamp_focal(snapshot.focal, view_size),
+            view_size,
+        };
+        *self = if self.is_locked() {
+            Self::Locked(view)
+        } else {
+            Self::Idle(view)
+        };
     }
 
     /// Restores a previously captured [`snapshot()`](Self::snapshot) with an
@@ -1301,21 +2466,53 @@ impl OutputZoomState {
         self.commit_follow_focal();
 
         if config.off {
-            let view_size = self.view_size;
+            let view_size = self.view().view_size;
             self.restore_immediate(snapshot, view_size);
             return;
         }
 
         let to_level = snapshot.target_level;
-        let to_focal = Self::clamp_focal(snapshot.focal, self.view_size);
+        let to_focal = Self::clamp_focal(snapshot.focal, self.view().view_size);
 
-        if self.locked {
+        if self.is_locked() {
             // The lock is stronger than focal restoration: keep the camera
-            // fixed and animate only the level towards the saved target.
-            // `set_target_level` ignores the anchor while locked and zooms
-            // around the viewport center.
-            let anchor = self.view_size.to_point().downscale(2.);
-            self.set_target_level(to_level, anchor, clock, config);
+            // fixed and animate only the level towards the saved target,
+            // anchored on the viewport center like a regular locked zoom
+            // command.
+            let center = self.view().view_size.to_point().downscale(2.);
+            let center_content = self.viewport_transform().apply_inverse(center);
+            let from_level = self.level();
+            let velocity = self.transition_log_velocity();
+            let view = *self.view();
+
+            let animation = Animation::new(
+                clock.clone(),
+                from_level.log2(),
+                to_level.log2(),
+                velocity,
+                config,
+            );
+            let command = if to_level == 1. {
+                LockedCommandState::ToIdentity {
+                    payload: LockedIdentityCommand {
+                        animation,
+                        focal: self.focal(),
+                    },
+                }
+            } else {
+                let payload = LockedZoomCommand {
+                    animation,
+                    anchor: LockedAnchor {
+                        content: center_content,
+                        display: center,
+                    },
+                };
+                Self::locked_command_by_delta(to_level, from_level, payload)
+            };
+            *self = Self::LockedZooming {
+                view,
+                zooming: LockedZoomingState::Command(command),
+            };
             return;
         }
 
@@ -1325,10 +2522,11 @@ impl OutputZoomState {
         if from_level == to_level && from_focal == to_focal {
             // Already at the destination: commit it, cancelling any in-flight
             // transition.
-            self.transition = None;
-            self.level = to_level;
-            self.target_level = to_level;
-            self.focal = to_focal;
+            *self = Self::Idle(ZoomView {
+                level: to_level,
+                focal: to_focal,
+                view_size: self.view().view_size,
+            });
             return;
         }
 
@@ -1341,92 +2539,88 @@ impl OutputZoomState {
             0.
         };
 
-        self.target_level = to_level;
-        self.transition = Some(ZoomLevelTransition::Restore {
-            animation: Animation::new(clock.clone(), 0., 1., v_progress, config),
-            from_level,
-            to_level,
-            from_focal,
-            to_focal,
-            clock: clock.clone(),
-            config,
-        });
+        *self = Self::Zooming {
+            view: *self.view(),
+            zooming: ZoomingState::Restore(RestorePayload {
+                animation: Animation::new(clock.clone(), 0., 1., v_progress, config),
+                from_level,
+                to_level,
+                from_focal,
+                to_focal,
+                clock: clock.clone(),
+                config,
+            }),
+        };
     }
 
     /// The current log-space level velocity of the transition in progress.
     ///
-    /// For a regular level animation this is the animation velocity directly.
+    /// For a regular level command this is the animation velocity directly.
     /// For a restore, the progress velocity is scaled by the level delta.
     /// Returns 0 when the velocity is unavailable (easing curves) or absent.
     fn transition_log_velocity(&self) -> f64 {
-        match &self.transition {
-            Some(ZoomLevelTransition::Animation { animation, .. }) => {
-                animation.velocity().unwrap_or(0.)
-            }
-            Some(ZoomLevelTransition::Restore {
-                animation,
-                from_level,
-                to_level,
+        // The restore's progress velocity is scaled by the level delta;
+        // every other transition animates `log2(level)` directly.
+        let dz = match self {
+            Self::Zooming {
+                zooming: ZoomingState::Restore(r),
                 ..
-            }) => {
-                let dz = to_level.log2() - from_level.log2();
-                animation.velocity().unwrap_or(0.) * dz
-            }
-            Some(ZoomLevelTransition::Gesturing { .. })
-            | Some(ZoomLevelTransition::Follow { .. })
-            | None => 0.,
-        }
+            } => r.to_level.log2() - r.from_level.log2(),
+            _ => 1.,
+        };
+        self.animation().and_then(|a| a.velocity()).unwrap_or(0.) * dz
     }
 
-    /// Converts an in-progress restore into a regular level animation.
+    /// Converts an in-progress restore into a regular level command.
     ///
     /// Used when user input takes over the camera mid-restore: the saved
     /// focal destination is abandoned, the level keeps animating towards the
     /// restore target with its current velocity, and the focal point follows
-    /// `focal` behavior from the current displayed position.
+    /// `anchor` from the current displayed position.
     ///
-    /// Does nothing unless the current transition is a restore.
-    fn convert_restore_to_level_animation(&mut self, focal: ZoomTransitionFocal) {
+    /// Does nothing unless the current state is a restore.
+    fn convert_restore_to_command(&mut self, anchor: FlexibleAnchor) {
         let level = self.level();
         // The displayed focal point is sampled before the restore is taken
         // apart: afterwards `focal()` would report the stale committed value.
         let displayed_focal = self.focal();
-        let Some(ZoomLevelTransition::Restore {
-            animation,
-            from_level,
-            to_level,
-            clock,
-            config,
-            ..
-        }) = self.transition.take()
+        let Self::Zooming {
+            view,
+            zooming: ZoomingState::Restore(r),
+        } = self.take()
         else {
             return;
         };
 
-        // Zooming out to the identity transform degenerates the anchored
-        // focal solve (it divides by `level - 1`), so an anchor would fly to
-        // a clamped edge as the level approaches 1. Keep the current focal
-        // point fixed instead, like `set_target_level` does for target 1.
-        let focal = if to_level == 1. && matches!(focal, ZoomTransitionFocal::Anchored { .. }) {
-            ZoomTransitionFocal::Fixed {
-                focal: displayed_focal,
-            }
-        } else {
-            focal
-        };
-
-        let dz = to_level.log2() - from_level.log2();
+        let dz = r.to_level.log2() - r.from_level.log2();
         let velocity = if dz.abs() > RESTORE_VELOCITY_MIN_DELTA {
-            animation.velocity().unwrap_or(0.) * dz
+            r.animation.velocity().unwrap_or(0.) * dz
         } else {
             0.
         };
+        let animation =
+            Animation::new(r.clock, level.log2(), r.to_level.log2(), velocity, r.config);
 
-        self.transition = Some(ZoomLevelTransition::Animation {
-            animation: Animation::new(clock, level.log2(), to_level.log2(), velocity, config),
-            focal,
-            display_follow: None,
-        });
+        let command = if r.to_level == 1. {
+            // Zooming out to the identity transform degenerates the anchored
+            // focal solve (it divides by `level - 1`), so an anchor would fly
+            // to a clamped edge as the level approaches 1. Keep the current
+            // focal point fixed instead, like a `ToIdentity` command.
+            ZoomCommandState::ToIdentity {
+                payload: IdentityCommand {
+                    animation,
+                    focal: displayed_focal,
+                },
+            }
+        } else {
+            let payload = ZoomCommand { animation, anchor };
+            Self::command_by_delta(r.to_level, level, payload)
+        };
+
+        *self = Self::Zooming {
+            view,
+            zooming: ZoomingState::Command(command),
+        };
     }
 
     /// The focal point that keeps `content` displayed at `display` for the
@@ -1436,21 +2630,21 @@ impl OutputZoomState {
     /// `level == 1` the transform is the identity and the focal point is
     /// unconstrained, so the committed focal point is kept.
     fn anchored_focal(
-        &self,
+        view: &ZoomView,
         content: Point<f64, Logical>,
         display: Point<f64, Logical>,
         level: f64,
     ) -> Point<f64, Logical> {
         let d = level - 1.;
         if d == 0. {
-            return Self::clamp_focal(self.focal, self.view_size);
+            return Self::clamp_focal(view.focal, view.view_size);
         }
 
         let focal = Point::from((
             (level * content.x - display.x) / d,
             (level * content.y - display.y) / d,
         ));
-        Self::clamp_focal(focal, self.view_size)
+        Self::clamp_focal(focal, view.view_size)
     }
 
     /// Clamps the focal point so that the logical viewport stays within the
@@ -1845,18 +3039,20 @@ mod tests {
     fn output_zoom_state_locked_stops_tracking() {
         let view_size = Size::from((1920., 1080.));
         let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        let pointer = Point::from((1500., 540.));
 
-        state.set_locked(true);
+        state.set_locked(true, pointer);
         assert!(state.is_locked());
+        assert!(matches!(state, OutputZoomState::Locked(_)));
 
         // This cursor would move the focal point if not locked.
-        let cursor = Point::from((1500., 540.));
-        assert!(!track(&mut state, cursor, 0.5));
+        assert!(!track(&mut state, pointer, 0.5));
         assert_point_eq(state.focal(), Point::from((960., 540.)));
 
-        state.toggle_locked();
+        state.toggle_locked(pointer);
         assert!(!state.is_locked());
-        assert!(track(&mut state, cursor, 0.5));
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        assert!(track(&mut state, pointer, 0.5));
     }
 
     #[test]
@@ -1904,6 +3100,67 @@ mod tests {
 
         assert_finite_point(state.focal());
         assert_viewport_within(state.viewport(), output);
+    }
+
+    #[test]
+    fn output_zoom_state_end_session() {
+        let view_size = Size::from((1920., 1080.));
+        let output = Rectangle::from_size(view_size);
+        let clock = test_clock();
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        // A session in every transient state at once: locked, mid level
+        // animation with a deadzone drift pending.
+        state.set_locked(true, Point::from((960., 540.)));
+        state.set_target_level(4., Point::from((100., 100.)), &clock, test_anim_config());
+        assert!(state.is_animating());
+
+        state.end_session();
+
+        assert_eq!(state.level(), 1.);
+        assert_eq!(state.target_level(), 1.);
+        assert!(!state.is_locked());
+        assert!(!state.is_animating());
+        assert!(!state.is_gesturing());
+        assert_eq!(state.viewport_transform().factor(), 1.);
+        assert_finite_point(state.focal());
+        assert_viewport_within(state.viewport(), output);
+
+        // The session is gone: a follow cannot be committed or suspended,
+        // and ending a gesture is a no-op.
+        assert!(!state.commit_follow_focal());
+        assert!(!state.suspend_follow());
+        state.end_gesture();
+        assert_eq!(state.level(), 1.);
+
+        // Idempotent: ending an already-ended session changes nothing.
+        state.end_session();
+        assert_eq!(state.level(), 1.);
+        assert_eq!(state.viewport_transform().factor(), 1.);
+    }
+
+    #[test]
+    fn output_zoom_state_end_session_during_follow() {
+        let view_size = Size::from((1920., 1080.));
+        let clock = test_clock();
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        // Park the cursor outside the deadzone so a follow owns the focal
+        // point.
+        follow(
+            &mut state,
+            Point::from((500., 300.)),
+            0.33,
+            &clock,
+            test_anim_config(),
+        );
+        assert!(matches!(state, OutputZoomState::Follow { .. }));
+
+        state.end_session();
+
+        assert_eq!(state.level(), 1.);
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        assert!(!state.is_locked());
     }
 
     #[test]
@@ -1995,7 +3252,7 @@ mod tests {
         let b = OutputZoomState::new(view_size);
 
         a.set_level_immediate(2., Point::from((960., 540.)));
-        a.set_locked(true);
+        a.set_locked(true, Point::from((960., 540.)));
 
         assert_eq!(b.level(), 1.);
         assert_eq!(b.target_level(), 1.);
@@ -2048,13 +3305,28 @@ mod tests {
     }
 
     /// The animation inside the current transition, if any.
-    fn transition_animation(state: &OutputZoomState) -> Option<&Animation> {
-        match &state.transition {
-            Some(ZoomLevelTransition::Animation { animation, .. })
-            | Some(ZoomLevelTransition::Restore { animation, .. }) => Some(animation),
-            Some(ZoomLevelTransition::Gesturing { .. })
-            | Some(ZoomLevelTransition::Follow { .. })
-            | None => None,
+    fn transition_animation(state: &OutputZoomState) -> Option<&crate::animation::Animation> {
+        state.animation()
+    }
+
+    /// The FSM state name, for assertion messages.
+    fn state_name(state: &OutputZoomState) -> &'static str {
+        match state {
+            OutputZoomState::Idle(_) => "Idle",
+            OutputZoomState::Follow { .. } => "Follow",
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Command(_),
+                ..
+            } => "Zooming(Command)",
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Restore(_),
+                ..
+            } => "Zooming(Restore)",
+            OutputZoomState::ZoomingFollow { .. } => "ZoomingFollow",
+            OutputZoomState::Gesture { .. } => "Gesture",
+            OutputZoomState::Locked(_) => "Locked",
+            OutputZoomState::LockedZooming { .. } => "LockedZooming",
+            OutputZoomState::LockedGesture { .. } => "LockedGesture",
         }
     }
 
@@ -2479,7 +3751,7 @@ mod tests {
     fn transition_locked_keeps_viewport_center_fixed() {
         let view_size = Size::from((1920., 1080.));
         let mut state = state_at(2., Point::from((500., 400.)), view_size);
-        state.set_locked(true);
+        state.set_locked(true, Point::from((960., 540.)));
         let mut clock = test_clock();
 
         // The content point at the viewport center: it must stay fixed while
@@ -2488,6 +3760,7 @@ mod tests {
         let center_content = state.viewport_transform().apply_inverse(center);
 
         state.set_target_level(4., Point::from((960., 540.)), &clock, test_anim_config());
+        assert!(matches!(state, OutputZoomState::LockedZooming { .. }));
 
         for _ in 0..20 {
             advance(&mut state, &mut clock, 10);
@@ -2504,28 +3777,66 @@ mod tests {
         let mut state = OutputZoomState::new(view_size);
         let mut clock = test_clock();
         let anchor = Point::from((960., 540.));
+        let pointer = Point::from((1200., 700.));
 
-        state.set_target_level(3., anchor, &clock, test_anim_config());
+        state.zoom_in(3., anchor, &clock, test_anim_config());
         advance(&mut state, &mut clock, 50);
+        let mid = state.level();
+        assert!(mid > 1. && mid < 3.);
 
-        state.set_locked(true);
-        let frozen = state.focal();
+        // Locking keeps the displayed viewport and the target, and
+        // re-anchors on the output center.
+        let viewport_before = state.viewport();
+        state.set_locked(true, pointer);
+        assert!(matches!(state, OutputZoomState::LockedZooming { .. }));
+        assert_eq!(state.target_level(), 3.);
+        assert_abs_diff_eq!(state.level(), mid, epsilon = EPS);
+        assert_point_eq(state.viewport().loc, viewport_before.loc);
+
+        let center = view_size.to_point().downscale(2.);
+        let center_content = state.viewport_transform().apply_inverse(center);
         advance(&mut state, &mut clock, 20);
+        assert_point_eq(state.viewport_transform().apply(center_content), center);
 
-        // Unlocking must not move the camera.
-        state.set_locked(false);
-        assert_point_eq(state.focal(), frozen);
+        // Unlocking keeps the displayed viewport and the target, and
+        // immediately re-anchors on the pointer.
+        let viewport_before = state.viewport();
+        state.set_locked(false, pointer);
+        assert!(
+            matches!(
+                state,
+                OutputZoomState::Zooming {
+                    zooming: ZoomingState::Command(ZoomCommandState::In { target, .. }),
+                    ..
+                } if target == 3.
+            ),
+            "expected Zooming(Command(In)), got {}",
+            state_name(&state)
+        );
+        assert_eq!(state.target_level(), 3.);
+        assert_abs_diff_eq!(
+            state.viewport().size.w,
+            viewport_before.size.w,
+            epsilon = EPS
+        );
+        assert_point_eq(state.viewport().loc, viewport_before.loc);
 
-        // Deadzone tracking waits for the level animation to finish.
-        assert!(!track(&mut state, Point::from((0., 0.)), 0.));
-        assert_point_eq(state.focal(), frozen);
+        // The pointer is the anchor: its displayed position stays pinned
+        // while the level animates.
+        let pointer_display = state.viewport_transform().apply(pointer);
+        for _ in 0..5 {
+            advance(&mut state, &mut clock, 20);
+            assert_point_eq(state.viewport_transform().apply(pointer), pointer_display);
+        }
+
+        // Deadzone tracking engages immediately, during the animation.
+        assert!(track(&mut state, Point::from((0., 0.)), 0.));
+        assert_point_eq(state.focal(), Point::from((0., 0.)));
 
         advance(&mut state, &mut clock, 5000);
         assert_eq!(state.level(), 3.);
-
-        // Once the animation completes, the follow evaluation moves the
-        // camera to the deadzone edge.
-        assert!(track(&mut state, Point::from((0., 0.)), 0.));
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        assert!(!track(&mut state, Point::from((0., 0.)), 0.));
         assert_point_eq(state.focal(), Point::from((0., 0.)));
     }
 
@@ -2696,7 +4007,14 @@ mod tests {
 
         // A saved 1x state whose focal differs from the temporary one.
         let saved_focal = Point::from((400., 300.));
-        state.focal = saved_focal;
+        state.restore_immediate(
+            ZoomSnapshot {
+                level: 1.,
+                target_level: 1.,
+                focal: saved_focal,
+            },
+            view_size,
+        );
         let snapshot = snapshot_of(&state);
         assert_eq!(snapshot.target_level, 1.);
 
@@ -2823,8 +4141,11 @@ mod tests {
         // The transition is now a regular level animation towards the same
         // target; the level did not jump.
         assert!(matches!(
-            state.transition,
-            Some(ZoomLevelTransition::Animation { .. })
+            state,
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Command(_),
+                ..
+            } | OutputZoomState::ZoomingFollow { .. }
         ));
         assert_eq!(state.level(), level);
         assert!(state.is_animating());
@@ -2838,37 +4159,58 @@ mod tests {
     }
 
     #[test]
-    fn restore_lock_converts_to_fixed_animation() {
+    fn restore_lock_converts_to_center_anchored_command() {
         let view_size = Size::from((1920., 1080.));
-        let mut state = state_at(2., Point::from((400., 300.)), view_size);
+        // A focal point near the center so that the center-anchored solve
+        // stays within the output bounds down to the restore target.
+        let mut state = state_at(3., Point::from((700., 450.)), view_size);
         let mut clock = test_clock();
-        let snapshot = snapshot_of(&state);
 
-        assert!(track(&mut state, Point::from((0., 0.)), 0.));
         // A slow easing restore so that it is still in flight when the lock
         // engages.
+        let mut snapshot = snapshot_of(&state);
+        snapshot.target_level = 1.5;
         state.restore_animated(snapshot, &clock, easing_config(1000));
         advance(&mut state, &mut clock, 50);
+        assert!(state.is_animating());
 
-        // Locking mid-restore freezes the current focal point and discards
-        // the saved destination.
-        let frozen = state.focal();
-        state.set_locked(true);
-        assert!(matches!(
-            state.transition,
-            Some(ZoomLevelTransition::Animation {
-                focal: ZoomTransitionFocal::Fixed { .. },
-                ..
-            })
-        ));
+        // Locking mid-restore converts it to a locked command: the restore
+        // target becomes the command target, the displayed viewport does
+        // not jump, and the camera re-anchors on the output center instead
+        // of freezing the focal point.
+        let viewport_before = state.viewport();
+        state.set_locked(true, Point::from((960., 540.)));
+        assert!(
+            matches!(state, OutputZoomState::LockedZooming { .. }),
+            "expected LockedZooming, got {}",
+            state_name(&state)
+        );
+        assert_eq!(state.target_level(), 1.5);
+        assert_point_eq(state.viewport().loc, viewport_before.loc);
+        assert_abs_diff_eq!(
+            state.viewport().size.w,
+            viewport_before.size.w,
+            epsilon = EPS
+        );
 
+        // Center anchoring: the content under the output center stays fixed
+        // while the level animates, so the focal point moves rather than
+        // freezing at the lock position.
+        let center = view_size.to_point().downscale(2.);
+        let center_content = state.viewport_transform().apply_inverse(center);
+        let lock_focal = state.focal();
+        let mut focal_moved = false;
         for _ in 0..10 {
             advance(&mut state, &mut clock, 20);
-            assert_point_eq(state.focal(), frozen);
+            assert_point_eq(state.viewport_transform().apply(center_content), center);
+            focal_moved |= state.focal() != lock_focal;
         }
+        assert!(focal_moved, "locked command must re-anchor on the center");
+
         advance(&mut state, &mut clock, 5000);
-        assert_eq!(state.level(), 2.);
-        assert_point_eq(state.focal(), frozen);
+        assert_eq!(state.level(), 1.5);
+        assert!(matches!(state, OutputZoomState::Locked(_)));
+        assert_point_eq(state.viewport_transform().apply(center_content), center);
     }
 
     #[test]
@@ -2881,7 +4223,7 @@ mod tests {
         // Move the camera away and lock it: the lock is stronger than the
         // saved focal destination.
         assert!(track(&mut state, Point::from((0., 0.)), 0.));
-        state.set_locked(true);
+        state.set_locked(true, Point::from((960., 540.)));
         let fixed = state.focal();
 
         let mut snapshot = snapshot;
@@ -2917,8 +4259,11 @@ mod tests {
         // A new zoom action retargets from the displayed state: no jump.
         state.set_target_level(4., Point::from((960., 540.)), &clock, test_anim_config());
         assert!(matches!(
-            state.transition,
-            Some(ZoomLevelTransition::Animation { .. })
+            state,
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Command(ZoomCommandState::Value { .. }),
+                ..
+            }
         ));
         assert_eq!(state.target_level(), 4.);
         assert_abs_diff_eq!(state.level(), mid, epsilon = EPS);
@@ -3004,7 +4349,7 @@ mod tests {
 
         advance(&mut state, &mut clock, 5000);
         assert!(!state.is_animating());
-        assert!(state.transition.is_none());
+        assert!(matches!(state, OutputZoomState::Idle(_)));
         assert_eq!(state.level(), 1.5);
         assert_eq!(state.target_level(), 1.5);
         assert_point_eq(state.focal(), Point::from((800., 500.)));
@@ -3061,13 +4406,15 @@ mod tests {
         state.begin_gesture(Point::from((960., 540.)));
 
         assert!(state.is_gesturing());
-        assert!(matches!(
-            state.transition,
-            Some(ZoomLevelTransition::Gesturing { start_level, .. })
-                if start_level == displayed
-        ));
+        assert!(matches!(state, OutputZoomState::Gesture { .. }));
         assert_abs_diff_eq!(state.level(), displayed, epsilon = EPS);
         assert_abs_diff_eq!(state.target_level(), displayed, epsilon = EPS);
+
+        // The gesture base is the displayed level: a scale of 1.1 lands on
+        // displayed * 1.1, not on anything derived from the abandoned
+        // animation target.
+        assert!(state.update_gesture(1.1, 10.));
+        assert_abs_diff_eq!(state.level(), displayed * 1.1, epsilon = 1e-6);
     }
 
     #[test]
@@ -3103,10 +4450,7 @@ mod tests {
         assert_eq!(state.level(), 2.);
         assert_eq!(state.target_level(), 2.);
         // Updates never allocate an animation.
-        assert!(matches!(
-            state.transition,
-            Some(ZoomLevelTransition::Gesturing { .. })
-        ));
+        assert!(matches!(state, OutputZoomState::Gesture { .. }));
     }
 
     #[test]
@@ -3197,7 +4541,7 @@ mod tests {
     fn gesture_locked_focal() {
         let view_size = Size::from((1920., 1080.));
         let mut state = state_at(2., Point::from((960., 540.)), view_size);
-        state.set_locked(true);
+        state.set_locked(true, Point::from((960., 540.)));
         let focal = state.focal();
 
         state.begin_gesture(Point::from((700., 400.)));
@@ -3218,7 +4562,8 @@ mod tests {
         let frozen = state.focal();
 
         // Locking freezes the focal point at its current displayed value.
-        state.set_locked(true);
+        state.set_locked(true, Point::from((960., 540.)));
+        assert!(matches!(state, OutputZoomState::LockedGesture { .. }));
         assert!(state.update_gesture(0.75, 10.));
 
         assert_eq!(state.level(), 1.5);
@@ -3231,13 +4576,14 @@ mod tests {
         let mut state = state_at(2., Point::from((960., 540.)), view_size);
 
         state.begin_gesture(Point::from((700., 400.)));
-        state.set_locked(true);
+        state.set_locked(true, Point::from((960., 540.)));
         assert!(state.update_gesture(1.5, 10.));
         let frozen = state.focal();
 
         // Unlocking does not jump back to the anchor: the fixed focal point
         // remains until the gesture ends.
-        state.set_locked(false);
+        state.set_locked(false, Point::from((960., 540.)));
+        assert!(matches!(state, OutputZoomState::Gesture { .. }));
         assert!(state.update_gesture(0.75, 10.));
 
         assert_point_eq(state.focal(), frozen);
@@ -3283,7 +4629,7 @@ mod tests {
         state.end_gesture();
 
         assert!(!state.is_gesturing());
-        assert!(state.transition.is_none());
+        assert!(matches!(state, OutputZoomState::Idle(_)));
         assert_eq!(state.level(), 3.);
         assert_eq!(state.target_level(), 3.);
         assert_point_eq(state.focal(), focal);
@@ -3557,7 +4903,7 @@ mod tests {
 
         assert_eq!(state.level(), 2.);
         assert_eq!(state.target_level(), 2.);
-        assert!(state.transition.is_none());
+        assert!(matches!(state, OutputZoomState::Idle(_)));
     }
 
     #[test]
@@ -3597,6 +4943,993 @@ mod tests {
         state.end_gesture();
         assert_eq!(state.level(), 1.);
         assert_eq!(state.target_level(), 1.);
+    }
+
+    // --- FSM transition matrix ---
+    //
+    // The zoom state is a finite state machine over eight variants: `Idle`,
+    // `Follow`, `Zooming` (command or restore), `ZoomingFollow`, `Gesture`,
+    // `Locked`, `LockedZooming` and `LockedGesture`. These tests pin the
+    // transition edges and the resting states they converge to.
+
+    #[test]
+    fn fsm_idle_zoom_in_completes_to_idle() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+
+        state.zoom_in(2., Point::from((960., 540.)), &clock, test_anim_config());
+        assert!(
+            matches!(
+                state,
+                OutputZoomState::Zooming {
+                    zooming: ZoomingState::Command(ZoomCommandState::In { target, .. }),
+                    ..
+                } if target == 2.
+            ),
+            "expected Zooming(Command(In)), got {}",
+            state_name(&state)
+        );
+        assert_eq!(state.target_level(), 2.);
+        assert_eq!(state.intent_level(), 2.);
+        assert!(state.is_zooming());
+        assert!(state.is_animating());
+        assert!(!state.is_following());
+        assert!(!state.is_gesturing());
+
+        advance(&mut state, &mut clock, 5000);
+        assert!(
+            matches!(state, OutputZoomState::Idle(_)),
+            "expected Idle, got {}",
+            state_name(&state)
+        );
+        assert_eq!(state.level(), 2.);
+        assert_eq!(state.intent_level(), 2.);
+    }
+
+    #[test]
+    fn fsm_command_targets() {
+        // Each command kind carries its resolved target: In/Out from
+        // incremental actions, Value from an explicit level, ToIdentity for
+        // the normalized zoom-out-to-1x.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let clock = test_clock();
+        let anchor = Point::from((960., 540.));
+
+        state.zoom_in(2., anchor, &clock, test_anim_config());
+        assert!(matches!(
+            state,
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Command(ZoomCommandState::In { target, .. }),
+                ..
+            } if target == 2.
+        ));
+
+        state.zoom_out(1.5, anchor, &clock, test_anim_config());
+        assert!(matches!(
+            state,
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Command(ZoomCommandState::Out { target, .. }),
+                ..
+            } if target == 1.5
+        ));
+
+        state.set_target_level(3., anchor, &clock, test_anim_config());
+        assert!(matches!(
+            state,
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Command(ZoomCommandState::Value { target, .. }),
+                ..
+            } if target == 3.
+        ));
+
+        state.set_target_level(1., anchor, &clock, test_anim_config());
+        assert!(matches!(
+            state,
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Command(ZoomCommandState::ToIdentity { .. }),
+                ..
+            }
+        ));
+        assert_eq!(state.target_level(), 1.);
+        assert_eq!(state.intent_level(), 1.);
+    }
+
+    #[test]
+    fn fsm_command_direction_uses_intent_not_display() {
+        // The command direction is resolved from the user intent (the
+        // requested operation), not by comparing the target against the
+        // displayed level. Here the displayed level is still below the
+        // zoom-out target, yet the command is an Out.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+        let anchor = Point::from((960., 540.));
+
+        state.zoom_in(4., anchor, &clock, test_anim_config());
+        advance(&mut state, &mut clock, 10);
+        let displayed = state.level();
+        assert!(displayed > 1. && displayed < 2.);
+
+        state.zoom_out(2., anchor, &clock, test_anim_config());
+        assert!(
+            matches!(
+                state,
+                OutputZoomState::Zooming {
+                    zooming: ZoomingState::Command(ZoomCommandState::Out { target, .. }),
+                    ..
+                } if target == 2.
+            ),
+            "expected Out command, got {}",
+            state_name(&state)
+        );
+        // No jump: the displayed level continues from where it was.
+        assert_abs_diff_eq!(state.level(), displayed, epsilon = EPS);
+    }
+
+    #[test]
+    fn fsm_repeated_action_replaces_value_with_in() {
+        // A repeated incremental action replaces the in-flight command: the
+        // new target is derived from the intent level, not the displayed
+        // one, and the command kind changes Value → In.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+        let anchor = Point::from((960., 540.));
+
+        state.set_target_level(2., anchor, &clock, test_anim_config());
+        assert!(matches!(
+            state,
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Command(ZoomCommandState::Value { .. }),
+                ..
+            }
+        ));
+        advance(&mut state, &mut clock, 50);
+        let displayed = state.level();
+        assert!(displayed > 1. && displayed < 2.);
+
+        // The input layer resolves the next target from intent_level():
+        // 2. * 1.5 = 3.
+        assert_eq!(state.intent_level(), 2.);
+        state.zoom_in(3., anchor, &clock, test_anim_config());
+        assert!(matches!(
+            state,
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Command(ZoomCommandState::In { target, .. }),
+                ..
+            } if target == 3.
+        ));
+        assert_abs_diff_eq!(state.level(), displayed, epsilon = EPS);
+
+        advance(&mut state, &mut clock, 5000);
+        assert_eq!(state.level(), 3.);
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+    }
+
+    #[test]
+    fn fsm_to_identity_lands_exactly() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        let mut clock = test_clock();
+
+        state.set_target_level(1., Point::from((960., 540.)), &clock, test_anim_config());
+        assert!(matches!(
+            state,
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Command(ZoomCommandState::ToIdentity { .. }),
+                ..
+            }
+        ));
+
+        advance(&mut state, &mut clock, 5000);
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        assert_eq!(state.level(), 1.);
+        assert_eq!(state.viewport_transform().factor(), 1.);
+    }
+
+    #[test]
+    fn fsm_follow_starts_and_converges() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let cursor = Point::from((100., 540.));
+
+        assert!(state.update_follow(cursor, zoom, &clock, test_anim_config()));
+        assert!(
+            matches!(state, OutputZoomState::Follow { .. }),
+            "expected Follow, got {}",
+            state_name(&state)
+        );
+        assert!(state.is_following());
+        assert!(!state.is_zooming());
+
+        // The follow converges to the clamped deadzone target and rests.
+        for _ in 0..500 {
+            advance(&mut state, &mut clock, 16);
+            state.update_follow(cursor, zoom, &clock, test_anim_config());
+            if matches!(state, OutputZoomState::Idle(_)) {
+                break;
+            }
+        }
+        assert!(
+            matches!(state, OutputZoomState::Idle(_)),
+            "expected Idle, got {}",
+            state_name(&state)
+        );
+        assert_eq!(state.level(), 2.);
+    }
+
+    #[test]
+    fn fsm_zoom_action_during_follow() {
+        // A zoom action during a resting follow keeps the follow alive: the
+        // state becomes ZoomingFollow immediately, the camera does not
+        // jump, and the follow keeps converging during the level animation.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let cursor = Point::from((100., 540.));
+
+        assert!(state.update_follow(cursor, zoom, &clock, test_anim_config()));
+        advance(&mut state, &mut clock, 16);
+        state.update_follow(cursor, zoom, &clock, test_anim_config());
+        assert!(matches!(state, OutputZoomState::Follow { .. }));
+        let focal = state.focal();
+        let level = state.level();
+
+        state.zoom_in(3., Point::from((960., 540.)), &clock, test_anim_config());
+        assert!(
+            matches!(
+                state,
+                OutputZoomState::ZoomingFollow {
+                    zooming: ZoomCommandState::In { target, .. },
+                    ..
+                } if target == 3.
+            ),
+            "expected ZoomingFollow(In), got {}",
+            state_name(&state)
+        );
+        assert!(state.is_following());
+        assert_abs_diff_eq!(state.level(), level, epsilon = EPS);
+        assert_point_eq(state.focal(), focal);
+
+        // The follow is still live: the next evaluation steps it.
+        advance(&mut state, &mut clock, 16);
+        assert!(state.update_follow(cursor, zoom, &clock, test_anim_config()));
+        assert!(matches!(state, OutputZoomState::ZoomingFollow { .. }));
+    }
+
+    #[test]
+    fn fsm_resting_command_noop() {
+        // A command whose target equals the resting level is an exact
+        // no-op: no zero-distance Zooming state is created.
+        let view_size = Size::from((1920., 1080.));
+        let clock = test_clock();
+        let anchor = Point::from((960., 540.));
+
+        // Idle at 1x: zooming out to 1 and setting level 1 are no-ops.
+        let mut state = OutputZoomState::new(view_size);
+        state.zoom_out(1., anchor, &clock, test_anim_config());
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        state.set_target_level(1., anchor, &clock, test_anim_config());
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        assert!(!state.is_animating());
+
+        // Idle at 2x: an explicit set to the resting level is a no-op.
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        state.set_target_level(2., anchor, &clock, test_anim_config());
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        assert!(!state.is_animating());
+        assert_eq!(state.level(), 2.);
+
+        // Locked resting at 2x: same no-op, stays Locked.
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        state.set_locked(true, anchor);
+        state.set_target_level(2., anchor, &clock, test_anim_config());
+        assert!(matches!(state, OutputZoomState::Locked(_)));
+        assert!(!state.is_animating());
+
+        // Resting follow: a no-op command does not disturb it.
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        assert!(state.update_follow(Point::from((100., 540.)), zoom, &clock, test_anim_config()));
+        assert!(matches!(state, OutputZoomState::Follow { .. }));
+        state.set_target_level(2., anchor, &clock, test_anim_config());
+        assert!(
+            matches!(state, OutputZoomState::Follow { .. }),
+            "expected Follow, got {}",
+            state_name(&state)
+        );
+        assert!(state.is_following());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn fsm_command_direction_rejects_wrong_side() {
+        // The caller resolves the target from the intent level; a zoom-in
+        // target below the intent (or a zoom-out target above it) is a
+        // caller bug and is rejected in debug builds.
+        let view_size = Size::from((1920., 1080.));
+        let clock = test_clock();
+        let anchor = Point::from((960., 540.));
+
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.zoom_in(1.5, anchor, &clock, test_anim_config())
+        }))
+        .is_err());
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        assert_eq!(state.level(), 2.);
+
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.zoom_out(3., anchor, &clock, test_anim_config())
+        }))
+        .is_err());
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        assert_eq!(state.level(), 2.);
+    }
+
+    #[test]
+    fn fsm_to_identity_during_follow_drops_follow() {
+        // A command to the identity transform cannot keep a follow: at 1x
+        // the deadzone is meaningless, so the combined state degrades to a
+        // plain ToIdentity command with the focal point fixed at its live
+        // displayed value.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+
+        assert!(state.update_follow(Point::from((100., 540.)), zoom, &clock, test_anim_config()));
+        assert!(matches!(state, OutputZoomState::Follow { .. }));
+        let focal = state.focal();
+
+        state.set_target_level(1., Point::from((960., 540.)), &clock, test_anim_config());
+        assert!(
+            matches!(
+                state,
+                OutputZoomState::Zooming {
+                    zooming: ZoomingState::Command(ZoomCommandState::ToIdentity { .. }),
+                    ..
+                }
+            ),
+            "expected Zooming(ToIdentity), got {}",
+            state_name(&state)
+        );
+        assert!(!state.is_following());
+        assert_point_eq(state.focal(), focal);
+
+        advance(&mut state, &mut clock, 5000);
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        assert_eq!(state.level(), 1.);
+    }
+
+    #[test]
+    fn fsm_zooming_follow_retarget_keeps_follow() {
+        // Retargeting the combined state replaces the command but keeps the
+        // follow: same live geometry, no stale timing, no jump.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let config = test_anim_config();
+        let cursor = Point::from((100., 540.));
+
+        state.zoom_in(4., Point::from((960., 540.)), &clock, config);
+        advance(&mut state, &mut clock, 50);
+        assert!(state.update_follow(cursor, zoom, &clock, config));
+        assert!(matches!(state, OutputZoomState::ZoomingFollow { .. }));
+        let level = state.level();
+        let focal = state.focal();
+
+        // zoom-out to a level still above 1: the command kind and target
+        // change, the follow is retained.
+        state.zoom_out(2., cursor, &clock, config);
+        assert!(
+            matches!(
+                state,
+                OutputZoomState::ZoomingFollow {
+                    zooming: ZoomCommandState::Out { target, .. },
+                    ..
+                } if target == 2.
+            ),
+            "expected ZoomingFollow(Out), got {}",
+            state_name(&state)
+        );
+        assert!(state.is_following());
+        assert_eq!(state.target_level(), 2.);
+        assert_abs_diff_eq!(state.level(), level, epsilon = EPS);
+        assert_point_eq(state.focal(), focal);
+
+        // The follow still steps on the next evaluation.
+        advance(&mut state, &mut clock, 16);
+        state.update_follow(cursor, zoom, &clock, config);
+        assert!(state.is_following());
+    }
+
+    #[test]
+    fn fsm_zooming_follow_retarget_to_identity_drops_follow() {
+        // Retargeting the combined state to 1x drops the follow: the
+        // deadzone is meaningless at the identity transform.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let config = test_anim_config();
+        let cursor = Point::from((100., 540.));
+
+        state.zoom_in(4., Point::from((960., 540.)), &clock, config);
+        advance(&mut state, &mut clock, 50);
+        assert!(state.update_follow(cursor, zoom, &clock, config));
+        assert!(matches!(state, OutputZoomState::ZoomingFollow { .. }));
+        let focal = state.focal();
+
+        state.set_target_level(1., Point::from((960., 540.)), &clock, config);
+        assert!(
+            matches!(
+                state,
+                OutputZoomState::Zooming {
+                    zooming: ZoomingState::Command(ZoomCommandState::ToIdentity { .. }),
+                    ..
+                }
+            ),
+            "expected Zooming(ToIdentity), got {}",
+            state_name(&state)
+        );
+        assert!(!state.is_following());
+        assert_point_eq(state.focal(), focal);
+
+        advance(&mut state, &mut clock, 5000);
+        assert_eq!(state.level(), 1.);
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+    }
+
+    #[test]
+    fn fsm_zooming_follow_combined_then_resting_follow() {
+        // A cursor outside the deadzone during a level animation combines
+        // the command with a live follow: ZoomingFollow. When the command
+        // completes first, the state degrades to a resting Follow that
+        // keeps converging — without consuming the combined phase as one
+        // stale step.
+        let view_size = Size::from((1920., 1080.));
+        let output = Rectangle::from_size(view_size);
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let config = test_anim_config();
+        let cursor = Point::from((100., 540.));
+
+        state.zoom_in(2., Point::from((960., 540.)), &clock, config);
+        advance(&mut state, &mut clock, 50);
+
+        assert!(state.update_follow(cursor, zoom, &clock, config));
+        assert!(
+            matches!(state, OutputZoomState::ZoomingFollow { .. }),
+            "expected ZoomingFollow, got {}",
+            state_name(&state)
+        );
+        assert!(state.is_zooming());
+        assert!(state.is_following());
+
+        // Drive the combined state for a few frames: enough that a stale
+        // resting-step timestamp would produce a clearly visible snap, but
+        // few enough that the follow has not converged yet.
+        for _ in 0..10 {
+            advance(&mut state, &mut clock, 16);
+            state.update_follow(cursor, zoom, &clock, config);
+        }
+        assert!(matches!(state, OutputZoomState::ZoomingFollow { .. }));
+
+        // Complete the command instantly; the follow is still converging.
+        clock.set_complete_instantly(true);
+        state.advance_animations();
+        clock.set_complete_instantly(false);
+        assert_eq!(state.level(), 2.);
+        assert!(
+            matches!(state, OutputZoomState::Follow { .. }),
+            "expected resting Follow, got {}",
+            state_name(&state)
+        );
+
+        // The first resting step measures only its own frame delta: a stale
+        // timestamp would snap the camera to the deadzone border at once.
+        let before = state.viewport_transform().apply(cursor);
+        advance(&mut state, &mut clock, 16);
+        state.update_follow(cursor, zoom, &clock, config);
+        let after = state.viewport_transform().apply(cursor);
+        let d = after - before;
+        let step = (d.x * d.x + d.y * d.y).sqrt();
+        assert!(step < 100., "stale follow step: {step}px");
+
+        // The resting follow converges normally.
+        for _ in 0..500 {
+            advance(&mut state, &mut clock, 16);
+            state.update_follow(cursor, zoom, &clock, config);
+            if matches!(state, OutputZoomState::Idle(_)) {
+                break;
+            }
+        }
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        assert_viewport_within(state.viewport(), output);
+    }
+
+    #[test]
+    fn fsm_zooming_follow_follow_converges_first() {
+        // When the follow reaches its target while the command is still
+        // animating, the combined state drops the follow and continues as a
+        // plain command.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        // A long easing keeps the command animating after the follow lands.
+        let config = easing_config(5000);
+        let cursor = Point::from((100., 540.));
+
+        state.zoom_in(2., Point::from((960., 540.)), &clock, config);
+        advance(&mut state, &mut clock, 50);
+        assert!(state.update_follow(cursor, zoom, &clock, config));
+        assert!(matches!(state, OutputZoomState::ZoomingFollow { .. }));
+
+        // An instant follow evaluation lands the camera on the deadzone
+        // edge while the level animation continues.
+        state.update_follow(cursor, zoom, &clock, niri_config::Animation::new_off());
+        assert!(
+            matches!(
+                state,
+                OutputZoomState::Zooming {
+                    zooming: ZoomingState::Command(_),
+                    ..
+                }
+            ),
+            "expected Zooming(Command), got {}",
+            state_name(&state)
+        );
+        assert!(state.is_zooming());
+        assert!(!state.is_following());
+        assert!(state.is_animating());
+
+        advance(&mut state, &mut clock, 6000);
+        assert_eq!(state.level(), 2.);
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+    }
+
+    #[test]
+    fn fsm_zooming_follow_simultaneous_completion() {
+        // Command and follow completing together land on the resting zoomed
+        // state: no follow is left running at the target.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let cursor = Point::from((100., 540.));
+
+        state.zoom_in(2., Point::from((960., 540.)), &clock, test_anim_config());
+        advance(&mut state, &mut clock, 50);
+        assert!(state.update_follow(cursor, zoom, &clock, test_anim_config()));
+        assert!(matches!(state, OutputZoomState::ZoomingFollow { .. }));
+
+        // Land the follow on its target and complete the command in the
+        // same frame.
+        state.update_follow(cursor, zoom, &clock, niri_config::Animation::new_off());
+        clock.set_complete_instantly(true);
+        state.advance_animations();
+        clock.set_complete_instantly(false);
+
+        assert!(
+            matches!(state, OutputZoomState::Idle(_)),
+            "expected Idle, got {}",
+            state_name(&state)
+        );
+        assert_eq!(state.level(), 2.);
+        assert!(!state.is_following());
+        assert!(!state.is_animating());
+    }
+
+    #[test]
+    fn fsm_restore_pointer_takeover() {
+        // Pointer interaction during a restore takes over the camera: the
+        // restore becomes a regular command anchored on the cursor at its
+        // current displayed position. The level keeps animating towards the
+        // restore target without a focal jump.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(3., Point::from((400., 300.)), view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let config = test_anim_config();
+
+        let mut snapshot = snapshot_of(&state);
+        snapshot.target_level = 1.5;
+        snapshot.focal = Point::from((800., 500.));
+        state.restore_animated(snapshot, &clock, config);
+        assert!(
+            matches!(
+                state,
+                OutputZoomState::Zooming {
+                    zooming: ZoomingState::Restore(_),
+                    ..
+                }
+            ),
+            "expected Zooming(Restore), got {}",
+            state_name(&state)
+        );
+        advance(&mut state, &mut clock, 50);
+        let level = state.level();
+        let focal = state.focal();
+
+        // The per-frame follow evaluation never disturbs a restore.
+        assert!(!state.update_follow(Point::from((0., 0.)), zoom, &clock, config));
+        assert!(matches!(
+            state,
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Restore(_),
+                ..
+            }
+        ));
+
+        // Pointer interaction takes over: restore → command, continuous.
+        let cursor = Point::from((1500., 900.));
+        assert!(state.update_focal_for_cursor(cursor, zoom, &clock, config));
+        assert!(
+            matches!(
+                state,
+                OutputZoomState::Zooming {
+                    zooming: ZoomingState::Command(_),
+                    ..
+                } | OutputZoomState::ZoomingFollow { .. }
+            ),
+            "expected command takeover, got {}",
+            state_name(&state)
+        );
+        assert_eq!(state.target_level(), 1.5);
+        assert_abs_diff_eq!(state.level(), level, epsilon = EPS);
+        assert_point_eq(state.focal(), focal);
+
+        advance(&mut state, &mut clock, 5000);
+        assert_eq!(state.level(), 1.5);
+    }
+
+    #[test]
+    fn fsm_restore_replaces_follow() {
+        // A restore owns the viewport exclusively: starting one during a
+        // resting follow materializes the camera and takes over.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        let clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+
+        assert!(state.update_follow(Point::from((100., 540.)), zoom, &clock, test_anim_config()));
+        assert!(matches!(state, OutputZoomState::Follow { .. }));
+        let focal = state.focal();
+
+        let mut snapshot = snapshot_of(&state);
+        snapshot.target_level = 3.;
+        snapshot.focal = Point::from((400., 300.));
+        state.restore_animated(snapshot, &clock, test_anim_config());
+
+        assert!(matches!(
+            state,
+            OutputZoomState::Zooming {
+                zooming: ZoomingState::Restore(_),
+                ..
+            }
+        ));
+        // The camera did not jump when the follow was materialized.
+        assert_point_eq(state.focal(), focal);
+    }
+
+    #[test]
+    fn fsm_gesture_lifecycle() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(matches!(state, OutputZoomState::Gesture { .. }));
+        assert!(state.is_gesturing());
+        assert!(!state.is_animating());
+        assert!(!state.is_zooming());
+
+        assert!(state.update_gesture(1.5, 10.));
+        assert_eq!(state.level(), 3.);
+        assert_eq!(state.intent_level(), 3.);
+
+        state.end_gesture();
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        assert_eq!(state.level(), 3.);
+        assert_eq!(state.target_level(), 3.);
+    }
+
+    #[test]
+    fn fsm_gesture_begin_during_follow() {
+        // A gesture takes over from a resting follow: the camera is
+        // materialized and the gesture owns the viewport.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        let clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+
+        assert!(state.update_follow(Point::from((100., 540.)), zoom, &clock, test_anim_config()));
+        assert!(matches!(state, OutputZoomState::Follow { .. }));
+        let focal = state.focal();
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(matches!(state, OutputZoomState::Gesture { .. }));
+        assert_point_eq(state.focal(), focal);
+    }
+
+    #[test]
+    fn fsm_gesture_begin_during_zooming_follow() {
+        // A gesture takes over the combined state: the command and the
+        // follow are abandoned at the displayed viewport, which becomes the
+        // gesture base.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let config = test_anim_config();
+
+        state.zoom_in(2., Point::from((960., 540.)), &clock, config);
+        advance(&mut state, &mut clock, 50);
+        assert!(state.update_follow(Point::from((100., 540.)), zoom, &clock, config));
+        assert!(matches!(state, OutputZoomState::ZoomingFollow { .. }));
+        let level = state.level();
+        let focal = state.focal();
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(matches!(state, OutputZoomState::Gesture { .. }));
+        assert!(state.is_gesturing());
+        assert_abs_diff_eq!(state.level(), level, epsilon = EPS);
+        assert_point_eq(state.focal(), focal);
+    }
+
+    #[test]
+    fn fsm_gesture_begin_during_locked_zooming() {
+        // A gesture while a locked command is animating takes over into the
+        // locked gesture state; the lock is kept.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        let mut clock = test_clock();
+
+        state.set_locked(true, Point::from((960., 540.)));
+        state.zoom_in(4., Point::from((960., 540.)), &clock, test_anim_config());
+        assert!(matches!(state, OutputZoomState::LockedZooming { .. }));
+        advance(&mut state, &mut clock, 50);
+        let level = state.level();
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(matches!(state, OutputZoomState::LockedGesture { .. }));
+        assert!(state.is_gesturing());
+        assert!(state.is_locked());
+        assert_abs_diff_eq!(state.level(), level, epsilon = EPS);
+    }
+
+    #[test]
+    fn fsm_locked_gesture_lifecycle() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        state.set_locked(true, Point::from((960., 540.)));
+        assert!(matches!(state, OutputZoomState::Locked(_)));
+
+        state.begin_gesture(Point::from((700., 400.)));
+        assert!(matches!(state, OutputZoomState::LockedGesture { .. }));
+        assert!(state.is_gesturing());
+        assert!(state.is_locked());
+
+        assert!(state.update_gesture(1.5, 10.));
+        assert_eq!(state.level(), 3.);
+
+        state.end_gesture();
+        assert!(matches!(state, OutputZoomState::Locked(_)));
+        assert!(state.is_locked());
+        assert_eq!(state.level(), 3.);
+    }
+
+    #[test]
+    fn fsm_lock_unlock_resting() {
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        let pointer = Point::from((1200., 700.));
+
+        state.set_locked(true, pointer);
+        assert!(matches!(state, OutputZoomState::Locked(_)));
+        assert!(state.is_locked());
+        // Locking a resting state does not move the camera.
+        assert_point_eq(state.focal(), Point::from((960., 540.)));
+
+        state.set_locked(false, pointer);
+        assert!(matches!(state, OutputZoomState::Idle(_)));
+        assert!(!state.is_locked());
+        assert_point_eq(state.focal(), Point::from((960., 540.)));
+    }
+
+    #[test]
+    fn fsm_lock_during_follow() {
+        // Locking a resting follow materializes the camera where it is and
+        // drops the follow: the combined locked+follow state does not
+        // exist.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = state_at(2., Point::from((960., 540.)), view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let cursor = Point::from((100., 540.));
+
+        assert!(state.update_follow(cursor, zoom, &clock, test_anim_config()));
+        advance(&mut state, &mut clock, 16);
+        state.update_follow(cursor, zoom, &clock, test_anim_config());
+        assert!(matches!(state, OutputZoomState::Follow { .. }));
+        let focal = state.focal();
+
+        state.set_locked(true, cursor);
+        assert!(matches!(state, OutputZoomState::Locked(_)));
+        assert!(!state.is_following());
+        // The camera froze where the follow had carried it.
+        assert_point_eq(state.focal(), focal);
+    }
+
+    #[test]
+    fn fsm_lock_during_zooming_follow() {
+        // Locking the combined state drops the follow and keeps the
+        // command: LockedZooming. The displayed viewport does not jump.
+        let view_size = Size::from((1920., 1080.));
+        let mut state = OutputZoomState::new(view_size);
+        let mut clock = test_clock();
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let config = test_anim_config();
+        let cursor = Point::from((100., 540.));
+
+        state.zoom_in(2., Point::from((960., 540.)), &clock, config);
+        advance(&mut state, &mut clock, 50);
+        assert!(state.update_follow(cursor, zoom, &clock, config));
+        assert!(matches!(state, OutputZoomState::ZoomingFollow { .. }));
+        let viewport_before = state.viewport();
+
+        state.set_locked(true, cursor);
+        assert!(
+            matches!(state, OutputZoomState::LockedZooming { .. }),
+            "expected LockedZooming, got {}",
+            state_name(&state)
+        );
+        assert!(!state.is_following());
+        assert_eq!(state.target_level(), 2.);
+        assert_point_eq(state.viewport().loc, viewport_before.loc);
+        assert_abs_diff_eq!(
+            state.viewport().size.w,
+            viewport_before.size.w,
+            epsilon = EPS
+        );
+
+        advance(&mut state, &mut clock, 5000);
+        assert!(matches!(state, OutputZoomState::Locked(_)));
+        assert_eq!(state.level(), 2.);
+    }
+
+    #[test]
+    fn fsm_end_session_from_every_state() {
+        // The Overview replaces the desktop presentation: from every FSM
+        // state the session ends on the resting 1x identity, unlocked.
+        let view_size = Size::from((1920., 1080.));
+        let zoom = niri_config::Zoom {
+            deadzone_size: 0.5,
+            ..Default::default()
+        };
+        let mut clock = test_clock();
+
+        let resting = || state_at(2., Point::from((960., 540.)), view_size);
+
+        let mut follow = resting();
+        follow.update_follow(Point::from((100., 540.)), zoom, &clock, test_anim_config());
+
+        let mut command = resting();
+        command.zoom_in(4., Point::from((960., 540.)), &clock, test_anim_config());
+
+        let mut restore = resting();
+        let mut snapshot = restore.snapshot();
+        snapshot.target_level = 1.5;
+        snapshot.focal = Point::from((400., 300.));
+        restore.restore_animated(snapshot, &clock, test_anim_config());
+
+        let mut combined = resting();
+        combined.zoom_in(4., Point::from((960., 540.)), &clock, test_anim_config());
+        advance(&mut combined, &mut clock, 50);
+        combined.update_follow(Point::from((100., 540.)), zoom, &clock, test_anim_config());
+
+        let mut gesture = resting();
+        gesture.begin_gesture(Point::from((700., 400.)));
+
+        let mut locked = resting();
+        locked.set_locked(true, Point::from((960., 540.)));
+
+        let mut locked_command = resting();
+        locked_command.set_locked(true, Point::from((960., 540.)));
+        locked_command.zoom_in(4., Point::from((960., 540.)), &clock, test_anim_config());
+
+        let mut locked_gesture = resting();
+        locked_gesture.set_locked(true, Point::from((960., 540.)));
+        locked_gesture.begin_gesture(Point::from((700., 400.)));
+
+        let mut states = [
+            ("Idle", resting()),
+            ("Follow", follow),
+            ("Zooming(Command)", command),
+            ("Zooming(Restore)", restore),
+            ("ZoomingFollow", combined),
+            ("Gesture", gesture),
+            ("Locked", locked),
+            ("LockedZooming", locked_command),
+            ("LockedGesture", locked_gesture),
+        ];
+
+        for (expected, state) in states.iter_mut() {
+            let expected = *expected;
+            assert_eq!(
+                state_name(state),
+                expected,
+                "setup did not reach {expected}"
+            );
+            state.end_session();
+            assert!(
+                matches!(state, OutputZoomState::Idle(_)),
+                "end_session from {expected} left {}",
+                state_name(state)
+            );
+            assert_eq!(state.level(), 1., "level after end_session from {expected}");
+            assert_eq!(state.target_level(), 1.);
+            assert!(!state.is_locked());
+            assert!(!state.is_animating());
+            assert!(!state.is_gesturing());
+            assert!(!state.is_following());
+            assert_eq!(state.viewport_transform().factor(), 1.);
+        }
     }
 
     proptest! {

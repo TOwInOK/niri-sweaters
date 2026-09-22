@@ -3196,6 +3196,40 @@ impl Niri {
         }
     }
 
+    /// Ends every output's desktop zoom session for the Overview.
+    ///
+    /// The Overview replaces the desktop presentation entirely, so the zoom
+    /// session does not survive it: each monitor's zoom state is reset to
+    /// the resting 1x identity, the `hold-zoom` and `zoom-lock` hold
+    /// sessions are dropped without restoring their snapshots, and an
+    /// active zoom pinch switches to `Swallowing` so the rest of the
+    /// already-claimed gesture sequence never reaches the client.
+    ///
+    /// The caller is responsible for the pointer rebase: the canonical
+    /// pointer position must be moved to its displayed position so the
+    /// pointer does not visually jump when the zoom transform disappears.
+    pub fn terminate_zoom_for_overview(&mut self) {
+        // The client never saw the pinch begin, so the remaining updates and
+        // the end are swallowed rather than forwarded as an orphan gesture.
+        if let Some(routing) = self.zoom_pinch.take() {
+            self.zoom_pinch = Some(ZoomPinchRouting::Swallowing {
+                device_id: routing.device_id().to_owned(),
+            });
+        }
+
+        // The sessions are dropped without restoring their snapshots: the
+        // zoom state they would restore no longer exists. A late trigger
+        // release then finds no session and is a no-op.
+        self.zoom_hold = None;
+        self.zoom_lock_hold = None;
+
+        for mon in self.layout.monitors_mut() {
+            mon.zoom_mut().end_session();
+        }
+
+        self.queue_redraw_all();
+    }
+
     pub fn output_resized(&mut self, output: &Output) {
         let output_size = output_size(output);
         let scale = output.current_scale();
@@ -3288,28 +3322,27 @@ impl Niri {
     /// While the session is locked the lock surface is the authoritative
     /// presentation: it is drawn in raw screen space, so the pointer must be
     /// presented at its canonical position with the identity transform.
-    /// Otherwise the pointer follows the desktop zoom presentation, i.e. the
-    /// monitor's effective zoom transform (which already accounts for the
-    /// Overview). When the output has no monitor the transform is identity.
+    /// Otherwise the pointer follows the desktop zoom presentation. When the
+    /// output has no monitor the transform is identity.
     pub(crate) fn pointer_presentation_transform(&self, output: &Output) -> ViewportTransform {
-        let effective = self
+        let zoom = self
             .layout
             .monitor_for_output(output)
-            .map(|mon| mon.effective_zoom_transform())
+            .map(|mon| mon.zoom().viewport_transform())
             .unwrap_or_else(ViewportTransform::identity);
-        Self::pointer_transform_for_presentation(self.is_locked(), effective)
+        Self::pointer_transform_for_presentation(self.is_locked(), zoom)
     }
 
     /// Pointer presentation policy: identity while the session is locked,
-    /// otherwise the effective desktop zoom transform.
+    /// otherwise the desktop zoom transform.
     pub(crate) fn pointer_transform_for_presentation(
         locked: bool,
-        effective: ViewportTransform,
+        zoom: ViewportTransform,
     ) -> ViewportTransform {
         if locked {
             ViewportTransform::identity()
         } else {
-            effective
+            zoom
         }
     }
 
@@ -3319,7 +3352,7 @@ impl Niri {
     /// The transform is taken from the output that owns the canonical position,
     /// never from a candidate output the displayed position may overlap, and
     /// follows the pointer presentation policy: identity while the session is
-    /// locked, the effective desktop zoom transform otherwise. When the
+    /// locked, the desktop zoom transform otherwise. When the
     /// position is not on any output it is returned unchanged.
     pub(crate) fn display_position_for_content(
         &self,
@@ -4666,12 +4699,12 @@ impl Niri {
             push
         };
 
-        // Desktop zoom transform for the desktop scene below. At effective level 1 it is
+        // Desktop zoom transform for the desktop scene below. At level 1 it is
         // the identity.
         let desktop_zoom = self
             .layout
             .monitor_for_output(output)
-            .map(|mon| mon.effective_zoom_transform())
+            .map(|mon| mon.zoom().viewport_transform())
             .unwrap_or_else(ViewportTransform::identity);
 
         // The pointer goes on the top. Its presentation follows the pointer transform:

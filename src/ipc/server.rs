@@ -482,7 +482,7 @@ pub(crate) fn zoom_state(niri: &crate::niri::Niri) -> Vec<niri_ipc::ZoomState> {
                 output: monitor.output_name().clone(),
                 level: zoom.level(),
                 target_level: zoom.target_level(),
-                effective_level: monitor.effective_zoom_transform().factor(),
+                effective_level: zoom.level(),
                 focal: zoom.focal().into(),
                 locked: zoom.is_locked(),
             }

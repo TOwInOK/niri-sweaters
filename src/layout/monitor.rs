@@ -30,7 +30,6 @@ use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
 use crate::utils::transaction::Transaction;
-use crate::utils::view::ViewportTransform;
 use crate::utils::{
     output_size, round_logical_in_physical, round_logical_in_physical_max1, ResizeEdge,
 };
@@ -1402,34 +1401,6 @@ impl<W: LayoutElement> Monitor<W> {
         self.overview_progress.is_some()
     }
 
-    /// Returns the desktop zoom transform currently visible on this monitor.
-    ///
-    /// Overview suppression is derived only at this presentation boundary: it moves
-    /// the stored level toward 1x in log2 space without changing stored state.
-    pub fn effective_zoom_transform(&self) -> ViewportTransform {
-        let stored = self.zoom.viewport_transform();
-        let Some(progress) = &self.overview_progress else {
-            return stored;
-        };
-
-        let progress = progress.clamped_value().clamp(0., 1.);
-        if progress <= 0. {
-            return stored;
-        }
-        if progress >= 1. {
-            return ViewportTransform::identity();
-        }
-
-        let effective_level = (stored.factor().log2() * (1. - progress)).exp2();
-        ViewportTransform::new(stored.focal(), effective_level)
-    }
-
-    /// Returns the content viewport represented by the effective presentation.
-    pub fn effective_viewport(&self) -> Rectangle<f64, Logical> {
-        self.effective_zoom_transform()
-            .apply_inverse_rect(Rectangle::from_size(self.view_size))
-    }
-
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
         let prev_render_idx = self.workspace_render_idx();
         self.overview_progress = progress.map(OverviewProgress::from);
@@ -2188,6 +2159,34 @@ impl<W: LayoutElement> Monitor<W> {
         let clock = self.clock.clone();
         let config = self.options.animations.zoom.0;
         self.zoom.set_target_level(level, anchor, &clock, config);
+    }
+
+    /// Starts an animated zoom-in transition of the desktop zoom level
+    /// towards `target`, keeping `anchor` at its displayed position where
+    /// possible.
+    ///
+    /// `target` is the already-resolved destination level and `anchor` a
+    /// content position in output-local logical coordinates. Uses the
+    /// current `animations.zoom` config; when it is `off` the level is set
+    /// immediately.
+    pub fn zoom_in(&mut self, target: f64, anchor: Point<f64, Logical>) {
+        let clock = self.clock.clone();
+        let config = self.options.animations.zoom.0;
+        self.zoom.zoom_in(target, anchor, &clock, config);
+    }
+
+    /// Starts an animated zoom-out transition of the desktop zoom level
+    /// towards `target`, keeping `anchor` at its displayed position where
+    /// possible.
+    ///
+    /// `target` is the already-resolved destination level and `anchor` a
+    /// content position in output-local logical coordinates. Uses the
+    /// current `animations.zoom` config; when it is `off` the level is set
+    /// immediately.
+    pub fn zoom_out(&mut self, target: f64, anchor: Point<f64, Logical>) {
+        let clock = self.clock.clone();
+        let config = self.options.animations.zoom.0;
+        self.zoom.zoom_out(target, anchor, &clock, config);
     }
 
     /// Starts an animated transition of the desktop zoom towards the saved
