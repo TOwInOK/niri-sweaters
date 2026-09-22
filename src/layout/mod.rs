@@ -4718,12 +4718,6 @@ impl<W: LayoutElement> Layout<W> {
         self.set_monitors_overview_state();
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_overview_open_for_test(&mut self, open: bool) {
-        self.overview_open = open;
-        self.overview_progress = open.then_some(OverviewProgress::Open);
-        self.set_monitors_overview_state();
-    }
 
     pub fn toggle_overview(&mut self) {
         self.overview_open = !self.overview_open;
