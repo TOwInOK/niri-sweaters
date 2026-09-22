@@ -443,6 +443,7 @@ zoom {
 
 The upper limit for the desktop zoom level.
 Zoom actions and pinch gestures are clamped to it.
+Lowering it in the config clamps the zoom level of every output right away, including locked outputs.
 Must be at least `1`; defaults to `10.0`.
 
 ```kdl
@@ -512,7 +513,8 @@ The number of fingers of a touchpad pinch gesture that controls the desktop zoom
 Unset by default: the compositor does not claim pinch gestures, so applications receive all of them.
 Set it to an integer of at least `2` to opt in; only pinch gestures with exactly that many fingers control the zoom.
 The gesture is claimed when it begins, so a matching pinch belongs to the desktop zoom rather than the application.
-Moving the fingers apart zooms in, and moving them together zooms out.
+Moving the fingers apart zooms in, and moving them together zooms out; the level snaps to exactly 1× when it gets close.
+Zoom pinch gestures are ignored while the [Overview](./Overview.md) is open, and opening it cancels an in-progress zoom pinch.
 
 Three fingers are a good choice, since two-finger pinch gestures commonly belong to applications.
 

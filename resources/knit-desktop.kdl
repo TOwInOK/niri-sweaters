@@ -3,7 +3,18 @@
 // Launches Zed, Obsidian and two blank Ghostty windows as a 2-by-2 grid.
 
 prefer-no-csd
-input {}
+input {
+    keyboard {
+        xkb {
+            layout "us"
+        }
+    }
+}
+
+cursor {
+    // Keep the pointer visible in screenshots.
+    hide-when-typing false
+}
 
 layout {
     background-color "#e9e1cd"
@@ -158,4 +169,38 @@ binds {
     Alt+Down { focus-window-down; }
     Alt+Shift+E { quit skip-confirmation=true; }
     Alt+Space { toggle-window-floating; }
+
+    Alt+Z repeat=false { toggle-zoom 2.0 hold=false; }
+    Alt+X repeat=false { hold-zoom 4.0 hold=false; }
+
+    Alt+WheelScrollUp   { zoom-in; }
+    Alt+WheelScrollDown { zoom-out; }
+
+    Alt+W repeat=false { toggle-overview; }
+
+
+    Alt+C repeat=false { zoom-lock hold=true; }
+
+    Alt+U     hotkey-overlay-title="Screenshot area"   { screenshot; }
+}
+
+zoom {
+    max-zoom 100.0
+    increment-factor 1.1
+    deadzone-size 0.2
+
+
+    debug {
+        deadzone true
+        focal-point true
+    }
+
+    follow-min-speed 600
+    follow-max-speed 6900
+}
+
+recent-windows {
+    binds {
+        Ctrl+Alt+Tab { next-window; }
+    }
 }

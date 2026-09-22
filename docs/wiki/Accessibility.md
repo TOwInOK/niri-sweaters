@@ -76,9 +76,11 @@ Changing the zoom level while locked keeps the content at the center of the view
 You can also zoom with a touchpad pinch gesture by setting [`pinch-fingers`](./Configuration:-Miscellaneous.md#pinch-fingers) in the `zoom` config section.
 This is an opt-in: a matching pinch gesture is claimed by the compositor when it begins, so applications will no longer receive pinch gestures with that finger count.
 
-Opening the [Overview](./Overview.md) temporarily returns the desktop to normal scale; the zoom level is restored when the Overview closes.
+Opening the [Overview](./Overview.md) returns the desktop to normal scale and ends the zoom session: closing the Overview comes back to the unzoomed desktop, and zoom actions are ignored while the Overview is open.
+An in-progress `hold-zoom` or `zoom-lock hold=true` hold is dropped without restoring its remembered view.
 The lock screen is shown unzoomed; the stored zoom is restored when you unlock.
 Viewport following is also suspended while the screenshot UI or the window switcher is open.
+Lowering [`max-zoom`](./Configuration:-Miscellaneous.md#max-zoom) in the config clamps the zoom level of every output right away, including locked outputs.
 
 Monitor screenshots and monitor screencasts include desktop zoom.
 Window-only screenshots and window casts capture the window unzoomed.

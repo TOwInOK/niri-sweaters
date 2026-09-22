@@ -18,8 +18,8 @@ While in the overview, all keyboard shortcuts keep working, while pointing devic
 - Touchpad: two-finger scrolling that matches the normal three-finger gestures.
 - Touchscreen: one-finger scrolling, or one-finger long press to move a window.
 
-[Desktop zoom](./Accessibility.md#desktop-zoom) is temporarily suppressed while the Overview is open, and restored when it closes.
-Zoom actions still apply to the stored zoom state while the Overview is open.
+Opening the Overview ends the [desktop zoom](./Accessibility.md#desktop-zoom) session: the captured zoomed frame animates into the Overview, and closing it returns to the normal, unzoomed desktop.
+Zoom actions and zoom pinch gestures are ignored while the Overview is open.
 
 > [!TIP]
 > The overview needs to draw a background under every workspace.

@@ -438,6 +438,7 @@ binds {
 ```
 
 Zoom actions apply to the output under the pointer, or to the focused output when the pointer is not on any output.
+They are ignored while the [Overview](./Overview.md) is open, since opening it ends the zoom session.
 
 - `zoom-in`: multiplies the target zoom level by [`increment-factor`](./Configuration:-Miscellaneous.md#increment-factor), clamped between 1× and `max-zoom`.
 - `zoom-out`: divides the target zoom level by `increment-factor`, ending at exactly 1×.

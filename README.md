@@ -4,14 +4,25 @@
   <img src="docs/assets/knit-hero.webp" alt="Zed, Oh My Pi, Helix, and Obsidian windows with knitted borders" width="800">
   <p>A <a href="https://github.com/niri-wm/niri">niri</a> fork with knitted window borders.<br>Choose a pattern and colours for each app.</p>
   <p>
+    <a href="#features">Features</a> ·
     <a href="#choose-your-knit">Patterns</a> ·
     <a href="#in-action">In action</a> ·
+    <a href="#desktop-zoom-in-action">Zoom demo</a> ·
     <a href="#try-it">Try it</a> ·
     <a href="#build-from-scratch">Build</a> ·
     <a href="#configure-it">Configure</a> ·
     <a href="#status">Status</a>
   </p>
 </div>
+
+## Features
+
+- **Knitted borders.** Choose from six patterns, with per-app colours and live configuration reloads.
+- **Desktop Zoom.** Magnify the desktop with keyboard actions, mouse-wheel bindings, or opt-in touchpad pinch gestures.
+- **Follow or lock.** Let the viewport follow the pointer outside a configurable deadzone, or lock it in place.
+- **Momentary zoom.** Hold a shortcut to zoom in; release it to restore the previous view.
+- **Continuous Overview.** Move from the magnified view into Overview with simultaneous scaling and centering, without an intermediate desktop reset.
+- **Separate session.** Install alongside stock Niri without replacing its session or configuration.
 
 ## Choose your knit
 
@@ -22,6 +33,16 @@
 [![A desktop with app-specific knitted borders](docs/assets/knit-desktop.png)](docs/assets/knit-desktop.png)
 
 [Example configuration](resources/knit-preview.kdl)
+
+## Desktop Zoom in action
+
+[Watch the Desktop Zoom demonstration (MP4, 42 seconds)](docs/assets/zoom_demonstration.mp4)
+
+Zoom in for a closer look, navigate the magnified desktop, and enter Overview without first snapping back to the normal desktop. The pointer stays in place during the Overview transition.
+
+[Zoom setup and controls](docs/wiki/Accessibility.md) · [Zoom key bindings](docs/wiki/Configuration:-Key-Bindings.md#zoom)
+
+The recording uses HEVC; if your browser cannot play it, download it and open it in a compatible video player.
 
 ## Try it
 

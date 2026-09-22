@@ -75,9 +75,12 @@ With `--json`, the response is a list of objects with the following fields:
 - `output`: the output name.
 - `level`: the currently displayed zoom level. While a zoom transition is in progress this is the current animation sample; during a pinch gesture it is the level set by the latest gesture update.
 - `target_level`: the zoom level the output is transitioning towards. It equals `level` at rest and during a pinch gesture, and differs while a zoom animation or a `hold-zoom` restore is in progress.
-- `effective_level`: the zoom of the desktop scene after Overview suppression. While the Overview is open this is `1`; during the Overview transition it moves between `level` and `1`. It is not necessarily the transform currently visible on screen—for example, the lock screen is always shown unzoomed.
+- `effective_level`: currently the same as `level`.
 - `focal`: the fixed point of the current zoom transform in output-local logical coordinates, as `[x, y]`.
 - `locked`: whether the zoom lock is enabled.
+
+Opening the [Overview](./Overview.md) ends the zoom session, so while it is open `level`, `target_level` and `effective_level` report `1` and `locked` reports `false`—even though the Overview transition still renders the captured zoomed frame.
+IPC does not expose the Overview's own camera transform, so the rendered scene scale cannot be derived from `effective_level`.
 
 ### Backwards Compatibility
 
