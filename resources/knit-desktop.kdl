@@ -170,16 +170,16 @@ binds {
     Alt+Shift+E { quit skip-confirmation=true; }
     Alt+Space { toggle-window-floating; }
 
-    Alt+Z repeat=false { zoom 2.0; }
-    Alt+X repeat=false { zoom 4.0 hold=true; }
+    Ctrl+Z repeat=false { zoom 2.0; }
+    Ctrl+X repeat=false { zoom 4.0 hold=true; }
 
-    Alt+WheelScrollUp   { zoom-in; }
-    Alt+WheelScrollDown { zoom-out; }
+    Ctrl+WheelScrollUp   { zoom-in; }
+    Ctrl+WheelScrollDown { zoom-out; }
 
     Alt+W repeat=false { toggle-overview; }
 
 
-    Alt+C repeat=false { zoom-lock hold=true; }
+    Alt+C repeat=false { zoom-lock ; }
 
     Alt+U     hotkey-overlay-title="Screenshot area"   { screenshot; }
 }
@@ -189,6 +189,9 @@ zoom {
     increment-factor 1.1
     deadzone-size 0.2
 
+    // sampling "linear"
+    // sampling "nearest"
+    sampling "auto" threshold=4.0
 
     debug {
         deadzone true

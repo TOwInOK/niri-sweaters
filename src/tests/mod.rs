@@ -1,7 +1,7 @@
 use fixture::Fixture;
 
 mod client;
-mod fixture;
+pub(crate) mod fixture;
 mod server;
 
 mod animations;

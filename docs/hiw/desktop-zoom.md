@@ -197,9 +197,17 @@ A cancellation tail can outlive `overview_progress`. Consequently:
 
 ## Rendering and replacement UI
 
-`render_inner` applies `scene_presentation_transform` through the existing `push_desktop!` rescale wrapper. Normal desktop Zoom uses its viewport transform; Overview uses its outer correction in addition to the base workspace layout. Identity skips the wrapper.
+`render_inner` applies `scene_presentation_transform` through the existing `push_desktop!` rescale wrapper. Normal desktop Zoom uses its viewport transform; Overview uses its outer correction in addition to the base workspace layout. Identity with normal sampling skips the wrapper.
 
 Output, screencast and screen-capture targets use consistent desktop geometry. Pointer sprites remain unscaled; their position uses the separate pointer transform. Screen-space UI and hot corners must not receive the scene transform.
+
+### Texture sampling
+
+`ZoomSampling` lives only in `Config.zoom.sampling`: `Linear` (default), `Nearest`, or `Auto { threshold }`. Commands and the Zoom FSM do not own a copy. `Auto` compares the displayed total camera scale (`scene_scale * mon.overview_zoom()`) with its finite threshold greater than 1; using the target, terminated Zoom state, or handoff residual alone is incorrect. At total scale 1 or below, normal sampling is retained.
+
+`SamplingRenderElement` in `src/render_helpers/sampling.rs` wraps desktop presentation elements. It scopes Smithay's upscale filter to `draw()` using `FrameContext`, restoring the previous filter on return, including errors and nested draws. The per-EGL-context filter cell tracks the state because Smithay has no getter; this helper must remain the sole writer of the renderer upscale filter. Unchanged filters skip the context guard. `ShaderRenderElement` reads the same scoped filter for its final texture magnification. Minification and internal blur passes keep their existing filtering; `capture_framebuffer()` is forwarded without applying the wrapper's sampling policy.
+
+Nearest elements hide their underlying storage to prevent hardware planes from bypassing the filter. An output-owned `ExtraDamage` commit invalidates the scene when the selected filter changes, including config reload with stationary clients; output and capture damage trackers consume that history independently. Geometry and input mapping are unchanged. This magnifies texture pixels, not an intermediate screenshot of the entire desktop, and does not remove application-rendered antialiasing.
 
 Session lock renders an unzoomed replacement surface and preserves Zoom state for unlock. Screenshot and MRU UI suspend tracking rather than accumulate hidden follow time. These are not Overview's terminate-session semantics.
 

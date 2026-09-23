@@ -46,6 +46,7 @@ If you're shipping niri and would like to make it work better for screen readers
 
 Niri has a built-in desktop zoom that magnifies the rendered desktop without changing the output scale.
 Clients are not asked to re-render at a higher scale, so high or fractional zoom levels may look softer.
+To see individual texture pixels instead, set [`sampling`](./Configuration:-Miscellaneous.md#sampling) to `"nearest"`, or use `"auto" threshold=4.0` to switch at 4×.
 
 Desktop zoom is controlled through [bind actions](./Configuration:-Key-Bindings.md#zoom), for example:
 

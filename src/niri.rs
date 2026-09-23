@@ -163,9 +163,11 @@ use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::sampling::SamplingRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::texture::TextureBuffer;
@@ -528,6 +530,8 @@ pub struct OutputState {
     screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     pub debug_damage_tracker: OutputDamageTracker,
+    /// Each output/capture damage tracker consumes this commit history independently.
+    zoom_sampling_damage: RefCell<(bool, ExtraDamage)>,
 }
 
 #[derive(Debug, Default)]
@@ -3064,6 +3068,7 @@ impl Niri {
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
+            zoom_sampling_damage: RefCell::new((false, ExtraDamage::default())),
         };
         let rv = self.output_state.insert(output.clone(), state);
         assert!(rv.is_none(), "output was already tracked");
@@ -4886,6 +4891,22 @@ impl Niri {
             .focal()
             .to_physical_precise_round(output_scale);
         let scene_scale = scene_transform.factor();
+        // Include Overview's base scale, not just its outer handoff correction.
+        let nearest = self
+            .config
+            .borrow()
+            .zoom
+            .sampling
+            .uses_nearest(scene_scale * zoom);
+        let sampling_damage = {
+            let mut sampling = state.zoom_sampling_damage.borrow_mut();
+            if sampling.0 != nearest {
+                sampling.0 = nearest;
+                sampling.1.damage_all();
+            }
+            sampling.1.render(Rectangle::from_size(output_size(output)))
+        };
+        push(sampling_damage.into());
 
         // The zoom debug overlay is screen-space UI: it goes above the
         // desktop scene but below the MRU, hotkey overlay, notifications,
@@ -4977,10 +4998,11 @@ impl Niri {
         macro_rules! push_desktop {
             ($elem:expr) => {{
                 let elem = $elem;
-                if scene_scale == 1. {
+                if scene_scale == 1. && !nearest {
                     push(elem.into());
                 } else {
                     let elem = RescaleRenderElement::from_element(elem, scene_origin, scene_scale);
+                    let elem = SamplingRenderElement::new(elem, nearest);
                     push(elem.into());
                 }
             }};
@@ -7637,22 +7659,22 @@ niri_render_elements! {
         RelocatedColor = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
             SolidColorRenderElement
         >>>,
-        // Desktop-zoomed variants of the desktop scene elements above. Used when the
-        // output's committed zoom level is above 1.
-        ZoomedMonitor = RescaleRenderElement<MonitorRenderElement<R>>,
-        ZoomedRescaledTile = RescaleRenderElement<RescaleRenderElement<TileRenderElement<R>>>,
-        ZoomedLayerSurface = RescaleRenderElement<LayerSurfaceRenderElement<R>>,
-        ZoomedRelocatedLayerSurface = RescaleRenderElement<
+        // Scene presentation is independent of screen-space UI.
+        ZoomedMonitor = SamplingRenderElement<RescaleRenderElement<MonitorRenderElement<R>>>,
+        ZoomedRescaledTile = SamplingRenderElement<RescaleRenderElement<RescaleRenderElement<TileRenderElement<R>>>>,
+        ZoomedLayerSurface = SamplingRenderElement<RescaleRenderElement<LayerSurfaceRenderElement<R>>>,
+        ZoomedRelocatedLayerSurface = SamplingRenderElement<RescaleRenderElement<
             CropRenderElement<RelocateRenderElement<RescaleRenderElement<
                 LayerSurfaceRenderElement<R>
             >>>,
-        >,
-        ZoomedRelocatedColor = RescaleRenderElement<
+        >>,
+        ZoomedRelocatedColor = SamplingRenderElement<RescaleRenderElement<
             CropRenderElement<RelocateRenderElement<RescaleRenderElement<
                 SolidColorRenderElement
             >>>,
-        >,
-        ZoomedSolidColor = RescaleRenderElement<SolidColorRenderElement>,
+        >>,
+        ZoomedSolidColor = SamplingRenderElement<RescaleRenderElement<SolidColorRenderElement>>,
+        SamplingDamage = ExtraDamage,
         Pointer = PointerRenderElements<R>,
         Wayland = WaylandSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,

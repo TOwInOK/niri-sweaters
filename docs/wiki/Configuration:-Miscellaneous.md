@@ -427,6 +427,7 @@ See the [Accessibility](./Accessibility.md#desktop-zoom) page for an overview an
 zoom {
     max-zoom 10.0
     increment-factor 1.2
+    sampling "linear"
     deadzone-size 0.5
     follow-min-speed 80
     follow-max-speed 1400
@@ -464,6 +465,29 @@ zoom {
     increment-factor 1.5
 }
 ```
+
+#### `sampling`
+
+Controls texture filtering while the desktop camera is magnified. Choose one policy:
+
+- `sampling "linear"` (default): smooth interpolation.
+- `sampling "nearest"`: sharp pixel boundaries throughout magnification.
+- `sampling "auto" threshold=4.0`: linear below 4×, nearest at or above 4×.
+
+`auto` requires an explicit finite threshold greater than `1`; the other modes do not accept a threshold.
+The comparison uses the displayed scale during animations and pinch gestures, including the total camera scale during the transition into Overview, not the target zoom level.
+Changing the policy in the config takes effect without changing the zoom level.
+
+```kdl
+zoom {
+    sampling "auto" threshold=4.0
+}
+```
+
+This affects magnified desktop textures in monitor screenshots and screencasts as well as on screen.
+It does not change pointer sprites, screen-space compositor UI, or the internal blur passes.
+Nearest filtering reveals texture pixels; it cannot undo smoothing already drawn by an application.
+At fractional scales, pixel blocks may have unequal sizes. At camera scale 1× or below, normal filtering is preserved.
 
 #### `deadzone-size`
 

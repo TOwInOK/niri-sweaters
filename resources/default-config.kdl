@@ -324,6 +324,11 @@ animations {
 //     follow-min-speed 80
 //     follow-max-speed 1400
 //
+//     // Keep smooth filtering, or use "nearest" for visible texture pixels.
+//     sampling "linear"
+//     // Alternatively, switch to nearest at 4x:
+//     // sampling "auto" threshold=4.0
+//
 //     // Enable three-finger pinch for desktop zoom.
 //     // pinch-fingers 3
 //

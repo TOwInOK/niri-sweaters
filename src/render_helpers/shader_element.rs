@@ -9,12 +9,13 @@ use smithay::backend::renderer::gles::{
     UniformDesc, UniformName,
 };
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
-use smithay::backend::renderer::DebugFlags;
+use smithay::backend::renderer::{DebugFlags, TextureFilter};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
 
 use super::renderer::AsGlesFrame;
 use super::resources::Resources;
+use super::sampling::current_upscale_filter;
 use super::shaders::{ProgramType, Shaders};
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
@@ -376,6 +377,11 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
         let has_debug = !frame.debug_flags().is_empty();
         let has_tint = frame.debug_flags().contains(DebugFlags::TINT);
 
+        let mag_filter = match current_upscale_filter(frame) {
+            TextureFilter::Nearest => ffi::NEAREST,
+            TextureFilter::Linear => ffi::LINEAR,
+        } as i32;
+
         // render
         let span_loc = smithay::gpu_span_location!("draw shader");
         frame.with_profiled_context(span_loc, move |gl| -> Result<(), GlesError> {
@@ -390,7 +396,7 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
                     gl.ActiveTexture(ffi::TEXTURE0 + i as u32);
                     gl.BindTexture(ffi::TEXTURE_2D, texture.tex_id());
                     gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
-                    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+                    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, mag_filter);
                     gl.TexParameteri(
                         ffi::TEXTURE_2D,
                         ffi::TEXTURE_WRAP_S,

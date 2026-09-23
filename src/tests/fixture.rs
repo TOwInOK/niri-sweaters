@@ -29,7 +29,7 @@ pub struct State {
 /// Golden tests require llvmpipe for deterministic pixels. Keep this in the
 /// shared fixture setup because the test harness runs tests in parallel and
 /// EGL vendor selection is process-global.
-fn prefer_mesa_egl() {
+pub(crate) fn prefer_mesa_egl() {
     static INIT: Once = Once::new();
 
     INIT.call_once(|| {

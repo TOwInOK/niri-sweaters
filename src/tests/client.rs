@@ -715,6 +715,10 @@ impl Dispatch<WlSurface, ()> for State {
                     }
                 }
             }
+            // These clients deliberately keep fixed test buffers and use viewporter.
+            // The compositor's preferred buffer scale/transform are advisory.
+            wl_surface::Event::PreferredBufferScale { .. }
+            | wl_surface::Event::PreferredBufferTransform { .. } => (),
             _ => unreachable!(),
         }
     }
@@ -913,3 +917,6 @@ impl Dispatch<WpViewport, ()> for State {
         unreachable!()
     }
 }
+
+wayland_client::delegate_noop!(State: ignore wayland_client::protocol::wl_shm::WlShm);
+wayland_client::delegate_noop!(State: ignore wayland_client::protocol::wl_shm_pool::WlShmPool);

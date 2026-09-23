@@ -1771,6 +1771,7 @@ mod tests {
                 follow_min_speed: 80.0,
                 follow_max_speed: 1400.0,
                 pinch_fingers: None,
+                sampling: Linear,
                 debug: ZoomDebug {
                     deadzone: false,
                     focal_point: false,
@@ -2577,6 +2578,100 @@ mod tests {
         assert_eq!(config.zoom.increment_factor, 1.2);
         assert_eq!(config.zoom.deadzone_size, 0.5);
         assert_eq!(config.zoom.pinch_fingers, None);
+    }
+
+    #[test]
+    fn parse_zoom_sampling() {
+        // Linear is the default.
+        let config = do_parse("");
+        assert_eq!(config.zoom.sampling, ZoomSampling::Linear);
+
+        let config = do_parse(r#"zoom { sampling "linear"; }"#);
+        assert_eq!(config.zoom.sampling, ZoomSampling::Linear);
+
+        let config = do_parse(r#"zoom { sampling "nearest"; }"#);
+        assert_eq!(config.zoom.sampling, ZoomSampling::Nearest);
+
+        let config = do_parse(r#"zoom { sampling "auto" threshold=4.0; }"#);
+        assert_eq!(config.zoom.sampling, ZoomSampling::Auto { threshold: 4. });
+
+        // Integer thresholds are accepted.
+        let config = do_parse(r#"zoom { sampling "auto" threshold=4; }"#);
+        assert_eq!(config.zoom.sampling, ZoomSampling::Auto { threshold: 4. });
+
+        // A later zoom block overrides the sampling policy, while a zoom
+        // block without sampling leaves it alone.
+        let mut zoom = Zoom {
+            sampling: ZoomSampling::Nearest,
+            ..Zoom::default()
+        };
+
+        let part: ZoomPart = knuffel::parse("part.kdl", "max-zoom 5;")
+            .map_err(miette::Report::new)
+            .unwrap();
+        zoom.merge_with(&part);
+        assert_eq!(zoom.sampling, ZoomSampling::Nearest);
+        assert_eq!(zoom.max_zoom, 5.);
+
+        let part: ZoomPart = knuffel::parse("part.kdl", r#"sampling "auto" threshold=2;"#)
+            .map_err(miette::Report::new)
+            .unwrap();
+        zoom.merge_with(&part);
+        assert_eq!(zoom.sampling, ZoomSampling::Auto { threshold: 2. });
+    }
+
+    #[test]
+    fn parse_zoom_sampling_invalid() {
+        for text in [
+            // The mode argument is required.
+            "zoom { sampling; }",
+            // Unknown modes are rejected.
+            r#"zoom { sampling "bilinear"; }"#,
+            r#"zoom { sampling "auto"; }"#,
+            // Auto requires an explicit finite threshold greater than 1.
+            r#"zoom { sampling "auto" threshold=1; }"#,
+            r#"zoom { sampling "auto" threshold=1.0; }"#,
+            r#"zoom { sampling "auto" threshold=0.5; }"#,
+            r#"zoom { sampling "auto" threshold=-2; }"#,
+            r#"zoom { sampling "auto" threshold=#inf; }"#,
+            r#"zoom { sampling "auto" threshold=#nan; }"#,
+            r#"zoom { sampling "auto" threshold="high"; }"#,
+            // Threshold is only valid for auto.
+            r#"zoom { sampling "linear" threshold=4; }"#,
+            r#"zoom { sampling "nearest" threshold=4; }"#,
+            // No extra arguments, properties or children.
+            r#"zoom { sampling "linear" "nearest"; }"#,
+            r#"zoom { sampling "auto" threshold=4 foo=1; }"#,
+            r#"zoom { sampling "linear" { child; } }"#,
+        ] {
+            assert!(
+                Config::parse_mem(text).is_err(),
+                "expected parse error for: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn zoom_sampling_uses_nearest() {
+        // Nothing is magnified at or below scale 1.
+        for scale in [0.5, 1.] {
+            assert!(!ZoomSampling::Linear.uses_nearest(scale));
+            assert!(!ZoomSampling::Nearest.uses_nearest(scale));
+            assert!(!ZoomSampling::Auto { threshold: 2. }.uses_nearest(scale));
+        }
+
+        // Linear never uses nearest; nearest always does once magnified.
+        for scale in [1.5, 10.] {
+            assert!(!ZoomSampling::Linear.uses_nearest(scale));
+            assert!(ZoomSampling::Nearest.uses_nearest(scale));
+        }
+
+        // Auto switches at the threshold, inclusive.
+        let auto = ZoomSampling::Auto { threshold: 4. };
+        assert!(!auto.uses_nearest(1.5));
+        assert!(!auto.uses_nearest(3.999));
+        assert!(auto.uses_nearest(4.));
+        assert!(auto.uses_nearest(10.));
     }
 
     #[test]

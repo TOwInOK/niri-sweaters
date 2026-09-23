@@ -231,6 +231,8 @@ pub struct Zoom {
     /// forwarded to clients. Setting this is an explicit opt-in that hands
     /// matching pinch sequences to the compositor instead of applications.
     pub pinch_fingers: Option<u32>,
+    /// Texture sampling filter used for the magnified desktop.
+    pub sampling: ZoomSampling,
     /// Debug visualization of the desktop zoom state.
     pub debug: ZoomDebug,
 }
@@ -244,6 +246,7 @@ impl Default for Zoom {
             follow_min_speed: 80.,
             follow_max_speed: 1400.,
             pinch_fingers: None,
+            sampling: ZoomSampling::default(),
             debug: ZoomDebug::default(),
         }
     }
@@ -291,6 +294,8 @@ pub struct ZoomPart {
     #[knuffel(child, unwrap(argument))]
     pub pinch_fingers: Option<PinchFingers>,
     #[knuffel(child)]
+    pub sampling: Option<ZoomSampling>,
+    #[knuffel(child)]
     pub debug: Option<ZoomDebugPart>,
 }
 
@@ -304,6 +309,7 @@ impl MergeWith<ZoomPart> for Zoom {
             follow_min_speed,
             follow_max_speed,
             pinch_fingers,
+            sampling,
             debug
         );
 
@@ -497,5 +503,208 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for PinchFingers {
             ctx.emit_error(DecodeError::conversion(val, "value must be at least 2"));
             Ok(Self::default())
         }
+    }
+}
+
+/// Texture sampling filter used for the magnified desktop.
+///
+/// Applies only while the desktop is zoomed in; screen UI such as the
+/// compositor's own overlays is unaffected.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub enum ZoomSampling {
+    /// Smooth linear filtering at every zoom level.
+    #[default]
+    Linear,
+    /// Crisp nearest-neighbor filtering at every zoom level.
+    Nearest,
+    /// Linear below `threshold`, nearest-neighbor at or above it.
+    ///
+    /// The threshold is compared against the currently displayed total
+    /// camera scale, not the target of an in-progress zoom animation.
+    Auto { threshold: f64 },
+}
+
+impl ZoomSampling {
+    /// Whether the magnified desktop should use nearest-neighbor sampling at
+    /// the given displayed total camera scale.
+    ///
+    /// Always `false` at or below scale 1: nothing is magnified, so the
+    /// filter choice is irrelevant.
+    pub fn uses_nearest(&self, scale: f64) -> bool {
+        if scale <= 1. {
+            return false;
+        }
+
+        match self {
+            ZoomSampling::Linear => false,
+            ZoomSampling::Nearest => true,
+            ZoomSampling::Auto { threshold } => scale >= *threshold,
+        }
+    }
+}
+
+impl MergeWith<ZoomSampling> for ZoomSampling {
+    fn merge_with(&mut self, part: &ZoomSampling) {
+        *self = *part;
+    }
+}
+
+/// The mode argument of `sampling`: `linear`, `nearest` or `auto`.
+#[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq, Eq)]
+enum ZoomSamplingMode {
+    Linear,
+    Nearest,
+    Auto,
+}
+
+/// Nearest-neighbor threshold for `sampling "auto"`: a finite number strictly
+/// greater than 1.
+///
+/// A threshold of 1 or less would make `auto` behave exactly like `nearest`,
+/// so unlike [`FloatOrInt`] the lower bound is exclusive.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct ZoomSamplingThreshold(f64);
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for ZoomSamplingThreshold {
+    fn type_check(
+        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) {
+        if let Some(type_name) = &type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+    }
+
+    fn raw_decode(
+        val: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let value = match &**val {
+            knuffel::ast::Literal::Int(value) => match i32::try_from(value) {
+                Ok(v) => f64::from(v),
+                Err(e) => {
+                    ctx.emit_error(DecodeError::conversion(val, e));
+                    return Ok(Self::default());
+                }
+            },
+            knuffel::ast::Literal::Decimal(value) => match f64::try_from(value) {
+                Ok(v) => v,
+                Err(e) => {
+                    ctx.emit_error(DecodeError::conversion(val, e));
+                    return Ok(Self::default());
+                }
+            },
+            _ => {
+                ctx.emit_error(DecodeError::unsupported(
+                    val,
+                    "Unsupported value, only numbers are recognized",
+                ));
+                return Ok(Self::default());
+            }
+        };
+
+        if value.is_finite() && value > 1. {
+            Ok(ZoomSamplingThreshold(value))
+        } else {
+            ctx.emit_error(DecodeError::conversion(val, "value must be greater than 1"));
+            Ok(Self::default())
+        }
+    }
+}
+
+impl<S> knuffel::Decode<S> for ZoomSampling
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        if let Some(type_name) = &node.type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+
+        let mut iter_args = node.arguments.iter();
+        let mode = match iter_args.next() {
+            Some(val) => knuffel::traits::DecodeScalar::decode(val, ctx)?,
+            None => {
+                ctx.emit_error(DecodeError::missing(
+                    node,
+                    "additional argument `mode` is required",
+                ));
+                ZoomSamplingMode::Linear
+            }
+        };
+
+        if let Some(val) = iter_args.next() {
+            ctx.emit_error(DecodeError::unexpected(
+                &val.literal,
+                "argument",
+                "unexpected argument",
+            ));
+        }
+
+        let mut threshold: Option<ZoomSamplingThreshold> = None;
+        let mut threshold_name = None;
+        for (name, val) in &node.properties {
+            match &***name {
+                "threshold" => {
+                    threshold_name = Some(name);
+                    if matches!(mode, ZoomSamplingMode::Auto) {
+                        threshold = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
+                    }
+                }
+                name_str => {
+                    ctx.emit_error(DecodeError::unexpected(
+                        name,
+                        "property",
+                        format!("unexpected property `{}`", name_str.escape_default()),
+                    ));
+                }
+            }
+        }
+
+        for child in node.children() {
+            ctx.emit_error(DecodeError::unexpected(
+                child,
+                "node",
+                format!("unexpected node `{}`", child.node_name.escape_default()),
+            ));
+        }
+
+        if !matches!(mode, ZoomSamplingMode::Auto) {
+            if let Some(name) = threshold_name {
+                ctx.emit_error(DecodeError::unexpected(
+                    name,
+                    "property",
+                    "threshold is only valid for sampling \"auto\"",
+                ));
+            }
+        }
+
+        Ok(match mode {
+            ZoomSamplingMode::Linear => ZoomSampling::Linear,
+            ZoomSamplingMode::Nearest => ZoomSampling::Nearest,
+            ZoomSamplingMode::Auto => match threshold {
+                Some(threshold) => ZoomSampling::Auto {
+                    threshold: threshold.0,
+                },
+                None => {
+                    ctx.emit_error(DecodeError::missing(
+                        node,
+                        "property `threshold` is required for sampling \"auto\"",
+                    ));
+                    ZoomSampling::Linear
+                }
+            },
+        })
     }
 }

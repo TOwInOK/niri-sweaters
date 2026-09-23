@@ -168,55 +168,140 @@ fn add_top_layer_with_color(
     Rectangle::new(Point::from((0, 0)), Size::from((1920, i32::from(height))))
 }
 
-#[test]
-fn zoom_identity_no_wrappers() {
-    let mut f = set_up();
-    let output = f.niri_output(1);
-    let id = f.add_client();
-    open_window(&mut f, id, "zoom-identity", 400, 300, [0xff, 0, 0, 0xff]);
-    add_top_layer(&mut f, id, 50);
+/// A real two-pixel client buffer, so interpolation is observable in captures.
+fn add_sampling_layer(f: &mut Fixture, layer: Layer) {
+    use std::io::Write as _;
+    use std::os::fd::AsFd as _;
 
-    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
-    assert!(!elements.is_empty());
-    assert!(
-        elements.iter().all(|elem| !is_zoomed(elem)),
-        "level 1 must not produce zoomed elements"
-    );
+    use smithay::reexports::rustix::fs::{memfd_create, MemfdFlags};
+    use wayland_client::protocol::wl_shm::{Format, WlShm};
+
+    let id = f.add_client();
+    let client = f.client(id);
+    let global = client
+        .state
+        .globals
+        .iter()
+        .find(|g| g.interface == "wl_shm")
+        .unwrap();
+    let registry = client.display.get_registry(&client.qh, ());
+    let shm = registry.bind::<WlShm, _, _>(global.name, 1, &client.qh, ());
+    let mut file = std::fs::File::from(memfd_create("zoom-sampling", MemfdFlags::CLOEXEC).unwrap());
+    file.write_all(&[0, 0, 0, 255, 255, 255, 255, 255]).unwrap();
+    let pool = shm.create_pool(file.as_fd(), 8, &client.qh, ());
+    let buffer = pool.create_buffer(0, 2, 1, 8, Format::Argb8888, &client.qh, ());
+    let layer = client.create_layer(None, layer, "sampling");
+    let surface = layer.surface.clone();
+    layer.set_configure_props(LayerConfigureProps {
+        anchor: Some(Anchor::Left | Anchor::Top),
+        size: Some((2, 1)),
+        ..Default::default()
+    });
+    layer.commit();
+    f.roundtrip(id);
+    let layer = f.client(id).layer(&surface);
+    layer.surface.attach(Some(&buffer), 0, 0);
+    layer.set_size(2, 1);
+    layer.ack_last_and_commit();
+    f.double_roundtrip(id);
 }
 
 #[test]
-fn zoom_wraps_desktop_scene() {
-    let mut f = set_up();
+fn zoom_sampling_pixels_reload_and_capture_damage() {
+    let mut f = set_up_with_zoom(r#"zoom { sampling "auto" threshold=4.0; }"#);
     let output = f.niri_output(1);
-    let id = f.add_client();
-    open_window(&mut f, id, "zoom-wrap", 400, 300, [0xff, 0, 0, 0xff]);
-    add_top_layer(&mut f, id, 50);
+    add_sampling_layer(&mut f, Layer::Top);
+    set_zoom(&mut f, &output, 4., Point::from((0., 0.)));
+    let size = output.current_mode().unwrap().size;
+    let scale = Scale::from(1.);
+    let mut output_damage = OutputDamageTracker::new(size, scale, Transform::Normal);
+    let mut capture_damage = OutputDamageTracker::new(size, scale, Transform::Normal);
+    for tracker in [&mut output_damage, &mut capture_damage] {
+        let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
+        tracker.damage_output(1, &elements).unwrap();
+        assert!(tracker.damage_output(1, &elements).unwrap().0.is_none());
+    }
+    let (_, nearest) = render_output_rgba(f.niri_state(), &output);
+    let red = |pixels: &[u8]| {
+        pixels[..32]
+            .chunks_exact(4)
+            .map(|p| p[0])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(red(&nearest), [0, 0, 0, 0, 255, 255, 255, 255]);
 
-    set_zoom(&mut f, &output, 2., Point::from((100., 100.)));
+    // Change only the filter, with identical buffers and geometry.
+    reload_with_zoom(&mut f, r#"zoom { sampling "auto" threshold=5.0; }"#);
+    let (_, linear) = render_output_rgba(f.niri_state(), &output);
+    let row = red(&linear);
+    assert!(row[2] > 0 && row[2] < row[3] && row[3] < row[4] && row[4] < row[5] && row[5] < 255);
+    for (tracker, target) in [
+        (&mut output_damage, RenderTarget::Output),
+        (&mut capture_damage, RenderTarget::ScreenCapture),
+    ] {
+        let elements = render_elements(f.niri_state(), &output, target);
+        let (damage, _) = tracker.damage_output(1, &elements).unwrap();
+        assert!(damage
+            .unwrap()
+            .iter()
+            .any(|r| r.contains(Point::from((3, 0)))));
+        assert!(tracker.damage_output(1, &elements).unwrap().0.is_none());
+    }
+    reload_with_zoom(&mut f, r#"zoom { sampling "nearest"; }"#);
+    let (_, restored) = render_output_rgba(f.niri_state(), &output);
+    assert_eq!(red(&restored), red(&nearest));
+    set_zoom(&mut f, &output, 1., Point::from((0., 0.)));
+    let (_, identity) = render_output_rgba(f.niri_state(), &output);
+    assert_eq!(&identity[..8], &[0, 0, 0, 255, 255, 255, 255, 255]);
+}
 
-    let elements = render_elements(f.niri_state(), &output, RenderTarget::Output);
-    assert!(!elements.is_empty());
+#[test]
+fn zoom_sampling_overview_uses_total_camera_scale() {
+    use niri_config::ZoomSampling;
+    let mut f = set_up_with_config(&format!(
+        r#"{ANIMATED_CONFIG}
+zoom {{ sampling "auto" threshold=3.0; }}"#
+    ));
+    let output = f.niri_output(1);
+    add_sampling_layer(&mut f, Layer::Bottom);
+    freeze_clock(&mut f);
+    set_zoom(&mut f, &output, 4., Point::from((0., 0.)));
+    let (_, before) = render_output_rgba(f.niri_state(), &output);
+    f.niri_state().toggle_overview();
+    let (_, entered) = render_output_rgba(f.niri_state(), &output);
     assert!(
-        elements.iter().any(is_zoomed),
-        "level 2 must wrap desktop scene elements"
+        before == entered,
+        "handoff must preserve pixel filtering on entry"
     );
+
+    // Find a frame where the residual alone would incorrectly select nearest.
+    let mut found = false;
+    for _ in 0..100 {
+        advance_clock(&mut f, 2);
+        let mon = f.niri().layout.monitor_for_output(&output).unwrap();
+        let residual = mon.overview_handoff_transform().factor();
+        let total = residual * mon.overview_zoom();
+        if residual >= 3. && total < 3. {
+            found = true;
+            break;
+        }
+    }
     assert!(
-        elements
-            .iter()
-            .any(|e| matches!(e, OutputRenderElements::ZoomedMonitor(_))),
-        "workspace content must be zoomed"
+        found,
+        "animation must cross the threshold before its residual does"
     );
+    let (_, automatic) = render_output_rgba(f.niri_state(), &output);
+    f.niri().config.borrow_mut().zoom.sampling = ZoomSampling::Linear;
+    let (_, linear) = render_output_rgba(f.niri_state(), &output);
     assert!(
-        elements
-            .iter()
-            .any(|e| matches!(e, OutputRenderElements::ZoomedLayerSurface(_))),
-        "layer surfaces must be zoomed"
+        automatic == linear,
+        "Auto must use total scale, not residual or old Zoom state"
     );
+    f.niri().config.borrow_mut().zoom.sampling = ZoomSampling::Nearest;
+    let (_, nearest) = render_output_rgba(f.niri_state(), &output);
     assert!(
-        elements
-            .iter()
-            .any(|e| matches!(e, OutputRenderElements::ZoomedSolidColor(_))),
-        "backdrop must be zoomed"
+        nearest != linear,
+        "pattern must distinguish the filters during handoff"
     );
 }
 
