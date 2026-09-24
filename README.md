@@ -28,9 +28,9 @@
 
 [![A desktop with app-specific knitted borders](docs/assets/knit-desktop.png)](docs/assets/knit-desktop.png)
 
-<video controls width="800" src="docs/assets/zoom_demonstration.mp4"></video>
+https://github.com/user-attachments/assets/7dcf712c-5059-4ca8-9076-512646c47815
 
-[Watch the Desktop Zoom demo (MP4)](docs/assets/zoom_demonstration.mp4) · [Example config](resources/knit-preview.kdl)
+[Example config](resources/knit-preview.kdl)
 
 ## Install
 
