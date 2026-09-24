@@ -16,7 +16,7 @@
 ## Features
 
 - **[Knitted borders](#knit).** Six patterns, per-app colours, and live config reloads; borders follow window geometry and animations.
-- **[Desktop Zoom](#zoom).** Magnify with keyboard, mouse wheel, or touchpad pinch; follow the pointer, lock the view, or hold a key for temporary zoom. Transition smoothly into Overview.
+- **[Zoom](#zoom).** Magnify with keyboard, mouse wheel, or touchpad pinch; follow the pointer, lock the view, or hold a key for temporary zoom. Transition smoothly into Overview.
 - **[Region IPC](#region-ipc).** Select an area for its coordinates and display a recording frame on one monitor without including the frame in captures.
 - **[Separate session](#install).** Run alongside stock Niri with its own config.
 
@@ -78,8 +78,6 @@ Edit `~/.config/niri-sweaters/config.kdl`; changes reload live. Merge the exampl
 
 ### Knit
 
-Give each window a knitted border. Choose `stockinette`, `rib`, `checker`, `zigzag`, `diamond`, or `dots`, then match the yarn colours to your apps.
-
 ```kdl
 layout {
     focus-ring { off; }
@@ -90,30 +88,28 @@ layout {
         inactive-color "#384136"
         knit {
             on
-            pattern "checker"
-            accent-color "#bac6a6"
+            pattern "checker" // stockinette / rib / checker / zigzag / diamond / dots
+            accent-color "#bac6a6" // second yarn colour
+            stitch-size 8 // larger stitches mean fewer rows across the border
+            relief 0.65 // depth and shading
+            fuzz 0.15 // wool fluffiness
         }
     }
 }
 ```
 
-- **Border:** `width` sets its thickness; `active-color` and `inactive-color` set the base colours. `knit { off; }` restores an ordinary border.
-- **Knit:** `accent-color` supplies the second yarn colour; `stitch-size` adjusts the stitch scale. Per-app window rules can override the pattern and palette.
-- **Focus ring:** a separate focus indicator, disabled in this example so the knitted border stands on its own.
-
 #### Per-window patterns and colours
-
-Set your shared style in `layout { border { ... } }`, then add top-level `window-rule` blocks alongside `layout`, not inside it. Each rule overrides only the properties it specifies: the examples below keep the shared border width, stitch size, and enabled Knit state.
 
 ```kdl
 window-rule {
     match app-id=r#"^dev\.zed\.Zed$"#
     border {
         active-color "#526c89"
-        inactive-color "#526c89"
+        inactive-color "#3d4652"
         knit {
             pattern "rib"
             accent-color "#8fa6bf"
+            // ...
         }
     }
 }
@@ -121,19 +117,15 @@ window-rule {
     match app-id=r#"^com\.mitchellh\.ghostty$"# title="^knit-desktop-helix$"
     border {
         active-color "#5a6b53"
-        inactive-color "#5a6b53"
+        inactive-color "#3d4652"
         knit {
             pattern "checker"
             accent-color "#9ba98e"
+            // ...
         }
     }
 }
 ```
-
-- **Match an app:** the first rule gives Zed a blue rib pattern. Run `niri-sweaters msg pick-window` and click a window to find its app ID and title.
-- **Match a specific window:** the second rule applies only to Ghostty windows titled `knit-desktop-helix`. Conditions on one `match` line must all match; separate `match` lines are alternatives. App IDs and titles use regular expressions; `^...$` matches the whole value.
-- **Layer your rules:** matching rules apply in config order, with later values overriding earlier ones. Put general rules first and specific exceptions last. Set `border { knit { off; } }` in a rule to use a plain border for that window.
-- **Mix palettes:** `active-color` and `inactive-color` colour the base yarn; `knit.accent-color` supplies the accent yarn. Border gradients work too—the [desktop example](resources/knit-desktop.kdl) uses them for Obsidian and a second Ghostty window.
 
 [Tuning guide](docs/wiki/Knitted-Border-Tuning.md) · [All knit options](docs/wiki/Configuration:-Layout.md#procedural-knit-border) · [Per-app rules](docs/wiki/Configuration:-Window-Rules.md#focus-ring-and-border)
 
@@ -143,52 +135,38 @@ Magnify the desktop without resizing windows. The view follows the pointer outsi
 
 ```kdl
 zoom {
-    max-zoom 10.0
-    increment-factor 1.2
-    deadzone-size 0.5
-    follow-min-speed 50
-    follow-max-speed 6000
-    sampling "auto" threshold=4.0
+    max-zoom 100.0 // maximum zoom level
+    increment-factor 1.2 // zoom step multiplier
+    deadzone-size 0.2 // central area with no pointer-follow movement
+
+    follow-min-speed 50 // follow speed just outside the deadzone
+    follow-max-speed 6000 // follow speed far outside the deadzone
+
+    sampling "auto" threshold=4.0 // linear below 4x; nearest at 4x and above (sharp pixels)
+    // sampling "linear"
+    // sampling "nearest"
     pinch-fingers 3
+
+    // use to tune the deadzone and follow speeds
+    debug {
+        deadzone // red outline of the pointer-follow deadzone
+        focal-point // fixed point of the zoom transform, not the deadzone boundary; dimmed at 1x
+    }
 }
+
+
 binds {
-    Mod+Z { zoom 2.0; }
-    Mod+X { zoom 2.0 hold=true; }
-    Mod+Shift+Z { zoom-lock; }
+    Mod+Z { zoom 2.0; } // toggle zoom
+    Mod+X { zoom 2.0 hold=true; } // zoom while held; restore the previous view on release
+    // Mod+X { zoom 2.0 hold=true lock=true; } // also lock pointer-follow while held
+
+    Mod+Shift+Z { zoom-lock; } // toggle pointer-follow lock
+
     Mod+0 { reset-zoom; }
     Mod+WheelScrollUp { zoom-in; }
     Mod+WheelScrollDown { zoom-out; }
 }
 ```
-
-- **Toggle or hold:** `Mod+Z` toggles 2× zoom; `Mod+X` restores the previous view when released. `Mod+Shift+Z` toggles pointer-follow lock; `Mod+0` resets zoom.
-- **Wheel or pinch:** wheel-up multiplies zoom by 1.2 and wheel-down divides it by 1.2; three-finger pinch adjusts it continuously.
-- **Tracking:** `deadzone-size 0.5` lets the pointer move within the central half of the display without panning.
-- **Sampling:** `auto` keeps the image smooth below 4× and shows sharp pixel edges at 4× and above. Use `linear` for smooth filtering throughout or `nearest` for pixel inspection.
-
-#### Tune pointer following
-
-The example uses `follow-min-speed 50` for gentle movement just outside the deadzone and `follow-max-speed 6000` for fast travel near the screen edge. Both are measured in **displayed logical pixels per second**, not zoom increments. Speed rises smoothly as the pointer moves farther outside the deadzone and falls as the viewport catches up. The minimum must be positive; the maximum must be at least the minimum.
-
-To see what you are tuning, temporarily add this inside `zoom`:
-
-```kdl
-    debug {
-        deadzone
-        focal-point
-    }
-```
-
-- **Red outline:** the area where the pointer can move without panning. `deadzone-size 0.5` uses half the output width and height; smaller values start following sooner. At `0`, a red crosshair replaces the outline and tracking keeps the pointer centered; at `1`, following is effectively disabled.
-- **Amber crosshair:** the fixed point of the zoom transform, not the deadzone boundary. It is dimmed at 1×.
-
-Zoom in with pointer-follow unlocked, then tune one setting at a time:
-
-1. Adjust `deadzone-size` until you can move comfortably inside the red outline without shifting the view.
-2. Move just outside the outline. Lower `follow-min-speed` if the initial movement feels abrupt; raise it if following starts too slowly.
-3. Move toward a screen edge. Lower `follow-max-speed` if travel is too fast; raise it if crossing the desktop takes too long. `6000` is a fast-travel choice, not a required default.
-
-Following can continue after the mouse stops, until the pointer reaches the deadzone boundary or the viewport reaches the desktop edge. Remove `debug` when finished; changes reload live. Debug markers stay out of screenshots and recordings.
 
 [Zoom controls](docs/wiki/Accessibility.md#desktop-zoom) · [All zoom settings](docs/wiki/Configuration:-Miscellaneous.md#zoom) · [Key bindings](docs/wiki/Configuration:-Key-Bindings.md#zoom)
 
