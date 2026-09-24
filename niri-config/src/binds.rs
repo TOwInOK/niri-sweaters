@@ -403,6 +403,10 @@ pub enum Action {
         #[knuffel(property(name = "hold"), default)] bool,
         #[knuffel(property(name = "lock"), default)] bool,
     ),
+
+    // Doesn't look like knuffel allows gating on #[cfg(test)]...
+    #[knuffel(skip)]
+    TestAction,
 }
 
 /// A zoom level preset for `zoom`: a finite number strictly greater than 1.

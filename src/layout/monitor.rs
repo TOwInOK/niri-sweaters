@@ -307,9 +307,9 @@ impl OverviewProgress {
 ///   the displayed total scale captured at the transition event (the zoom level times the base
 ///   overview zoom, or the previous handoff's live value) and `to_scale` is the endpoint's base
 ///   overview zoom — `1` when closing to the desktop.
-/// - The residual factor is `S(u) / B(u)` around the captured focal point, so the composition `B(u)
-///   * residual` reproduces `S(u)` exactly: the total scale interpolates linearly between the
-///   endpoints without a multiplicative bounce, and crossing `1` never divides by the focal
+/// - The residual factor is `S(u) / B(u)` around the captured focal point. The composition
+///   `B(u) * residual` reproduces `S(u)` exactly: the total scale interpolates linearly between
+///   the endpoints without a multiplicative bounce, and crossing `1` never divides by the focal
 ///   geometry.
 ///
 /// The payload is created and rebased only by explicit overview transition
@@ -735,7 +735,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // After adding a new window, workspace becomes this output's own.
         if workspace.name().is_none() {
-            workspace.original_output = OutputId::new(&self.output);
+            workspace.original_outputs = vec![OutputId::new(&self.output)];
         }
 
         if workspace_idx == self.workspaces.len() - 1 {
@@ -780,7 +780,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // After adding a new window, workspace becomes this output's own.
         if workspace.name().is_none() {
-            workspace.original_output = OutputId::new(&self.output);
+            workspace.original_outputs = vec![OutputId::new(&self.output)];
         }
 
         if workspace_idx == self.workspaces.len() - 1 {
@@ -814,7 +814,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // After adding a new window, workspace becomes this output's own.
         if workspace.name().is_none() {
-            workspace.original_output = OutputId::new(&self.output);
+            workspace.original_outputs = vec![OutputId::new(&self.output)];
         }
 
         // Since we're adding window to an existing column, the workspace isn't empty, and

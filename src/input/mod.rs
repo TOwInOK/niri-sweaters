@@ -2666,6 +2666,12 @@ impl State {
                     self.toggle_zoom(preset, lock);
                 }
             }
+            Action::TestAction => {
+                #[cfg(test)]
+                {
+                    self.niri.test_action_count += 1;
+                }
+            }
         }
     }
 

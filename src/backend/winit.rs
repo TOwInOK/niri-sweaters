@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::mem;
 use std::rc::Rc;
@@ -26,7 +26,7 @@ use super::{IpcOutputMap, OutputId, RenderResult};
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
-use crate::utils::{get_monotonic_time, logical_output};
+use crate::utils::{get_monotonic_time, logical_output, WinitScale};
 
 pub struct Winit {
     config: Rc<RefCell<Config>>,
@@ -81,6 +81,10 @@ impl Winit {
             serial: None,
         });
 
+        output
+            .user_data()
+            .insert_if_missing(|| WinitScale(Cell::new(backend.scale_factor())));
+
         let physical_properties = output.physical_properties();
         let ipc_outputs = Arc::new(Mutex::new(HashMap::from([(
             OutputId::next(),
@@ -109,9 +113,10 @@ impl Winit {
 
         event_loop
             .insert_source(winit, move |event, _, state| match event {
-                WinitEvent::Resized { size, .. } => {
+                WinitEvent::Resized { size, scale_factor } => {
                     let winit = state.backend.winit();
-                    winit.output.change_current_state(
+                    let output = winit.output.clone();
+                    output.change_current_state(
                         Some(Mode {
                             size,
                             refresh: 60_000,
@@ -122,19 +127,24 @@ impl Winit {
                     );
 
                     {
+                        let scale = output.user_data().get_or_insert(WinitScale::default);
+                        scale.0.set(scale_factor);
+                    }
+
+                    {
                         let mut ipc_outputs = winit.ipc_outputs.lock().unwrap();
                         let output = ipc_outputs.values_mut().next().unwrap();
                         let mode = &mut output.modes[0];
                         mode.width = size.w.clamp(0, u16::MAX as i32) as u16;
                         mode.height = size.h.clamp(0, u16::MAX as i32) as u16;
-                        if let Some(logical) = output.logical.as_mut() {
-                            logical.width = size.w as u32;
-                            logical.height = size.h as u32;
-                        }
                         state.niri.ipc_outputs_changed = true;
                     }
 
-                    state.niri.output_resized(&winit.output);
+                    state.reload_output_config();
+
+                    // reload_output_config() will call output_resized() for scale changes,
+                    // but not for size-only changes. Even if this is the second call, it's fine.
+                    state.niri.output_resized(&output);
                 }
                 WinitEvent::Input(event) => state.process_input_event(event),
                 WinitEvent::Focus(focused) => {

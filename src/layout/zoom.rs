@@ -4273,7 +4273,7 @@ mod tests {
             advance(&mut state, &mut clock, 20);
             assert_point_eq(state.focal(), fixed);
             let level = state.level();
-            assert!(level >= 2. - EPS && level <= 3. + EPS);
+            assert!((2. - EPS..=3. + EPS).contains(&level));
         }
         advance(&mut state, &mut clock, 5000);
         assert_eq!(state.level(), 2.);
@@ -4408,7 +4408,7 @@ mod tests {
             advance(&mut state, &mut clock, 10);
             let level = state.level();
             let focal = state.focal();
-            assert!(level >= 1.5 && level <= 3., "level out of bounds: {level}");
+            assert!((1.5..=3.).contains(&level), "level out of bounds: {level}");
             assert!(focal.x >= 400. - EPS && focal.x <= 800. + EPS);
             assert!(focal.y >= 300. - EPS && focal.y <= 500. + EPS);
         }

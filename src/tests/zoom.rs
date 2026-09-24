@@ -3101,12 +3101,12 @@ fn zoom_hold_pointer_button() {
 
     const BTN_BACK: u32 = 0x116;
 
-    pointer.button(0, BTN_BACK, wl_pointer::ButtonState::Pressed.into());
+    pointer.button(0, BTN_BACK, wl_pointer::ButtonState::Pressed);
     f.roundtrip(id);
     assert_eq!(zoom_level(&mut f, &output), 2.);
     assert!(f.niri().zoom_hold.is_some());
 
-    pointer.button(0, BTN_BACK, wl_pointer::ButtonState::Released.into());
+    pointer.button(0, BTN_BACK, wl_pointer::ButtonState::Released);
     f.roundtrip(id);
     assert_eq!(zoom_level(&mut f, &output), 1.);
     assert!(f.niri().zoom_hold.is_none());
@@ -5272,7 +5272,7 @@ fn zoom_overview_handoff_drag_keeps_pointer_anchor() {
         .as_ref()
         .unwrap()
         .create_virtual_pointer(None, &client.qh, ());
-    pointer.button(0, 0x110, wl_pointer::ButtonState::Pressed.into());
+    pointer.button(0, 0x110, wl_pointer::ButtonState::Pressed);
     pointer.frame();
     f.roundtrip(id);
     pointer.motion(0, -600., 0.);
@@ -6543,7 +6543,7 @@ fn click_left(f: &mut Fixture, id: ClientId) {
     let client = f.client(id);
     let manager = client.state.virtual_pointer_manager.as_ref().unwrap();
     let pointer = manager.create_virtual_pointer(None, &client.qh, ());
-    pointer.button(0, BTN_LEFT, wl_pointer::ButtonState::Pressed.into());
+    pointer.button(0, BTN_LEFT, wl_pointer::ButtonState::Pressed);
     f.roundtrip(id);
 }
 
@@ -6553,7 +6553,7 @@ fn release_left(f: &mut Fixture, id: ClientId) {
     let client = f.client(id);
     let manager = client.state.virtual_pointer_manager.as_ref().unwrap();
     let pointer = manager.create_virtual_pointer(None, &client.qh, ());
-    pointer.button(0, BTN_LEFT, wl_pointer::ButtonState::Released.into());
+    pointer.button(0, BTN_LEFT, wl_pointer::ButtonState::Released);
     f.roundtrip(id);
 }
 
