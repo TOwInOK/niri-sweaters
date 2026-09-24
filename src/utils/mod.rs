@@ -644,8 +644,9 @@ pub fn cause_panic() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use approx::assert_abs_diff_eq;
+
+    use super::*;
 
     fn assert_rect_eq(actual: Rectangle<f64, Logical>, expected: Rectangle<f64, Logical>) {
         assert_abs_diff_eq!(actual.loc.x, expected.loc.x);

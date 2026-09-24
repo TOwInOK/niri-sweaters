@@ -6,9 +6,9 @@
 //! zoom state itself.
 
 use niri_config::Color;
-use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::CommitCounter;
+use smithay::backend::renderer::Color32F;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::niri::OutputRenderElements;

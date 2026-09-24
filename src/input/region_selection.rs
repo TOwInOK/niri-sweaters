@@ -4,12 +4,12 @@ use niri_ipc::{
 };
 use smithay::backend::input::{ButtonState, InputTime};
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, CursorImageStatus, Focus, GestureHoldBeginEvent, GestureHoldEndEvent,
-    GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent,
-    GestureSwipeEndEvent, GestureSwipeUpdateEvent, GrabStartData, MotionEvent, PointerGrab,
-    PointerInnerHandle, RelativeMotionEvent,
+    AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, Focus, GestureHoldBeginEvent,
+    GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent,
+    GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent, GrabStartData,
+    MotionEvent, PointerGrab, PointerInnerHandle, RelativeMotionEvent,
 };
-use smithay::input::{pointer::CursorIcon, SeatHandler};
+use smithay::input::SeatHandler;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Size, SERIAL_COUNTER};
 

@@ -4729,7 +4729,6 @@ impl<W: LayoutElement> Layout<W> {
         self.set_monitors_overview_state();
     }
 
-
     pub fn toggle_overview(&mut self) {
         self.overview_open = !self.overview_open;
 

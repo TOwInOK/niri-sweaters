@@ -221,7 +221,7 @@ mod tests {
     use std::fs::{self, File, FileTimes};
     use std::io::Write;
 
-    use xshell::{Shell, TempDir, cmd};
+    use xshell::{cmd, Shell, TempDir};
 
     use super::*;
 

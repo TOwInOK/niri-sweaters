@@ -387,7 +387,6 @@ impl Client {
             .cloned()
             .unwrap_or_default()
     }
-
 }
 
 impl State {

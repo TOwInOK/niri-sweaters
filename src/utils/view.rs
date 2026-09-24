@@ -218,12 +218,10 @@ mod tests {
     #[test]
     fn viewport_transform_invalid_factor() {
         for factor in [0., -1., f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert!(
-                std::panic::catch_unwind(|| {
-                    ViewportTransform::new(Point::from((0., 0.)), factor)
-                })
-                .is_err()
-            );
+            assert!(std::panic::catch_unwind(|| {
+                ViewportTransform::new(Point::from((0., 0.)), factor)
+            })
+            .is_err());
         }
     }
 }
