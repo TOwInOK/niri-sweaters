@@ -9,6 +9,7 @@ mod floating;
 mod fullscreen;
 mod knit;
 mod layer_shell;
+mod region;
 mod remove_output;
 mod transactions;
 mod virtual_pointer;

@@ -6,15 +6,15 @@
 //! zoom state itself.
 
 use niri_config::Color;
+use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::CommitCounter;
-use smithay::backend::renderer::Color32F;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
-use crate::utils::center_f64;
+use crate::utils::{center_f64, inward_border_rects};
 
 /// Red outline of the deadzone rectangle.
 pub(crate) const DEADZONE_COLOR: Color =
@@ -39,38 +39,6 @@ const FOCAL_EXTENT: f64 = 14.;
 const FOCAL_CENTER: f64 = 4.;
 /// Total extent of the crosshair marking a zero-area deadzone.
 const DEADZONE_POINT_EXTENT: f64 = 14.;
-
-/// Inward stroke rectangles for the four sides of `rect`.
-///
-/// The stroke lies fully inside `rect`, so a deadzone covering the whole
-/// output still shows a complete border instead of being clipped away. The
-/// top and bottom bars span the full width; the side bars fill the space
-/// between them, so the corners are not painted twice.
-///
-/// A stroke wider than the rect is clamped to the rect's smaller side.
-pub(crate) fn deadzone_border_rects(
-    rect: Rectangle<f64, Logical>,
-    width: f64,
-) -> [Rectangle<f64, Logical>; 4] {
-    let width = width.min(rect.size.w).min(rect.size.h).max(0.);
-    let inner_h = (rect.size.h - 2. * width).max(0.);
-
-    let top = Rectangle::new(rect.loc, Size::from((rect.size.w, width)));
-    let bottom = Rectangle::new(
-        Point::from((rect.loc.x, rect.loc.y + rect.size.h - width)),
-        Size::from((rect.size.w, width)),
-    );
-    let left = Rectangle::new(
-        Point::from((rect.loc.x, rect.loc.y + width)),
-        Size::from((width, inner_h)),
-    );
-    let right = Rectangle::new(
-        Point::from((rect.loc.x + rect.size.w - width, rect.loc.y + width)),
-        Size::from((width, inner_h)),
-    );
-
-    [top, bottom, left, right]
-}
 
 /// Horizontal and vertical bars of a crosshair centered on `center`.
 ///
@@ -156,15 +124,11 @@ pub(crate) fn render_deadzone<R: NiriRenderer>(
     // Elements are drawn in reverse push order: the last pushed element is
     // at the bottom. The halo goes last so that it sits under the main stroke.
     push_rects(
-        deadzone_border_rects(deadzone, STROKE_WIDTH),
+        inward_border_rects(deadzone, STROKE_WIDTH),
         DEADZONE_COLOR,
         push,
     );
-    push_rects(
-        deadzone_border_rects(deadzone, HALO_WIDTH),
-        HALO_COLOR,
-        push,
-    );
+    push_rects(inward_border_rects(deadzone, HALO_WIDTH), HALO_COLOR, push);
 }
 
 /// Draws the focal point marker: a crosshair with a center square.
@@ -217,56 +181,6 @@ mod tests {
         assert_abs_diff_eq!(actual.loc.y, expected.loc.y);
         assert_abs_diff_eq!(actual.size.w, expected.size.w);
         assert_abs_diff_eq!(actual.size.h, expected.size.h);
-    }
-
-    #[test]
-    fn deadzone_border_inward_sides() {
-        // deadzone-size 0.5 on a 1920x720 output.
-        let rect = Rectangle::new(Point::from((480., 180.)), Size::from((960., 360.)));
-        let [top, bottom, left, right] = deadzone_border_rects(rect, 2.);
-
-        assert_rect_eq(
-            top,
-            Rectangle::new(Point::from((480., 180.)), (960., 2.).into()),
-        );
-        assert_rect_eq(
-            bottom,
-            Rectangle::new(Point::from((480., 538.)), (960., 2.).into()),
-        );
-        assert_rect_eq(
-            left,
-            Rectangle::new(Point::from((480., 182.)), (2., 356.).into()),
-        );
-        assert_rect_eq(
-            right,
-            Rectangle::new(Point::from((1438., 182.)), (2., 356.).into()),
-        );
-
-        // The stroke lies fully inside the rect.
-        for side in [top, bottom, left, right] {
-            assert!(rect.contains_rect(side));
-        }
-    }
-
-    #[test]
-    fn deadzone_border_full_output() {
-        // deadzone-size 1: the rect coincides with the output bounds, and the
-        // inward stroke still lands inside the framebuffer.
-        let output = Rectangle::new(Point::from((0., 0.)), Size::from((1920., 720.)));
-        for side in deadzone_border_rects(output, 4.) {
-            assert!(output.contains_rect(side));
-            assert!(!side.is_empty());
-        }
-    }
-
-    #[test]
-    fn deadzone_border_clamps_width() {
-        // A stroke wider than the rect collapses to the rect instead of
-        // spilling outside it.
-        let rect = Rectangle::new(Point::from((10., 10.)), Size::from((100., 3.)));
-        for side in deadzone_border_rects(rect, 4.) {
-            assert!(rect.contains_rect(side));
-        }
     }
 
     #[test]

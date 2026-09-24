@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
-use niri_ipc::{Action, OutputAction};
+use niri_ipc::{
+    Action, OutputAction, OutputRegion, RegionFrameCommand, RegionFrameSpec, RegionGeometry,
+};
 
 use crate::utils::version;
 
@@ -82,6 +84,23 @@ pub enum Msg {
     PickWindow,
     /// Pick a color from the screen with the mouse.
     PickColor,
+    /// Select a region on an output with the mouse.
+    ///
+    /// Drag a rectangle on an output; on success the selected geometry is printed. Cancelling
+    /// the selection exits with an error.
+    SelectRegion {
+        /// Output format.
+        ///
+        /// `plain` prints "x y width height" in global coordinates, `slurp` prints
+        /// "x,y wxh" in global coordinates, and `json` prints the output-local region as JSON.
+        #[arg(long, value_enum)]
+        format: Option<RegionFormat>,
+    },
+    /// Query or manipulate the fixed region frame shown on an output.
+    RegionFrame {
+        #[command(subcommand)]
+        command: RegionFrameCli,
+    },
     /// Perform an action.
     Action {
         #[command(subcommand)]
@@ -116,6 +135,87 @@ pub enum Msg {
     Zoom,
     /// Send a raw JSON request to the compositor, reading from stdin.
     RawRequest,
+}
+
+/// Output format for `niri msg select-region`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum RegionFormat {
+    /// "x y width height" in global coordinates.
+    Plain,
+    /// Machine-readable "x,y wxh" in global coordinates, like slurp.
+    Slurp,
+    /// JSON output-local region.
+    Json,
+}
+
+/// `niri msg region-frame` subcommands.
+///
+/// This is a dedicated CLI payload so that the canonical [`RegionFrameCommand`] IPC serde
+/// layout is not compromised by clap attributes.
+#[derive(Clone, Debug, Subcommand)]
+pub enum RegionFrameCli {
+    /// Set the region frame, replacing any existing frame.
+    Set {
+        /// Output name.
+        ///
+        /// Run `niri msg outputs` to see the output names.
+        #[arg(long)]
+        output: String,
+        /// X coordinate of the region's top-left corner in output-local logical coordinates.
+        #[arg(long, allow_negative_numbers = true)]
+        x: i32,
+        /// Y coordinate of the region's top-left corner in output-local logical coordinates.
+        #[arg(long, allow_negative_numbers = true)]
+        y: i32,
+        /// Region width in logical pixels.
+        #[arg(long)]
+        width: u32,
+        /// Region height in logical pixels.
+        #[arg(long)]
+        height: u32,
+        /// Frame color as a CSS color string, e.g. "red" or "#ff000080".
+        #[arg(long)]
+        color: String,
+    },
+    /// Change the color of the existing region frame.
+    SetColor {
+        /// Frame color as a CSS color string, e.g. "red" or "#ff000080".
+        #[arg()]
+        color: String,
+    },
+    /// Get the current region frame.
+    Get,
+    /// Remove the region frame.
+    Clear,
+}
+
+impl From<RegionFrameCli> for RegionFrameCommand {
+    fn from(command: RegionFrameCli) -> Self {
+        match command {
+            RegionFrameCli::Set {
+                output,
+                x,
+                y,
+                width,
+                height,
+                color,
+            } => RegionFrameCommand::Set(RegionFrameSpec {
+                region: OutputRegion {
+                    output,
+                    geometry: RegionGeometry {
+                        x,
+                        y,
+                        width,
+                        height,
+                    },
+                },
+                color,
+            }),
+            RegionFrameCli::SetColor { color } => RegionFrameCommand::SetColor(color),
+            RegionFrameCli::Get => RegionFrameCommand::Get,
+            RegionFrameCli::Clear => RegionFrameCommand::Clear,
+        }
+    }
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]

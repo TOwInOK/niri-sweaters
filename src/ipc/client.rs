@@ -1,21 +1,40 @@
 use std::io::{BufRead as _, ErrorKind};
 use std::iter::Peekable;
 use std::path::Path;
+use std::str::FromStr;
 use std::{env, slice};
 
 use anyhow::{anyhow, bail, Context};
-use niri_config::OutputName;
+use niri_config::{Color, OutputName};
 use niri_ipc::socket::Socket;
 use niri_ipc::{
     Action, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, Mode, Output,
-    OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout,
+    OutputConfigChanged, Overview, RegionFrameCommand, RegionFrameSpec, RegionGeometry, Request,
+    Response, SelectedRegion, Transform, Window, WindowLayout,
 };
 use serde_json::json;
 
-use crate::cli::Msg;
+use crate::cli::{Msg, RegionFormat, RegionFrameCli};
 use crate::utils::version;
 
 pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Result<()> {
+    // The --json flag conflicts with an explicitly requested non-JSON select-region format.
+    if json {
+        if let Msg::SelectRegion {
+            format: Some(format),
+        } = &msg
+        {
+            if *format != RegionFormat::Json {
+                let name = match format {
+                    RegionFormat::Plain => "plain",
+                    RegionFormat::Slurp => "slurp",
+                    RegionFormat::Json => unreachable!(),
+                };
+                bail!("--json conflicts with --format {name}");
+            }
+        }
+    }
+
     // For actions taking paths, prepend the niri CLI's working directory.
     if let Msg::Action {
         action:
@@ -36,6 +55,8 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
         Msg::FocusedOutput => Request::FocusedOutput,
         Msg::PickWindow => Request::PickWindow,
         Msg::PickColor => Request::PickColor,
+        Msg::SelectRegion { .. } => Request::SelectRegion,
+        Msg::RegionFrame { command } => Request::RegionFrame(command.clone().into()),
         Msg::Action { action } => Request::Action(action.clone()),
         Msg::Output { output, action } => Request::Output {
             output: output.clone(),
@@ -59,6 +80,24 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
             serde_json::from_slice(&buf).context("error parsing request JSON from stdin")?
         }
     };
+
+    // Validate region frame arguments before sending; the server validates them too.
+    if let Request::RegionFrame(command) = &request {
+        match command {
+            RegionFrameCommand::Set(spec) => {
+                spec.region
+                    .geometry
+                    .validate()
+                    .map_err(anyhow::Error::msg)?;
+                Color::from_str(&spec.color)
+                    .map_err(|e| anyhow!("invalid color {:?}: {e}", spec.color))?;
+            }
+            RegionFrameCommand::SetColor(color) => {
+                Color::from_str(color).map_err(|e| anyhow!("invalid color {color:?}: {e}"))?;
+            }
+            RegionFrameCommand::Get | RegionFrameCommand::Clear => {}
+        }
+    }
 
     if print_request {
         let json_str =
@@ -332,6 +371,53 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                 println!("Hex: #{r:02x}{g:02x}{b:02x}");
             } else {
                 println!("No color was picked.");
+            }
+        }
+        Msg::SelectRegion { format } => {
+            let Response::SelectedRegion(selected) = response else {
+                bail!("unexpected response: expected SelectedRegion, got {response:?}");
+            };
+
+            let format = format.unwrap_or(if json {
+                RegionFormat::Json
+            } else {
+                RegionFormat::Plain
+            });
+
+            if format == RegionFormat::Json {
+                // JSON output prints the output-local region object only.
+                let region = serde_json::to_string(&selected.as_ref().map(|s| &s.region))
+                    .context("error formatting response")?;
+                println!("{region}");
+            } else if let Some(selected) = &selected {
+                println!("{}", format_selected_region(selected, format));
+            }
+
+            if selected.is_none() {
+                bail!("region selection was cancelled");
+            }
+        }
+        Msg::RegionFrame { command } => {
+            if matches!(command, RegionFrameCli::Get) {
+                let Response::RegionFrame(spec) = response else {
+                    bail!("unexpected response: expected RegionFrame, got {response:?}");
+                };
+
+                if json {
+                    let spec = serde_json::to_string(&spec).context("error formatting response")?;
+                    println!("{spec}");
+                    return Ok(());
+                }
+
+                if let Some(spec) = spec {
+                    print_region_frame(&spec);
+                } else {
+                    println!("No region frame is set.");
+                }
+            } else {
+                let Response::Handled = response else {
+                    bail!("unexpected response: expected Handled, got {response:?}");
+                };
             }
         }
         Msg::Action { .. } => {
@@ -828,6 +914,38 @@ fn print_cast(cast: &Cast) {
     }
 }
 
+/// Formats a selected region for the plain and slurp output formats.
+///
+/// Both formats use the global geometry captured atomically with the selection.
+fn format_selected_region(selected: &SelectedRegion, format: RegionFormat) -> String {
+    let RegionGeometry {
+        x,
+        y,
+        width,
+        height,
+    } = selected.global_geometry;
+
+    match format {
+        RegionFormat::Plain => format!("{x} {y} {width} {height}"),
+        RegionFormat::Slurp => format!("{x},{y} {width}x{height}"),
+        RegionFormat::Json => unreachable!("JSON format is handled separately"),
+    }
+}
+
+fn print_region_frame(spec: &RegionFrameSpec) {
+    let RegionGeometry {
+        x,
+        y,
+        width,
+        height,
+    } = spec.region.geometry;
+
+    println!("Region frame on output \"{}\":", spec.region.output);
+    println!("  Position: {x}, {y}");
+    println!("  Size: {width} x {height}");
+    println!("  Color: {}", spec.color);
+}
+
 fn sort_zoom_states(states: &mut [niri_ipc::ZoomState]) {
     states.sort_by(|a, b| a.output.cmp(&b.output));
 }
@@ -929,5 +1047,36 @@ mod tests {
 
         let names: Vec<_> = states.iter().map(|s| s.output.as_str()).collect();
         assert_eq!(names, ["DP-1", "DP-2", "HDMI-A-1"]);
+    }
+
+    #[test]
+    fn test_format_selected_region() {
+        let selected = SelectedRegion {
+            region: niri_ipc::OutputRegion {
+                output: String::from("DP-1"),
+                geometry: RegionGeometry {
+                    x: 10,
+                    y: 20,
+                    width: 300,
+                    height: 200,
+                },
+            },
+            global_geometry: RegionGeometry {
+                x: 1930,
+                y: 20,
+                width: 300,
+                height: 200,
+            },
+        };
+
+        // Slurp and plain use the global geometry, not the output-local one.
+        assert_snapshot!(
+            format_selected_region(&selected, RegionFormat::Slurp),
+            @"1930,20 300x200"
+        );
+        assert_snapshot!(
+            format_selected_region(&selected, RegionFormat::Plain),
+            @"1930 20 300 200"
+        );
     }
 }

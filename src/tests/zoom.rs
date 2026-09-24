@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use approx::assert_abs_diff_eq;
-use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::element::utils::RescaleRenderElement;
-use smithay::backend::renderer::element::Element;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::Color32F;
+use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::element::Element;
+use smithay::backend::renderer::element::utils::RescaleRenderElement;
+use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::{Mode, Output};
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
@@ -22,6 +22,7 @@ use crate::render_helpers::framebuffer_effect::FramebufferEffect;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::ui::zoom_debug;
+use crate::utils::inward_border_rects;
 
 /// Minimal config for deterministic rendering: no animations, no gaps.
 const CONFIG: &str = r#"
@@ -173,7 +174,7 @@ fn add_sampling_layer(f: &mut Fixture, layer: Layer) {
     use std::io::Write as _;
     use std::os::fd::AsFd as _;
 
-    use smithay::reexports::rustix::fs::{memfd_create, MemfdFlags};
+    use smithay::reexports::rustix::fs::{MemfdFlags, memfd_create};
     use wayland_client::protocol::wl_shm::{Format, WlShm};
 
     let id = f.add_client();
@@ -241,10 +242,12 @@ fn zoom_sampling_pixels_reload_and_capture_damage() {
     ] {
         let elements = render_elements(f.niri_state(), &output, target);
         let (damage, _) = tracker.damage_output(1, &elements).unwrap();
-        assert!(damage
-            .unwrap()
-            .iter()
-            .any(|r| r.contains(Point::from((3, 0)))));
+        assert!(
+            damage
+                .unwrap()
+                .iter()
+                .any(|r| r.contains(Point::from((3, 0))))
+        );
         assert!(tracker.damage_output(1, &elements).unwrap().0.is_none());
     }
     reload_with_zoom(&mut f, r#"zoom { sampling "nearest"; }"#);
@@ -624,11 +627,11 @@ fn zoom_debug_deadzone_output() {
     let deadzone = OutputZoomState::deadzone_rect(Size::from((1920., 720.)), 0.5);
     assert_eq!(
         debug_solids(&elements, zoom_debug::DEADZONE_COLOR),
-        zoom_debug::deadzone_border_rects(deadzone, 2.),
+        inward_border_rects(deadzone, 2.),
     );
 
     // The halo covers the deadzone border and the focal crosshair.
-    let mut expected = zoom_debug::deadzone_border_rects(deadzone, 4.).to_vec();
+    let mut expected = inward_border_rects(deadzone, 4.).to_vec();
     expected.extend(zoom_debug::crosshair_rects(
         Point::from((960., 360.)),
         14.,
@@ -857,7 +860,7 @@ fn zoom_debug_multi_output() {
     let deadzone1 = OutputZoomState::deadzone_rect(Size::from((1920., 720.)), 0.5);
     assert_eq!(
         debug_solids(&elements, zoom_debug::DEADZONE_COLOR),
-        zoom_debug::deadzone_border_rects(deadzone1, 2.),
+        inward_border_rects(deadzone1, 2.),
     );
     assert!(!debug_solids(&elements, zoom_debug::FOCAL_INACTIVE_COLOR).is_empty());
     assert!(debug_solids(&elements, zoom_debug::FOCAL_ACTIVE_COLOR).is_empty());
@@ -866,7 +869,7 @@ fn zoom_debug_multi_output() {
     let deadzone2 = OutputZoomState::deadzone_rect(Size::from((1280., 1024.)), 0.5);
     assert_eq!(
         debug_solids(&elements, zoom_debug::DEADZONE_COLOR),
-        zoom_debug::deadzone_border_rects(deadzone2, 2.),
+        inward_border_rects(deadzone2, 2.),
     );
     assert!(!debug_solids(&elements, zoom_debug::FOCAL_ACTIVE_COLOR).is_empty());
     assert!(debug_solids(&elements, zoom_debug::FOCAL_INACTIVE_COLOR).is_empty());
@@ -5240,7 +5243,9 @@ fn zoom_overview_handoff_samples_live_animation() {
 
 #[test]
 fn zoom_overview_handoff_drag_keeps_pointer_anchor() {
-    let mut f = set_up_with_config(&format!("{ANIMATED_CONFIG}\nanimations {{\n window-movement {{ off; }}\n overview-open-close {{ duration-ms 1000; curve \"linear\"; }}\n}}\n"));
+    let mut f = set_up_with_config(&format!(
+        "{ANIMATED_CONFIG}\nanimations {{\n window-movement {{ off; }}\n overview-open-close {{ duration-ms 1000; curve \"linear\"; }}\n}}\n"
+    ));
     let output = f.niri_output(1);
     let id = f.add_client();
     open_window(
@@ -5273,10 +5278,11 @@ fn zoom_overview_handoff_drag_keeps_pointer_anchor() {
     pointer.motion(0, -600., 0.);
     pointer.frame();
     f.roundtrip(id);
-    assert!(f
-        .niri()
-        .layout
-        .interactive_move_is_moving_above_output(&output));
+    assert!(
+        f.niri()
+            .layout
+            .interactive_move_is_moving_above_output(&output)
+    );
     let mut initial_margin = None;
     for ms in [0, 100, 100] {
         advance_clock(&mut f, ms);
@@ -5505,24 +5511,26 @@ fn zoom_overview_entry_terminates_follow() {
     assert_eq!(zoom_level(&mut f, &output), 1.);
     // The follow transition is terminated, not suspended: there is nothing
     // left to commit.
-    assert!(!f
-        .niri()
-        .layout
-        .monitor_for_output_mut(&output)
-        .unwrap()
-        .zoom_mut()
-        .commit_follow_focal());
+    assert!(
+        !f.niri()
+            .layout
+            .monitor_for_output_mut(&output)
+            .unwrap()
+            .zoom_mut()
+            .commit_follow_focal()
+    );
 
     exit_overview(&mut f);
 
     // No follow resumes after the exit.
-    assert!(!f
-        .niri()
-        .layout
-        .monitor_for_output_mut(&output)
-        .unwrap()
-        .zoom_mut()
-        .commit_follow_focal());
+    assert!(
+        !f.niri()
+            .layout
+            .monitor_for_output_mut(&output)
+            .unwrap()
+            .zoom_mut()
+            .commit_follow_focal()
+    );
     assert_eq!(zoom_level(&mut f, &output), 1.);
 }
 
@@ -6074,10 +6082,11 @@ fn zoom_screenshot_ui_pointer_down_uses_displayed_coordinates() {
     .to_physical(output.current_scale().fractional_scale())
     .to_i32_round();
 
-    assert!(f
-        .niri()
-        .screenshot_ui
-        .pointer_down(output.clone(), point, None, false));
+    assert!(
+        f.niri()
+            .screenshot_ui
+            .pointer_down(output.clone(), point, None, false)
+    );
     f.niri().screenshot_ui.pointer_motion(point, None);
     let (_, end) = f
         .niri()
@@ -6376,6 +6385,7 @@ fn zoom_session_lock_deadzone_tracking_suspended() {
         session_locked,
         overview_active,
         screenshot_ui_open: false,
+        region_selection_open: false,
         mru_active: false,
     };
     assert!(!crate::input::zoom_tracking_enabled(gates(true, false)));
@@ -6414,6 +6424,7 @@ fn zoom_session_lock_warp_policy_uses_presentation() {
             session_locked: true,
             overview_active: false,
             screenshot_ui_open: false,
+            region_selection_open: false,
             mru_active: false,
         }
     ));
@@ -6866,7 +6877,7 @@ fn zoom_pinch_claim_finger_match() {
 
 #[test]
 fn zoom_pinch_claim_gates() {
-    use crate::input::{zoom_pinch_claim_allowed, ZoomPinchGates};
+    use crate::input::{ZoomPinchGates, zoom_pinch_claim_allowed};
 
     let clear = ZoomPinchGates {
         pinch_fingers: Some(3),

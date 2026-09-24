@@ -429,6 +429,8 @@ pub struct Niri {
     pub locked_hint: Option<bool>,
 
     pub screenshot_ui: ScreenshotUi,
+    pub(crate) region_selection: Option<crate::input::region_selection::RegionSelection>,
+    pub(crate) region_frame: Option<crate::ui::region::RegionFrame>,
     pub config_error_notification: ConfigErrorNotification,
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
@@ -565,6 +567,7 @@ pub enum KeyboardFocus {
     LayerShell { surface: WlSurface },
     LockScreen { surface: Option<WlSurface> },
     ScreenshotUi,
+    RegionSelection,
     ExitConfirmDialog,
     Overview,
     Mru,
@@ -713,7 +716,7 @@ impl KeyboardFocus {
             KeyboardFocus::Layout { surface } => surface.as_ref(),
             KeyboardFocus::LayerShell { surface } => Some(surface),
             KeyboardFocus::LockScreen { surface } => surface.as_ref(),
-            KeyboardFocus::ScreenshotUi => None,
+            KeyboardFocus::ScreenshotUi | KeyboardFocus::RegionSelection => None,
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Mru => None,
@@ -725,7 +728,7 @@ impl KeyboardFocus {
             KeyboardFocus::Layout { surface } => surface,
             KeyboardFocus::LayerShell { surface } => Some(surface),
             KeyboardFocus::LockScreen { surface } => surface,
-            KeyboardFocus::ScreenshotUi => None,
+            KeyboardFocus::ScreenshotUi | KeyboardFocus::RegionSelection => None,
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Mru => None,
@@ -1298,6 +1301,8 @@ impl State {
             }
         } else if self.niri.screenshot_ui.is_open() {
             KeyboardFocus::ScreenshotUi
+        } else if self.niri.region_selection.is_some() {
+            KeyboardFocus::RegionSelection
         } else if self.niri.window_mru_ui.is_open() {
             KeyboardFocus::Mru
         } else if let Some(output) = self.niri.layout.active_output() {
@@ -2798,6 +2803,8 @@ impl Niri {
 
             pick_window: None,
             pick_color: None,
+            region_selection: None,
+            region_frame: None,
 
             debug_draw_opaque_regions: false,
             debug_draw_damage: false,
@@ -3092,6 +3099,7 @@ impl Niri {
     }
 
     pub fn remove_output(&mut self, output: &Output) {
+        self.region_output_removed(output);
         // A zoom hold owned by the removed output can no longer be restored;
         // drop the session without moving the snapshot to another output.
         if self
@@ -3236,6 +3244,7 @@ impl Niri {
     }
 
     pub fn output_resized(&mut self, output: &Output) {
+        self.region_output_resized(output);
         let output_size = output_size(output);
         let scale = output.current_scale();
         let transform = output.current_transform();
@@ -4509,7 +4518,7 @@ impl Niri {
             // FIXME: when going into the screenshot UI from a layer-shell focus, and then back to
             // layer-shell, the layout will briefly draw as active, despite never having focus.
             KeyboardFocus::LockScreen { .. } => true,
-            KeyboardFocus::ScreenshotUi => true,
+            KeyboardFocus::ScreenshotUi | KeyboardFocus::RegionSelection => true,
             KeyboardFocus::ExitConfirmDialog => true,
             KeyboardFocus::Overview => true,
             KeyboardFocus::Mru => true,
@@ -4615,6 +4624,7 @@ impl Niri {
 
         let session_locked = self.is_locked();
         let screenshot_ui_open = self.screenshot_ui.is_open();
+        let region_selection_open = self.region_selection.is_some();
         let mru_active = self.window_mru_ui.is_active();
         let zoom_config = self.config.borrow().zoom;
 
@@ -4630,6 +4640,7 @@ impl Niri {
                     session_locked,
                     overview_active: mon.overview_active(),
                     screenshot_ui_open,
+                    region_selection_open,
                     mru_active,
                 }) {
                     mon.update_zoom_follow(*cursor_local, zoom_config)
@@ -6965,6 +6976,7 @@ impl Niri {
     }
 
     pub fn lock(&mut self, confirmation: SessionLocker) {
+        self.cancel_region_selection();
         // Check if another client is in the process of locking.
         if matches!(
             self.lock_state,

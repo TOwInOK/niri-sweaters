@@ -379,6 +379,31 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let color = result.map_err(|_| String::from("error getting picked color"))?;
             Response::PickedColor(color)
         }
+        Request::SelectRegion => {
+            let (tx, rx) = async_channel::bounded(1);
+            let (started_tx, started_rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let _ = started_tx.try_send(state.start_region_selection(tx));
+            });
+            started_rx
+                .recv()
+                .await
+                .map_err(|_| String::from("error starting region selection"))??;
+            let region = rx
+                .recv()
+                .await
+                .map_err(|_| String::from("error selecting region"))?;
+            Response::SelectedRegion(region)
+        }
+        Request::RegionFrame(command) => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let _ = tx.try_send(state.region_frame_command(command));
+            });
+            rx.recv()
+                .await
+                .map_err(|_| String::from("error updating region frame"))??
+        }
         Request::Action(action) => {
             validate_action(&action)?;
 

@@ -62,6 +62,7 @@ pub mod click_grab;
 pub mod move_grab;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
+pub(crate) mod region_selection;
 pub mod resize_grab;
 pub mod scroll_swipe_gesture;
 pub mod scroll_tracker;
@@ -700,6 +701,18 @@ impl State {
 
                 if let Some(Keysym::space) = raw {
                     this.niri.screenshot_ui.set_space_down(pressed);
+                }
+
+                if this.niri.region_selection.is_some() {
+                    if pressed {
+                        this.niri.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    }
+                    return if this.niri.suppressed_keys.remove(&key_code) {
+                        FilterResult::Intercept(None)
+                    } else {
+                        FilterResult::Forward
+                    };
                 }
 
                 let res = {
@@ -3059,6 +3072,20 @@ impl State {
             return;
         }
 
+        if self.niri.region_selection.is_some() {
+            pointer.button(
+                self,
+                &ButtonEvent {
+                    button: button_code,
+                    state: button_state,
+                    serial,
+                    time: event.time(),
+                },
+            );
+            pointer.frame(self);
+            return;
+        }
+
         let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
         let modifiers = modifiers_from_state(mods);
         let mod_down = modifiers.contains(mod_key.to_modifiers());
@@ -3380,6 +3407,9 @@ impl State {
     }
 
     fn on_pointer_axis<I: InputBackend>(&mut self, event: I::PointerAxisEvent) {
+        if self.niri.region_selection.is_some() {
+            return;
+        }
         let pointer = &self.niri.seat.get_pointer().unwrap();
 
         let source = event.source();
@@ -4815,6 +4845,7 @@ impl State {
 
         let session_locked = self.niri.is_locked();
         let screenshot_ui_open = self.niri.screenshot_ui.is_open();
+        let region_selection_open = self.niri.region_selection.is_some();
         let mru_active = self.niri.window_mru_ui.is_active();
         let zoom_config = self.niri.config.borrow().zoom;
         if let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) {
@@ -4822,6 +4853,7 @@ impl State {
                 session_locked,
                 overview_active: mon.overview_active(),
                 screenshot_ui_open,
+                region_selection_open,
                 mru_active,
             }) {
                 return;
@@ -5613,7 +5645,10 @@ impl State {
 
     fn grab_can_be_cancelled_with_esc(grab: &(dyn PointerGrab<State> + 'static)) -> bool {
         let grab = grab.as_any();
-        grab.is::<PickWindowGrab>() || grab.is::<PickColorGrab>() || Self::is_dnd_grab(grab)
+        grab.is::<PickWindowGrab>()
+            || grab.is::<PickColorGrab>()
+            || grab.is::<region_selection::RegionSelectionGrab>()
+            || Self::is_dnd_grab(grab)
     }
 }
 
@@ -5625,6 +5660,7 @@ pub(crate) struct ZoomTrackingGates {
     /// Whether the target output's Overview is active.
     pub overview_active: bool,
     pub screenshot_ui_open: bool,
+    pub region_selection_open: bool,
     /// Whether the recent-windows UI is visually active (open or closing).
     pub mru_active: bool,
 }
@@ -5634,11 +5670,12 @@ pub(crate) struct ZoomTrackingGates {
 /// Tracking is suspended while the session is locked (the lock surface is a
 /// replacement presentation, so pointer motion must not move the hidden zoom
 /// camera), while the Overview is active, and while the screenshot UI or the
-/// recent-windows UI is visually active.
+/// recent-windows UI is visually active, or during region selection.
 pub(crate) fn zoom_tracking_enabled(gates: ZoomTrackingGates) -> bool {
     !gates.session_locked
         && !gates.overview_active
         && !gates.screenshot_ui_open
+        && !gates.region_selection_open
         && !gates.mru_active
 }
 

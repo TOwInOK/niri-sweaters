@@ -173,6 +173,40 @@ pub fn center_f64(rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
     rect.loc + rect.size.downscale(2.0).to_point()
 }
 
+/// Inward stroke rectangles for the four sides of `rect`.
+///
+/// The stroke lies fully inside `rect`, so a region covering the whole
+/// output still shows a complete border instead of being clipped away. The
+/// top and bottom bars span the full width; the side bars fill the space
+/// between them, so the corners are not painted twice.
+///
+/// Degenerate sides are shortened so even narrow rectangles never overlap.
+pub fn inward_border_rects(
+    rect: Rectangle<f64, Logical>,
+    width: f64,
+) -> [Rectangle<f64, Logical>; 4] {
+    let width = width.min(rect.size.w).min(rect.size.h).max(0.);
+    let bottom_h = width.min(rect.size.h - width);
+    let right_w = width.min(rect.size.w - width);
+    let inner_h = (rect.size.h - width - bottom_h).max(0.);
+
+    let top = Rectangle::new(rect.loc, Size::from((rect.size.w, width)));
+    let bottom = Rectangle::new(
+        Point::from((rect.loc.x, rect.loc.y + rect.size.h - bottom_h)),
+        Size::from((rect.size.w, bottom_h)),
+    );
+    let left = Rectangle::new(
+        Point::from((rect.loc.x, rect.loc.y + width)),
+        Size::from((width, inner_h)),
+    );
+    let right = Rectangle::new(
+        Point::from((rect.loc.x + rect.size.w - right_w, rect.loc.y + width)),
+        Size::from((right_w, inner_h)),
+    );
+
+    [top, bottom, left, right]
+}
+
 /// Convert logical pixels to physical, rounding to physical pixels.
 pub fn to_physical_precise_round<N: Coordinate>(scale: f64, logical: impl Coordinate) -> N {
     N::from_f64((logical.to_f64() * scale).round())
@@ -603,6 +637,67 @@ pub fn cause_panic() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_abs_diff_eq;
+
+    fn assert_rect_eq(actual: Rectangle<f64, Logical>, expected: Rectangle<f64, Logical>) {
+        assert_abs_diff_eq!(actual.loc.x, expected.loc.x);
+        assert_abs_diff_eq!(actual.loc.y, expected.loc.y);
+        assert_abs_diff_eq!(actual.size.w, expected.size.w);
+        assert_abs_diff_eq!(actual.size.h, expected.size.h);
+    }
+
+    #[test]
+    fn inward_border_sides() {
+        let rect = Rectangle::new(Point::from((480., 180.)), Size::from((960., 360.)));
+        let [top, bottom, left, right] = inward_border_rects(rect, 2.);
+
+        assert_rect_eq(
+            top,
+            Rectangle::new(Point::from((480., 180.)), (960., 2.).into()),
+        );
+        assert_rect_eq(
+            bottom,
+            Rectangle::new(Point::from((480., 538.)), (960., 2.).into()),
+        );
+        assert_rect_eq(
+            left,
+            Rectangle::new(Point::from((480., 182.)), (2., 356.).into()),
+        );
+        assert_rect_eq(
+            right,
+            Rectangle::new(Point::from((1438., 182.)), (2., 356.).into()),
+        );
+
+        // The stroke lies fully inside the rect.
+        for side in [top, bottom, left, right] {
+            assert!(rect.contains_rect(side));
+        }
+    }
+
+    #[test]
+    fn inward_border_full_rect() {
+        // The rect coincides with the output bounds, and the inward stroke
+        // still lands inside the framebuffer.
+        let output = Rectangle::new(Point::from((0., 0.)), Size::from((1920., 720.)));
+        for side in inward_border_rects(output, 4.) {
+            assert!(output.contains_rect(side));
+            assert!(!side.is_empty());
+        }
+    }
+
+    #[test]
+    fn inward_border_clamps_width() {
+        // A stroke wider than the rect collapses to the rect instead of
+        // spilling outside it.
+        let rect = Rectangle::new(Point::from((10., 10.)), Size::from((100., 3.)));
+        let sides = inward_border_rects(rect, 4.);
+        for side in sides {
+            assert!(rect.contains_rect(side));
+        }
+        // A translucent border must not composite the same pixels twice.
+        let area: f64 = sides.iter().map(|side| side.size.w * side.size.h).sum();
+        assert_eq!(area, rect.size.w * rect.size.h);
+    }
 
     #[test]
     fn test_clamp_preferring_top_left() {

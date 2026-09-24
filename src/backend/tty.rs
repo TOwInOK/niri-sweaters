@@ -1906,7 +1906,7 @@ impl Tty {
             target: RenderTarget::Output,
             xray: None,
         };
-        let mut elements = niri.render_to_vec(ctx, output, true);
+        let mut elements = niri.render_for_output(ctx, output);
 
         // Visualize the damage, if enabled.
         if niri.debug_draw_damage {

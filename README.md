@@ -2,12 +2,13 @@
   <h1>niri-sweaters</h1>
   <p><strong>Your windows. In sweaters.</strong></p>
   <img src="docs/assets/knit-hero.webp" alt="Zed, Oh My Pi, Helix, and Obsidian windows with knitted borders" width="800">
-  <p>A <a href="https://github.com/niri-wm/niri">niri</a> fork with knitted window borders.<br>Choose a pattern and colours for each app.</p>
+  <p>A <a href="https://github.com/niri-wm/niri">niri</a> fork with knitted window borders and desktop zoom.<br>Choose a pattern and colours for each app, magnify your desktop, and mark regions for recording.</p>
   <p>
     <a href="#features">Features</a> ·
     <a href="#choose-your-knit">Patterns</a> ·
     <a href="#in-action">In action</a> ·
     <a href="#desktop-zoom-in-action">Zoom demo</a> ·
+    <a href="#select-and-frame-a-region">Region IPC</a> ·
     <a href="#try-it">Try it</a> ·
     <a href="#build-from-scratch">Build</a> ·
     <a href="#configure-it">Configure</a> ·
@@ -22,6 +23,7 @@
 - **Follow or lock.** Let the viewport follow the pointer outside a configurable deadzone, or lock it in place.
 - **Momentary zoom.** Hold a shortcut to zoom in; release it to restore the previous view.
 - **Continuous Overview.** Move from the magnified view into Overview with simultaneous scaling and centering, without an intermediate desktop reset.
+- **Region IPC.** Select a rectangle for its coordinates without taking a screenshot, then show or clear a fixed recording frame on that monitor.
 - **Separate session.** Install alongside stock Niri without replacing its session or configuration.
 
 ## Choose your knit
@@ -36,13 +38,37 @@
 
 ## Desktop Zoom in action
 
-[Watch the Desktop Zoom demonstration (MP4, 42 seconds)](docs/assets/zoom_demonstration.mp4)
+<video controls width="800" src="docs/assets/zoom_demonstration.mp4">
+  <a href="docs/assets/zoom_demonstration.mp4">Watch the Desktop Zoom demonstration (MP4, 56 seconds)</a>
+</video>
+
+[Open or download the Desktop Zoom demonstration (MP4, 56 seconds)](docs/assets/zoom_demonstration.mp4)
+
+GitHub does not render inline video in repository READMEs; use the MP4 link above when viewing this page there.
 
 Zoom in for a closer look, navigate the magnified desktop, and enter Overview without first snapping back to the normal desktop. The pointer stays in place during the Overview transition.
 
 [Zoom setup and controls](docs/wiki/Accessibility.md) · [Zoom key bindings](docs/wiki/Configuration:-Key-Bindings.md#zoom)
 
 The recording uses HEVC; if your browser cannot play it, download it and open it in a compatible video player.
+
+## Select and frame a region
+
+Use the IPC commands from your Niri Sweaters session to get coordinates without changing the clipboard or taking a screenshot:
+
+```sh
+niri-sweaters msg select-region --format slurp  # drag on one monitor; global logical coordinates
+niri-sweaters msg --json select-region           # output name and output-local logical coordinates
+```
+
+Press **Escape** to cancel. To mark a fixed region, use the output name and output-local coordinates from the JSON result (replace the example values):
+
+```sh
+niri-sweaters msg region-frame set --output DP-1 --x 100 --y 80 --width 800 --height 600 --color red
+niri-sweaters msg region-frame clear
+```
+
+The frame stays on its monitor across zoom and Overview but is excluded from screenshots and screencasts. [IPC formats and frame controls](docs/wiki/IPC.md#region-selection-and-recording-frame)
 
 ## Try it
 

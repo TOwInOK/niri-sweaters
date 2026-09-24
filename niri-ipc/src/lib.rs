@@ -85,6 +85,14 @@ pub enum Request {
     PickWindow,
     /// Request picking a color from the screen.
     PickColor,
+    /// Request selecting a region on an output.
+    ///
+    /// The user drags a rectangle on one output with the mouse. The reply is
+    /// [`Response::SelectedRegion`] with `Some` on success, or `None` if the selection was
+    /// cancelled.
+    SelectRegion,
+    /// Query or manipulate the fixed region frame shown on an output.
+    RegionFrame(RegionFrameCommand),
     /// Perform an action.
     Action(Action),
     /// Change output configuration temporarily.
@@ -161,6 +169,10 @@ pub enum Response {
     PickedWindow(Option<Window>),
     /// Information about the picked color.
     PickedColor(Option<PickedColor>),
+    /// The region selected by the user, or `None` if the selection was cancelled.
+    SelectedRegion(Option<SelectedRegion>),
+    /// The currently active region frame, or `None` if no frame is set.
+    RegionFrame(Option<RegionFrameSpec>),
     /// Output configuration change result.
     OutputConfigChanged(OutputConfigChanged),
     /// Information about the overview.
@@ -185,6 +197,71 @@ pub struct Overview {
 pub struct PickedColor {
     /// Color values as red, green, blue, each ranging from 0.0 to 1.0.
     pub rgb: [f64; 3],
+}
+
+/// A rectangle in logical coordinates.
+///
+/// Used both for output-local geometry (relative to an output's top-left corner) and for
+/// geometry in the global compositor coordinate space.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct RegionGeometry {
+    /// X coordinate of the region's top-left corner.
+    pub x: i32,
+    /// Y coordinate of the region's top-left corner.
+    pub y: i32,
+    /// Region width.
+    pub width: u32,
+    /// Region height.
+    pub height: u32,
+}
+
+/// A rectangle on a specific output.
+///
+/// The [`geometry`](Self::geometry) is in output-local logical coordinates, relative to the
+/// output's top-left corner.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct OutputRegion {
+    /// Output name.
+    pub output: String,
+    /// Region geometry in output-local logical coordinates.
+    pub geometry: RegionGeometry,
+}
+
+/// A region selected by the user.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct SelectedRegion {
+    /// The selected output and the region in output-local logical coordinates.
+    pub region: OutputRegion,
+    /// The same region in the global compositor coordinate space, captured atomically with the
+    /// selection.
+    pub global_geometry: RegionGeometry,
+}
+
+/// Specification of a fixed region frame shown on an output.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct RegionFrameSpec {
+    /// The output and output-local geometry of the frame.
+    pub region: OutputRegion,
+    /// Frame color as a CSS color string, e.g. `"red"` or `"#ff000080"`.
+    pub color: String,
+}
+
+/// Command for querying or manipulating the fixed region frame.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum RegionFrameCommand {
+    /// Set the region frame, replacing any existing frame.
+    Set(RegionFrameSpec),
+    /// Change the color of the existing region frame.
+    SetColor(String),
+    /// Get the current region frame.
+    Get,
+    /// Remove the region frame.
+    Clear,
 }
 
 /// Desktop zoom state of a single output.
@@ -2115,6 +2192,27 @@ macro_rules! ensure {
     };
 }
 
+impl RegionGeometry {
+    /// Validates that the region has a non-zero size and that its endpoints fit in `i32`.
+    pub fn validate(&self) -> Result<(), String> {
+        ensure!(self.width > 0, "region width {} must be > 0", self.width);
+        ensure!(self.height > 0, "region height {} must be > 0", self.height);
+        ensure!(
+            i64::from(self.x) + i64::from(self.width) <= i64::from(i32::MAX),
+            "region right edge overflows i32 (x {}, width {})",
+            self.x,
+            self.width
+        );
+        ensure!(
+            i64::from(self.y) + i64::from(self.height) <= i64::from(i32::MAX),
+            "region bottom edge overflows i32 (y {}, height {})",
+            self.y,
+            self.height
+        );
+        Ok(())
+    }
+}
+
 impl OutputAction {
     /// Validates some required constraints on the modeline and custom mode.
     pub fn validate(&self) -> Result<(), String> {
@@ -2355,5 +2453,48 @@ mod tests {
         assert_eq!(json["effective_level"], 1.25);
         assert_eq!(json["focal"], serde_json::json!([100.5, 200.25]));
         assert_eq!(json["locked"], true);
+    }
+
+    #[test]
+    fn region_geometry_validate() {
+        let valid = RegionGeometry {
+            x: -100,
+            y: 200,
+            width: 300,
+            height: 400,
+        };
+        assert_eq!(valid.validate(), Ok(()));
+
+        // Zero size is rejected.
+        assert!(RegionGeometry { width: 0, ..valid }.validate().is_err());
+        assert!(RegionGeometry { height: 0, ..valid }.validate().is_err());
+
+        // Endpoints overflowing i32 are rejected.
+        assert!(RegionGeometry {
+            x: i32::MAX,
+            width: 1,
+            ..valid
+        }
+        .validate()
+        .is_err());
+        assert!(RegionGeometry {
+            y: i32::MAX,
+            height: 1,
+            ..valid
+        }
+        .validate()
+        .is_err());
+
+        // Boundary values that still fit are accepted.
+        assert_eq!(
+            RegionGeometry {
+                x: i32::MIN,
+                y: i32::MIN,
+                width: u32::MAX,
+                height: u32::MAX,
+            }
+            .validate(),
+            Ok(())
+        );
     }
 }
