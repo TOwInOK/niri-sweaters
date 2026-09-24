@@ -15,20 +15,42 @@ The `niri-visual-tests` sub-crate/binary is development-only and should not be p
 The recommended way to package niri is so that it runs as a standalone desktop session.
 To do that, put files into the correct directories according to this table.
 
-| File | Destination |
-| ---- | ----------- |
-| `target/release/niri` | `/usr/bin/` |
-| `resources/niri-session` | `/usr/bin/` |
-| `resources/niri.desktop` | `/usr/share/wayland-sessions/` |
-| `resources/niri-portals.conf` | `/usr/share/xdg-desktop-portal/` |
-| `resources/niri.service` (systemd) | `/usr/lib/systemd/user/` |
-| `resources/niri-shutdown.target` (systemd) | `/usr/lib/systemd/user/` |
-| `resources/dinit/niri` (dinit) | `/usr/lib/dinit.d/user/` |
-| `resources/dinit/niri.target` (dinit) | `/usr/lib/dinit.d/user/` |
+| File                                       | Destination                      |
+| ------------------------------------------ | -------------------------------- |
+| `target/release/niri`                      | `/usr/bin/`                      |
+| `resources/niri-session`                   | `/usr/bin/`                      |
+| `resources/niri.desktop`                   | `/usr/share/wayland-sessions/`   |
+| `resources/niri-portals.conf`              | `/usr/share/xdg-desktop-portal/` |
+| `resources/niri.service` (systemd)         | `/usr/lib/systemd/user/`         |
+| `resources/niri-shutdown.target` (systemd) | `/usr/lib/systemd/user/`         |
+| `resources/dinit/niri` (dinit)             | `/usr/lib/dinit.d/user/`         |
+| `resources/dinit/niri.target` (dinit)      | `/usr/lib/dinit.d/user/`         |
 
 Doing this will make niri appear in GDM and other display managers.
 
 See the [Integrating niri](./Integrating-niri.md) page for further information on distribution integration.
+
+### Niri Sweaters with dinit
+
+The separate service definitions are in `resources/niri-sweaters/dinit/`. Install them alongside the stock `niri` and `niri.target` services, not over them:
+
+| File                                                                                                  | Destination                                  |
+| ----------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| `target/release/niri` (built with `--no-default-features --features dinit,dbus,xdp-gnome-screencast`) | `/usr/local/bin/niri-sweaters`               |
+| `resources/niri-sweaters/dinit/niri-sweaters`                                                         | `/usr/lib/dinit.d/user/niri-sweaters`        |
+| `resources/niri-sweaters/dinit/niri-sweaters.target`                                                  | `/usr/lib/dinit.d/user/niri-sweaters.target` |
+
+Before starting, create the log directory and a separate config (or copy your existing config with its includes):
+
+```sh
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+mkdir -p "$HOME/.local/share/niri-sweaters" "$config_home/niri-sweaters"
+test -e "$config_home/niri-sweaters/config.kdl" || cp resources/default-config.kdl "$config_home/niri-sweaters/config.kdl"
+```
+
+Start `dinitctl --user start niri-sweaters.target` from your login environment with a running user dinit instance and its `dbus` service. Ensure the manager has the login environment and `niri-sweaters` on its `PATH`. This is direct dinit startup; the systemd-oriented `install-niri-sweaters` installer is not used here.
+
+The service reads `$XDG_CONFIG_HOME/niri-sweaters/config.kdl` (falling back to `~/.config/niri-sweaters/config.kdl`) and writes `~/.local/share/niri-sweaters/niri.log`. Session dependencies belong in `dinit.d/niri-sweaters.d/`. Stop with `dinitctl --user stop niri-sweaters`; stock niri service files and config remain unchanged.
 
 ### Recommended dependencies
 
@@ -41,10 +63,10 @@ Set them as automatically-installed optional dependencies, if possible.
 - `xwayland-satellite`: required to run X11 applications (Steam, Discord, etc.).
 - `xdg-desktop-portal-gnome`: required for screencasting.
 - `xdg-desktop-portal-gtk`: configured as the fallback portal in `niri-portals.conf`.
-(This is in general the standard fallback portal that you want installed.)
+  (This is in general the standard fallback portal that you want installed.)
 - `oo7-portal` or `gnome-keyring`: configured as the Secret portal provider in `niri-portals.conf`.
 - Your distro's GPU driver package, such as `mesa-dri-drivers` and `mesa-libEGL`.
-Working hardware acceleration is required for running niri.
+  Working hardware acceleration is required for running niri.
 - Some notification daemon like `mako`, generally required for apps to work correctly.
 
 Finally, you may want to auto-install some of the applications bound in niri's [default configuration file](https://github.com/niri-wm/niri/blob/main/resources/default-config.kdl) (search for `spawn`), such as `alacritty` and `fuzzel`.
@@ -135,7 +157,7 @@ Important things to look for:
 - The backtrace goes all the way up to `main` and includes `cause_panic`.
 - The backtrace includes the file and line number for `cause_panic`: `at /.../src/utils/mod.rs:382:13`.
 
-If possible, please ensure that your niri package on its own has good panics, i.e. *without* installing debuginfo or other packages.
+If possible, please ensure that your niri package on its own has good panics, i.e. _without_ installing debuginfo or other packages.
 The user likely won't have debuginfo installed when their compositor first crashes, and we really want to be able to diagnose and fix all crashes right away.
 
 ### Rust dependencies

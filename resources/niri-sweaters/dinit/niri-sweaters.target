@@ -1,0 +1,6 @@
+type           = internal
+restart        = false
+depends-on:    niri-sweaters
+waits-for.d:   $XDG_CONFIG_HOME/dinit.d/niri-sweaters.d/
+waits-for.d:   $HOME/.config/dinit.d/niri-sweaters.d/
+waits-for.d:   /etc/dinit.d/user/niri-sweaters.d/
