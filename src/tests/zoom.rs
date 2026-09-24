@@ -24,10 +24,14 @@ use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::ui::zoom_debug;
 use crate::utils::inward_border_rects;
 
-/// Minimal config for deterministic rendering: no animations, no gaps.
+/// Minimal config for deterministic rendering: no animations, startup overlay, or gaps.
 const CONFIG: &str = r#"
 animations {
     off
+}
+
+hotkey-overlay {
+    skip-at-startup
 }
 
 layout {
